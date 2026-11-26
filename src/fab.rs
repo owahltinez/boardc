@@ -9,7 +9,7 @@ use crate::fab_gerber::{
     GerberBuilder, copper_gerber_filename, pad_anchor_world, pad_world_shape_with_margin,
 };
 use crate::fab_job::emit_gbrjob;
-use crate::fab_silk::emit_silk_layer;
+use crate::fab_silk::{emit_silk_layer, push_graphic_mask_shapes};
 use crate::geom::{
     local_to_board, pad_copper_layers, pad_world_layers, polygon_area, remap_layer_for_side,
 };
@@ -17,7 +17,7 @@ use crate::ir::{
     BoardIr, FootprintDef, LayerKind, Nm, PadKind, Placement, PourPoly, Pt, Side, nm_to_mm,
     safe_slug,
 };
-use crate::shapes::pad_to_world_shape;
+use crate::shapes::{ResolvedShape, pad_to_world_shape};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FabOptions {
@@ -159,12 +159,14 @@ fn emit_mask_layer(
     cu_layers: &[String],
     side: Side,
     out_path: &Path,
-) -> Result<(), String> {
+    collect_openings: bool,
+) -> Result<Vec<ResolvedShape>, String> {
     let (mask_name, pos) = match side {
         Side::Top => ("F.Mask", Position::Top),
         Side::Bottom => ("B.Mask", Position::Bottom),
     };
     let mut b = GerberBuilder::new(FileFunction::SolderMask { pos, index: None });
+    let mut openings = Vec::new();
     for pl in &board.placements {
         let Some(fp) = board.footprints.get(&pl.footprint) else {
             continue;
@@ -179,20 +181,44 @@ fn emit_mask_layer(
             let margin = pad.mask_margin_nm.unwrap_or(board.rules.mask_expansion_nm);
             if let Some(shape) = pad_world_shape_with_margin(pad, pl, margin) {
                 b.flash_shape(&shape, pad_anchor_world(pad, pl));
+                if collect_openings {
+                    openings.push(shape);
+                }
             }
         }
-        emit_fp_graphics(&mut b, fp, pl, mask_name);
+        for g in &fp.graphics {
+            if remap_layer_for_side(g.layer(), pl.side) == mask_name {
+                b.emit_graphic(g, Some(pl));
+                if collect_openings {
+                    push_graphic_mask_shapes(g, Some(pl), &mut openings);
+                }
+            }
+        }
     }
-    emit_board_graphics(&mut b, board, mask_name);
+    for g in &board.graphics {
+        if g.layer() == mask_name {
+            b.emit_graphic(g, None);
+            if collect_openings {
+                push_graphic_mask_shapes(g, None, &mut openings);
+            }
+        }
+    }
     for via in &board.vias {
         if !via.tented && via.touches_layer(side.cu_layer(), &board.layers) {
             let dia = via.diameter + 2 * board.rules.mask_expansion_nm;
             if dia > 0 {
                 b.flash_circle(via.pos, dia);
+                if collect_openings {
+                    openings.push(ResolvedShape::Circle {
+                        center: via.pos,
+                        radius: dia / 2,
+                    });
+                }
             }
         }
     }
-    b.write_file(out_path)
+    b.write_file(out_path)?;
+    Ok(openings)
 }
 
 fn emit_paste_layer(
@@ -395,7 +421,8 @@ pub fn export_fab(
         ),
     ] {
         let mask_path = out_dir.join(mask_file);
-        emit_mask_layer(board, &cu_layers, side, &mask_path)?;
+        let mask_openings =
+            emit_mask_layer(board, &cu_layers, side, &mask_path, cfg.clip_silk_to_mask)?;
         gerber_files.push(mask_path);
 
         let paste_path = out_dir.join(paste_file);
@@ -407,7 +434,7 @@ pub fn export_fab(
             pos: fn_pos,
             index: None,
         });
-        emit_silk_layer(&mut silk_b, board, side, &cu_layers, cfg.clip_silk_to_mask);
+        emit_silk_layer(&mut silk_b, board, side, &mask_openings);
         silk_b.write_file(&silk_path)?;
         gerber_files.push(silk_path);
     }

@@ -70,7 +70,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     let mut edge_closed: Vec<Vec<Pt>> = Vec::new();
     let mut layer_thickness: HashMap<String, Nm> = HashMap::new();
     let mut stackup = Stackup::default();
-    let mut setup_default_tented: Option<bool> = None;
+    let mut setup_default_tented: Option<(bool, bool)> = None;
 
     for node in items.iter().skip(1) {
         match node.tag() {
@@ -130,15 +130,6 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
         }
     }
 
-    let default_tented = setup_default_tented.unwrap_or(true);
-    let vias: Vec<Via> = parsed_vias
-        .into_iter()
-        .map(|(mut via, override_tented)| {
-            via.tented = override_tented.unwrap_or(default_tented);
-            via
-        })
-        .collect();
-
     for layer in &mut layers {
         if let Some(&t) = layer_thickness.get(&layer.name) {
             layer.thickness_nm = Some(t);
@@ -147,6 +138,18 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     if layers.is_empty() {
         layers = default_two_layer_stackup();
     }
+    let (setup_f, setup_b) = setup_default_tented.unwrap_or((true, true));
+    let vias: Vec<Via> = parsed_vias
+        .into_iter()
+        .map(|(mut via, (vf, vb))| {
+            let f = vf.unwrap_or(setup_f);
+            let b = vb.unwrap_or(setup_b);
+            let touches_f = via.touches_layer("F.Cu", &layers);
+            let touches_b = via.touches_layer("B.Cu", &layers);
+            via.tented = (!touches_f || f) && (!touches_b || b);
+            via
+        })
+        .collect();
     if stackup.dielectric_nm.len() != layers.len().saturating_sub(1).max(1) {
         stackup.dielectric_nm.clear();
     }
@@ -380,54 +383,64 @@ fn is_dielectric_stackup_layer(node: &SExp, layer_type: &str) -> bool {
         })
 }
 
-fn parse_tenting_list(attr: &SExp) -> Option<bool> {
-    let front = child_atom(attr, "front").map(|v| v == "yes");
-    let back = child_atom(attr, "back").map(|v| v == "yes");
-    match (front, back) {
-        (Some(f), Some(b)) => Some(f && b),
-        (Some(s), None) | (None, Some(s)) => Some(s),
-        (None, None) => {
-            let mut has_side = false;
-            let mut has_none = false;
-            for tok in attr.as_list().into_iter().flatten().skip(1) {
-                match tok.as_atom() {
-                    Some("front") | Some("back") => has_side = true,
-                    Some("none") => has_none = true,
-                    _ => {}
-                }
-            }
-            if has_side {
-                Some(true)
-            } else if has_none {
-                Some(false)
-            } else {
-                None
-            }
+fn parse_setup_tenting(node: &SExp) -> Option<(bool, bool)> {
+    if let Some(attr) = node.find_child("tenting") {
+        let f_atom = child_atom(attr, "front");
+        let b_atom = child_atom(attr, "back");
+        if f_atom.is_some() || b_atom.is_some() {
+            return Some((f_atom == Some("yes"), b_atom == Some("yes")));
         }
+        let atoms = attr.as_list().and_then(|l| l.get(1..)).unwrap_or(&[]);
+        return Some((
+            atoms.iter().any(|t| t.as_atom() == Some("front")),
+            atoms.iter().any(|t| t.as_atom() == Some("back")),
+        ));
     }
+    if matches!(
+        node.find_child("pcbplotparams")
+            .and_then(|p| child_atom(p, "viasonmask")),
+        Some("true" | "yes")
+    ) {
+        return Some((false, false));
+    }
+    None
 }
 
-fn parse_via_tenting_override(node: &SExp) -> Option<bool> {
-    node.find_child("tenting")
-        .and_then(parse_tenting_list)
-        .or_else(|| node.find_child("covering").and_then(parse_tenting_list))
+type TentOverride = (Option<bool>, Option<bool>);
+
+fn parse_via_tenting_override(node: &SExp) -> TentOverride {
+    let Some(attr) = node.find_child("tenting") else {
+        return (None, None);
+    };
+    if attr.find_child("front").is_some() || attr.find_child("back").is_some() {
+        let side = |key| match child_atom(attr, key) {
+            Some("yes") => Some(true),
+            Some("no") => Some(false),
+            _ => None,
+        };
+        return (side("front"), side("back"));
+    }
+    let atoms = attr.as_list().and_then(|l| l.get(1..)).unwrap_or(&[]);
+    (
+        atoms
+            .iter()
+            .any(|t| t.as_atom() == Some("front"))
+            .then_some(true),
+        atoms
+            .iter()
+            .any(|t| t.as_atom() == Some("back"))
+            .then_some(true),
+    )
 }
 
 fn parse_setup(
     node: &SExp,
     thickness: &mut HashMap<String, Nm>,
     stackup: &mut Stackup,
-    default_tented: &mut Option<bool>,
+    default_tented: &mut Option<(bool, bool)>,
 ) {
-    if let Some(t) = parse_via_tenting_override(node) {
+    if let Some(t) = parse_setup_tenting(node) {
         *default_tented = Some(t);
-    } else if default_tented.is_none()
-        && node
-            .find_child("pcbplotparams")
-            .and_then(|p| child_atom(p, "viasonmask"))
-            == Some("true")
-    {
-        *default_tented = Some(false);
     }
     if child_atom(node, "filling") == Some("yes") || child_atom(node, "capping") == Some("yes") {
         stackup.pofv = true;
@@ -659,7 +672,7 @@ fn parse_track_arc(node: &SExp, net_id_map: &HashMap<i64, String>) -> Result<Vec
 fn parse_via(
     node: &SExp,
     net_id_map: &HashMap<i64, String>,
-) -> Result<(Via, Option<bool>), String> {
+) -> Result<(Via, TentOverride), String> {
     let layers_vec = parse_layers_list(node, None);
     let layers = match layers_vec.as_slice() {
         [a, b, ..] => (a.clone(), b.clone()),

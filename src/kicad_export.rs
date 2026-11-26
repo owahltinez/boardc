@@ -153,14 +153,19 @@ fn write_setup(out: &mut String, board: &BoardIr) {
         nm_to_mm(board.rules.mask_expansion_nm)
     );
     out.push_str("\t\t(allow_soldermask_bridges_in_footprints no)\n");
-    if board.pofv_enabled() || !board.vias.is_empty() {
-        let yn = if board.pofv_enabled() || board.vias.iter().any(|v| v.tented) {
+    let has_tented = board.vias.iter().any(|v| v.tented);
+    let has_untented = board.vias.iter().any(|v| !v.tented);
+    if board.pofv_enabled() || (has_tented && has_untented) {
+        let yn = if board.pofv_enabled() || has_tented {
             "yes"
         } else {
             "no"
         };
         let _ = writeln!(out, "\t\t(tenting (front {yn}) (back {yn}))");
-        let _ = writeln!(out, "\t\t(covering (front {yn}) (back {yn}))");
+    } else if has_tented {
+        out.push_str("\t\t(tenting front back)\n");
+    } else if has_untented {
+        out.push_str("\t\t(tenting none)\n");
     }
     if board.pofv_enabled() {
         out.push_str("\t\t(plugging (front yes) (back yes))\n");
@@ -252,11 +257,10 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
     let mut uuids = UuidGen(0);
     let net_ids = collect_net_ids(board);
 
-    let kicad_version = if board.pofv_enabled() || !board.vias.is_empty() {
-        "20260206"
-    } else {
-        "20241229"
-    };
+    let has_mixed_vias =
+        board.vias.iter().any(|v| v.tented) && board.vias.iter().any(|v| !v.tented);
+    let use_kicad10 = board.pofv_enabled() || has_mixed_vias;
+    let kicad_version = if use_kicad10 { "20260206" } else { "20241229" };
     out.push_str("(kicad_pcb\n");
     let _ = writeln!(out, "\t(version {kicad_version})");
     out.push_str("\t(generator \"boardc\")\n");
@@ -330,10 +334,18 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
         } else {
             "blind "
         };
-        let yn = if via.tented { "yes" } else { "no" };
+        let tent = if use_kicad10 {
+            if via.tented {
+                " (tenting (front yes) (back yes))"
+            } else {
+                " (tenting (front no) (back no))"
+            }
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
-            "\t(via {kind}(at {:.6} {:.6}) (size {:.6}) (drill {:.6}) (layers \"{}\" \"{}\") (tenting (front {yn}) (back {yn})) (covering (front {yn}) (back {yn})) (net {net_id}) (uuid \"{}\"))",
+            "\t(via {kind}(at {:.6} {:.6}) (size {:.6}) (drill {:.6}) (layers \"{}\" \"{}\"){tent} (net {net_id}) (uuid \"{}\"))",
             nm_to_mm(via.pos.x),
             nm_to_mm(-via.pos.y),
             nm_to_mm(via.diameter),

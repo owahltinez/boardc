@@ -552,9 +552,10 @@ fn export_and_import_kicad_pcb_preserves_via_tenting() {
     let board = BoardIr::from_spec(&spec).unwrap();
     let rendered = render_kicad_pcb(&board);
 
+    // Mixed tented + untented vias use KiCad 10 per-via tenting without fabricating secondary covering.
     assert!(rendered.contains("(version 20260206)"));
     assert!(rendered.contains("\t\t(tenting (front yes) (back yes))"));
-    assert!(rendered.contains("\t\t(covering (front yes) (back yes))"));
+    assert!(!rendered.contains("(covering "));
 
     let via_lines: Vec<&str> = rendered
         .lines()
@@ -562,21 +563,18 @@ fn export_and_import_kicad_pcb_preserves_via_tenting() {
         .collect();
     assert_eq!(via_lines.len(), 3);
     assert!(
-        via_lines[0].contains("(tenting (front yes) (back yes))")
-            && via_lines[0].contains("(covering (front yes) (back yes))"),
-        "tented via missing tenting/covering: {}",
+        via_lines[0].contains("(tenting (front yes) (back yes))"),
+        "tented via missing tenting yes: {}",
         via_lines[0]
     );
     assert!(
-        via_lines[1].contains("(tenting (front no) (back no))")
-            && via_lines[1].contains("(covering (front no) (back no))"),
-        "untented via missing tenting/covering no: {}",
+        via_lines[1].contains("(tenting (front no) (back no))"),
+        "untented via missing tenting no: {}",
         via_lines[1]
     );
     assert!(
         via_lines[2].trim_start().starts_with("(via blind ")
-            && via_lines[2].contains("(tenting (front no) (back no))")
-            && via_lines[2].contains("(covering (front no) (back no))"),
+            && via_lines[2].contains("(tenting (front no) (back no))"),
         "blind untented via mismatch: {}",
         via_lines[2]
     );
@@ -585,17 +583,24 @@ fn export_and_import_kicad_pcb_preserves_via_tenting() {
     let tented_flags: Vec<bool> = reimported.vias.iter().map(|v| v.tented).collect();
     assert_eq!(tented_flags, vec![true, false, false]);
 
-    // Board with only untented vias sets setup defaults to no and round-trips cleanly.
+    // Uniform all-tented and all-untented boards stay KiCad 9 compatible and round-trip cleanly.
+    let mut tented_spec = spec.clone();
+    tented_spec.vias.retain(|v| v.tented);
+    let tented_rendered = render_kicad_pcb(&BoardIr::from_spec(&tented_spec).unwrap());
+    assert!(tented_rendered.contains("(version 20241229)"));
+    assert!(tented_rendered.contains("\t\t(tenting front back)"));
+    let reimported_tented = parse_kicad_pcb(&tented_rendered, None).unwrap();
+    assert!(reimported_tented.vias.iter().all(|v| v.tented));
+
     let mut untented_spec = spec.clone();
     untented_spec.vias.retain(|v| !v.tented);
-    let untented_board = BoardIr::from_spec(&untented_spec).unwrap();
-    let untented_rendered = render_kicad_pcb(&untented_board);
-    assert!(untented_rendered.contains("\t\t(tenting (front no) (back no))"));
-    assert!(untented_rendered.contains("\t\t(covering (front no) (back no))"));
+    let untented_rendered = render_kicad_pcb(&BoardIr::from_spec(&untented_spec).unwrap());
+    assert!(untented_rendered.contains("(version 20241229)"));
+    assert!(untented_rendered.contains("\t\t(tenting none)"));
     let reimported_untented = parse_kicad_pcb(&untented_rendered, None).unwrap();
     assert!(reimported_untented.vias.iter().all(|v| !v.tented));
 
-    // KiCad 9 flat tenting syntax and via-before-setup ordering both resolve properly.
+    // KiCad 9 flat tenting, via-before-setup order, and per-via `(tenting none)` inherit semantics.
     let kicad9_pcb = r#"(kicad_pcb (version 20241229)
         (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
         (gr_rect (start 0 0) (end 20 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
@@ -609,17 +614,54 @@ fn export_and_import_kicad_pcb_preserves_via_tenting() {
         vec![false, true]
     );
 
-    // KiCad 10 covering fallback when per-via tenting is omitted.
-    let kicad10_pcb = r#"(kicad_pcb (version 20260206)
+    let kicad9_inherit = r#"(kicad_pcb (version 20241229)
         (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
-        (setup (tenting (front yes) (back yes)))
+        (setup (tenting front back))
         (gr_rect (start 0 0) (end 20 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
-        (via (at 4 4) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 0))
+        (via (at 4 4) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (tenting none) (net 0))
+    )"#;
+    assert!(parse_kicad_pcb(kicad9_inherit, None).unwrap().vias[0].tented);
+
+    // KiCad 10 `(tenting (front none) (back none))` and `(covering (front no) (back no))` inherit setup tenting.
+    let kicad10_pcb = r#"(kicad_pcb (version 20260206)
+        (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (2 "B.Cu" signal))
+        (setup (tenting (front yes) (back yes)) (covering (front no) (back no)))
+        (gr_rect (start 0 0) (end 20 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (via (at 4 4) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (tenting (front none) (back none)) (net 0))
         (via (at 8 4) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (covering (front no) (back no)) (net 0))
+        (via (at 12 4) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (tenting (front no) (back none)) (net 0))
     )"#;
     let parsed_k10 = parse_kicad_pcb(kicad10_pcb, None).expect("parse kicad 10 tenting");
     assert_eq!(
         parsed_k10.vias.iter().map(|v| v.tented).collect::<Vec<_>>(),
-        vec![true, false]
+        vec![true, true, false]
     );
+
+    // Empty `(setup (tenting))` is untented; single-side override only tents blind via on touched side.
+    let kicad10_empty_and_partial = r#"(kicad_pcb (version 20260206)
+        (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (2 "B.Cu" signal))
+        (setup (tenting))
+        (gr_rect (start 0 0) (end 20 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (via (at 4 4) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 0))
+        (via (at 8 4) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (tenting (front yes) (back none)) (net 0))
+        (via blind (at 12 4) (size 0.6) (drill 0.3) (layers "F.Cu" "In1.Cu") (tenting (front yes) (back none)) (net 0))
+    )"#;
+    let parsed_partial = parse_kicad_pcb(kicad10_empty_and_partial, None).unwrap();
+    assert_eq!(
+        parsed_partial
+            .vias
+            .iter()
+            .map(|v| v.tented)
+            .collect::<Vec<_>>(),
+        vec![false, false, true]
+    );
+
+    // KiCad 7/8 `(pcbplotparams (viasonmask yes))` untents vias when `(tenting ...)` is absent.
+    let kicad8_plot = r#"(kicad_pcb (version 20241229)
+        (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+        (setup (pcbplotparams (viasonmask yes)))
+        (gr_rect (start 0 0) (end 20 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (via (at 4 4) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 0))
+    )"#;
+    assert!(!parse_kicad_pcb(kicad8_plot, None).unwrap().vias[0].tented);
 }

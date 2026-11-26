@@ -1379,11 +1379,31 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
                 width: 0,
                 fill: true,
             },
-            // Diagonal stroke crossing rotated oval pad at (25, 21).
+            // Diagonal X-crossing strokes over rotated oval pad at (25, 21).
             Graphic::Line {
                 layer: "F.SilkS".into(),
                 a: Pt::new(mm(21.0), mm(17.0)),
                 b: Pt::new(mm(29.0), mm(25.0)),
+                width: mm(0.15),
+            },
+            Graphic::Line {
+                layer: "F.SilkS".into(),
+                a: Pt::new(mm(21.0), mm(25.0)),
+                b: Pt::new(mm(29.0), mm(17.0)),
+                width: mm(0.15),
+            },
+            // Bottom-side B.Mask graphic [14, 4]..[16, 6] crossed by B.SilkS horizontal stroke.
+            Graphic::Rect {
+                layer: "B.Mask".into(),
+                min: Pt::new(mm(14.0), mm(4.0)),
+                max: Pt::new(mm(16.0), mm(6.0)),
+                width: 0,
+                fill: true,
+            },
+            Graphic::Line {
+                layer: "B.SilkS".into(),
+                a: Pt::new(mm(11.0), mm(5.0)),
+                b: Pt::new(mm(19.0), mm(5.0)),
                 width: mm(0.15),
             },
         ],
@@ -1453,17 +1473,48 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
         "expected vertical stroke clipped against F.Mask board graphic, got: {segs:?}"
     );
 
-    // Diagonal stroke crossing rotated oval pad at (25, 21) must split cleanly into two pieces outside pad.
+    // Crossing X-strokes over 45-deg rotated 2.4x1.0 oval pad at (25, 21) split into 4 pieces clearing pad.
     let diag_segs: Vec<_> = segs
         .iter()
-        .filter(|&&((x0, y0), (x1, y1))| {
+        .copied()
+        .filter(|&((x0, y0), (x1, y1))| {
             x0 >= 20.5 && x1 <= 29.5 && y0 >= 16.5 && y1 <= 25.5 && (x1 - x0).abs() > 0.1
         })
         .collect();
     assert_eq!(
         diag_segs.len(),
-        2,
-        "expected diagonal stroke split into 2 pieces by rotated oval pad, got: {diag_segs:?}"
+        4,
+        "expected X-crossing strokes split into 4 pieces by rotated oval pad, got: {diag_segs:?}"
+    );
+    // Verify every clipped diagonal endpoint stays outside oval pad + mask(0.05) + half-w(0.075) + clr(0.15).
+    for &((x0, y0), (x1, y1)) in &diag_segs {
+        for (px, py) in [(x0, y0), (x1, y1)] {
+            let (rx, ry) = (px - 25.0, py - 21.0);
+            let along = ((rx + ry) * std::f64::consts::FRAC_1_SQRT_2).abs();
+            let perp = ((-rx + ry) * std::f64::consts::FRAC_1_SQRT_2).abs();
+            let dx = (along - 0.7).max(0.0);
+            let dist_to_capsule_axis = (dx * dx + perp * perp).sqrt();
+            assert!(
+                dist_to_capsule_axis >= 0.5 + 0.05 + 0.075 + 0.15 - 0.002,
+                "diagonal endpoint ({px:.4}, {py:.4}) violates oval pad silk clearance: d={dist_to_capsule_axis:.4}"
+            );
+        }
+    }
+
+    // Bottom-side B.SilkS stroke must clip cleanly against B.Mask rect [14, 4]..[16, 6] => [11, 13.775] & [16.225, 19].
+    let b_segs = gerber_stroke_segments_mm(&fab_clipped.join("B_Silkscreen.gbo"));
+    let find_b_hseg = |x_lo: f64, x_hi: f64| {
+        b_segs.iter().any(|&((x0, y0), (x1, y1))| {
+            let (a, b) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
+            (y0 - 5.0).abs() < 0.005
+                && (y1 - 5.0).abs() < 0.005
+                && (a - x_lo).abs() < 0.01
+                && (b - x_hi).abs() < 0.01
+        })
+    };
+    assert!(
+        find_b_hseg(11.0, 13.775) && find_b_hseg(16.225, 19.0),
+        "expected B.SilkS clipped against B.Mask graphic, got: {b_segs:?}"
     );
 
     // Filled silkscreen rect wrapping circular pad must survive as G36* region with %LPC*% cutout hole.
@@ -1477,6 +1528,29 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
     assert!(
         last_lpd > last_lpc,
         "strokes must be emitted after filled silkscreen %LPC*% holes"
+    );
+
+    // Regression: `silk_clearance_nm == 0` must still subtract Poly mask openings from Poly filled silkscreen.
+    let mut zero_clr_spec = spec.clone();
+    zero_clr_spec.rules.silk_clearance_nm = 0;
+    zero_clr_spec.graphics = vec![Graphic::Rect {
+        layer: "F.SilkS".into(),
+        min: Pt::new(mm(7.0), mm(7.0)),
+        max: Pt::new(mm(13.0), mm(13.0)),
+        width: 0,
+        fill: true,
+    }];
+    let zero_clr_board = BoardIr::from_spec(&zero_clr_spec).unwrap();
+    let fab_zero = tmp.join("fab_zero_clr");
+    export_fab(&zero_clr_board, &fab_zero, &FabOptions::default()).unwrap();
+    let zero_silk = fs::read_to_string(fab_zero.join("F_Silkscreen.gto")).unwrap();
+    assert!(
+        zero_silk.contains("G36*") && zero_silk.contains("%LPC*%"),
+        "filled Poly silkscreen over Poly SMD pad must clip even when silk_clearance_nm == 0"
+    );
+    assert!(
+        zero_silk.contains("X8950000Y8950000") && zero_silk.contains("X11050000Y11050000"),
+        "expected exact 2.1x2.1 mm mask cutout hole coordinates in zero-clearance filled silkscreen"
     );
 
     let rep = boardc::verify::verify_fab_outputs(&board, &fab_clipped).unwrap();
