@@ -1,18 +1,13 @@
 use std::fs;
 use std::path::Path;
 
-use serde_json::{Map, Value, json};
+use serde_json::json;
 
 use crate::fab_gerber::copper_gerber_filename;
-use crate::ir::{BBoxNm, BoardIr, SOLDER_MASK_THICKNESS_NM, nm_to_mm};
+use crate::ir::{BBoxNm, BoardIr, SOLDER_MASK_THICKNESS_NM, fnv1a_128, nm_to_mm};
 
 fn project_guid(name: &str) -> String {
-    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    for b in name.as_bytes() {
-        hash ^= *b as u128;
-        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
-    }
-    let hex = format!("{hash:032x}");
+    let hex = format!("{:032x}", fnv1a_128(name.as_bytes()));
     format!(
         "{}-{}-4{}-8{}-{}",
         &hex[0..8],
@@ -29,38 +24,26 @@ pub(crate) fn emit_gbrjob(
     out_path: &Path,
 ) -> Result<(), String> {
     let bbox = BBoxNm::from_pts(&board.outline);
-    let layers = board.effective_layers();
-    let (cu_nm, diel_nm) = board.resolved_stackup_thicknesses();
+    let (copper, diel_nm) = board.resolved_stackup_thicknesses();
     let mask_mm = nm_to_mm(SOLDER_MASK_THICKNESS_NM);
     let r = &board.rules;
 
-    let mut general = Map::new();
-    general.insert(
-        "ProjectId".into(),
-        json!({
+    let mut general = json!({
+        "ProjectId": {
             "Name": board.name,
             "GUID": project_guid(&board.name),
             "Revision": "1",
-        }),
-    );
-    general.insert(
-        "Size".into(),
-        json!({
+        },
+        "Size": {
             "X": nm_to_mm(bbox.width()),
             "Y": nm_to_mm(bbox.height()),
-        }),
-    );
-    general.insert("LayerNumber".into(), json!(cu_layers.len()));
-    general.insert(
-        "BoardThickness".into(),
-        json!(nm_to_mm(board.effective_board_thickness_nm())),
-    );
-    general.insert(
-        "Finish".into(),
-        json!(board.stackup.finish_trimmed().unwrap_or("None")),
-    );
-    if board.stackup.pofv {
-        general.insert("ViaProtection".into(), json!(["VII"]));
+        },
+        "LayerNumber": cu_layers.len(),
+        "BoardThickness": nm_to_mm(board.effective_board_thickness_nm()),
+        "Finish": board.stackup.finish_trimmed().unwrap_or("None"),
+    });
+    if board.pofv_enabled() {
+        general["ViaProtection"] = json!(["VII"]);
     }
 
     let mut design_rules = vec![json!({
@@ -116,27 +99,36 @@ pub(crate) fn emit_gbrjob(
         json!({ "Type": "SolderPaste", "Name": "Top Solder Paste" }),
         json!({ "Type": "SolderMask", "Thickness": mask_mm, "Name": "Top Solder Mask" }),
     ];
-    for (idx, layer) in layers.iter().enumerate() {
+    for (idx, &(layer_name, cu_thick)) in copper.iter().enumerate() {
         stackup.push(json!({
             "Type": "Copper",
-            "Thickness": nm_to_mm(cu_nm[idx]),
-            "Name": layer.name,
+            "Thickness": nm_to_mm(cu_thick),
+            "Name": layer_name,
         }));
         if let Some(&d_nm) = diel_nm.get(idx) {
-            let next_name = layers
-                .get(idx + 1)
-                .map(|l| l.name.as_str())
-                .unwrap_or("B.Cu");
+            let (diel_name, notes) = if let Some(&(next_name, _)) = copper.get(idx + 1) {
+                (
+                    format!("{layer_name}/{next_name}"),
+                    format!(
+                        "Type: dielectric layer {} (from {layer_name} to {next_name})",
+                        idx + 1
+                    ),
+                )
+            } else {
+                (
+                    format!("{layer_name}/B.Mask"),
+                    format!(
+                        "Type: dielectric layer {} (substrate below {layer_name})",
+                        idx + 1
+                    ),
+                )
+            };
             stackup.push(json!({
                 "Type": "Dielectric",
                 "Thickness": nm_to_mm(d_nm),
                 "Material": "FR4",
-                "Name": format!("{}/{next_name}", layer.name),
-                "Notes": format!(
-                    "Type: dielectric layer {} (from {} to {next_name})",
-                    idx + 1,
-                    layer.name
-                ),
+                "Name": diel_name,
+                "Notes": notes,
             }));
         }
     }
@@ -153,7 +145,7 @@ pub(crate) fn emit_gbrjob(
                 "Version": env!("CARGO_PKG_VERSION"),
             }
         },
-        "GeneralSpecs": Value::Object(general),
+        "GeneralSpecs": general,
         "DesignRules": design_rules,
         "FilesAttributes": files_attrs,
         "MaterialStackup": stackup,
@@ -162,4 +154,108 @@ pub(crate) fn emit_gbrjob(
         .map_err(|e| format!("failed to serialize Gerber job file: {e}"))?;
     fs::write(out_path, format!("{text}\n"))
         .map_err(|e| format!("failed to write Gerber job '{}': {e}", out_path.display()))
+}
+
+pub(crate) fn verify_gbrjob(
+    board: &BoardIr,
+    cu_layers: &[String],
+    fab_dir: &Path,
+    job_path: &Path,
+) -> Result<(), String> {
+    let job_text = fs::read_to_string(job_path).map_err(|e| {
+        format!(
+            "missing or unreadable Gerber job file '{}': {e}",
+            job_path.display()
+        )
+    })?;
+    let job_json: serde_json::Value = serde_json::from_str(&job_text)
+        .map_err(|e| format!("invalid Gerber job JSON '{}': {e}", job_path.display()))?;
+    let specs = &job_json["GeneralSpecs"];
+    if specs["LayerNumber"].as_u64() != Some(cu_layers.len() as u64) {
+        return Err(format!(
+            "Gerber job '{}' LayerNumber mismatch (expected {})",
+            job_path.display(),
+            cu_layers.len()
+        ));
+    }
+    let exp_thick = nm_to_mm(board.effective_board_thickness_nm());
+    if !specs["BoardThickness"]
+        .as_f64()
+        .is_some_and(|v| (v - exp_thick).abs() <= 1e-4)
+    {
+        return Err(format!(
+            "Gerber job '{}' BoardThickness mismatch (expected {exp_thick})",
+            job_path.display()
+        ));
+    }
+    let exp_finish = board.stackup.finish_trimmed().unwrap_or("None");
+    if specs["Finish"].as_str() != Some(exp_finish) {
+        return Err(format!(
+            "Gerber job '{}' Finish mismatch (expected '{exp_finish}')",
+            job_path.display()
+        ));
+    }
+    let has_vii = specs
+        .get("ViaProtection")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some("VII")));
+    if has_vii != board.pofv_enabled() {
+        return Err(format!(
+            "Gerber job '{}' ViaProtection mismatch (expected pofv={})",
+            job_path.display(),
+            board.pofv_enabled()
+        ));
+    }
+    let files_attr = job_json["FilesAttributes"].as_array().ok_or_else(|| {
+        format!(
+            "Gerber job '{}' missing FilesAttributes",
+            job_path.display()
+        )
+    })?;
+    if files_attr.len() != cu_layers.len() + 7 {
+        return Err(format!(
+            "Gerber job '{}' FilesAttributes count mismatch (expected {})",
+            job_path.display(),
+            cu_layers.len() + 7
+        ));
+    }
+    for entry in files_attr {
+        let Some(rel) = entry["Path"].as_str() else {
+            return Err(format!(
+                "Gerber job '{}' FilesAttributes entry missing Path",
+                job_path.display()
+            ));
+        };
+        if !fab_dir.join(rel).exists() {
+            return Err(format!(
+                "Gerber job '{}' references missing file '{rel}'",
+                job_path.display()
+            ));
+        }
+    }
+    let (_, exp_diel) = board.resolved_stackup_thicknesses();
+    let got_diel: Vec<f64> = job_json["MaterialStackup"]
+        .as_array()
+        .ok_or_else(|| {
+            format!(
+                "Gerber job '{}' missing MaterialStackup",
+                job_path.display()
+            )
+        })?
+        .iter()
+        .filter(|e| e["Type"] == "Dielectric")
+        .filter_map(|e| e["Thickness"].as_f64())
+        .collect();
+    if got_diel.len() != exp_diel.len()
+        || got_diel
+            .iter()
+            .zip(&exp_diel)
+            .any(|(g, &e)| (g - nm_to_mm(e)).abs() > 1e-4)
+    {
+        return Err(format!(
+            "Gerber job '{}' MaterialStackup dielectric mismatch",
+            job_path.display()
+        ));
+    }
+    Ok(())
 }

@@ -105,8 +105,7 @@ fn write_layers(out: &mut String, board: &BoardIr) {
 }
 
 fn write_setup(out: &mut String, board: &BoardIr) {
-    let layers = board.effective_layers();
-    let (cu_nm, diel_nm) = board.resolved_stackup_thicknesses();
+    let (copper, diel_nm) = board.resolved_stackup_thicknesses();
     let mask_mm = nm_to_mm(SOLDER_MASK_THICKNESS_NM);
     out.push_str("\t(setup\n");
     out.push_str("\t\t(stackup\n");
@@ -116,12 +115,12 @@ fn write_setup(out: &mut String, board: &BoardIr) {
         out,
         "\t\t\t(layer \"F.Mask\" (type \"Top Solder Mask\") (thickness {mask_mm}))"
     );
-    for (idx, layer) in layers.iter().enumerate() {
+    for (idx, &(layer_name, cu_thick)) in copper.iter().enumerate() {
         let _ = writeln!(
             out,
             "\t\t\t(layer \"{}\" (type \"copper\") (thickness {}))",
-            esc(&layer.name),
-            nm_to_mm(cu_nm[idx])
+            esc(layer_name),
+            nm_to_mm(cu_thick)
         );
         if let Some(&d_nm) = diel_nm.get(idx) {
             let kind = if diel_nm.len() == 1 || idx % 2 == 1 {
@@ -154,7 +153,7 @@ fn write_setup(out: &mut String, board: &BoardIr) {
         nm_to_mm(board.rules.mask_expansion_nm)
     );
     out.push_str("\t\t(allow_soldermask_bridges_in_footprints no)\n");
-    if board.stackup.pofv {
+    if board.pofv_enabled() {
         out.push_str("\t\t(plugging (front yes) (back yes))\n");
         out.push_str("\t\t(capping yes)\n");
         out.push_str("\t\t(filling yes)\n");
@@ -244,8 +243,13 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
     let mut uuids = UuidGen(0);
     let net_ids = collect_net_ids(board);
 
+    let kicad_version = if board.pofv_enabled() {
+        "20260206"
+    } else {
+        "20241229"
+    };
     out.push_str("(kicad_pcb\n");
-    out.push_str("\t(version 20241229)\n");
+    let _ = writeln!(out, "\t(version {kicad_version})");
     out.push_str("\t(generator \"boardc\")\n");
     out.push_str("\t(generator_version \"0.1.0\")\n");
     let _ = writeln!(

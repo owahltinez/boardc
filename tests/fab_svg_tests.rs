@@ -1050,6 +1050,13 @@ pin_nets = { "1" = "SIG", "2" = "GND" }
     assert_eq!(find_file("F_Mask.gts")["FileFunction"], "SolderMask,Top");
     assert_eq!(find_file("F_Mask.gts")["FilePolarity"], "Negative");
     assert_eq!(find_file("Edge_Cuts.gm1")["FileFunction"], "Profile");
+    // Emitted solder mask Gerbers must declare Negative polarity matching FilesAttributes.
+    let f_mask_txt = fs::read_to_string(fab_6l.join("F_Mask.gts")).unwrap();
+    let b_mask_txt = fs::read_to_string(fab_6l.join("B_Mask.gbs")).unwrap();
+    assert!(f_mask_txt.contains("%TF.FilePolarity,Negative*%"));
+    assert!(b_mask_txt.contains("%TF.FilePolarity,Negative*%"));
+    // `[stackup] pofv = true` enables `rules.via_at_smd` consistently.
+    assert!(board_6l.rules.via_at_smd);
 
     let stack = job["MaterialStackup"].as_array().unwrap();
     let dielectrics: Vec<f64> = stack
@@ -1083,6 +1090,29 @@ pin_nets = { "1" = "SIG", "2" = "GND" }
     let fab_rep = boardc::verify::verify_fab_outputs(&board_6l, &fab_6l).unwrap();
     assert!(fab_rep.passed, "6-layer fab verify failed: {fab_rep:?}");
 
+    // Negative verifier checks: corrupted thickness, finish, ViaProtection, malformed JSON, and missing gbrjob all fail.
+    let orig_job = fs::read_to_string(&manifest_6l.gbrjob).unwrap();
+    fs::write(
+        &manifest_6l.gbrjob,
+        orig_job.replace("\"BoardThickness\": 1.0", "\"BoardThickness\": 1.6"),
+    )
+    .unwrap();
+    assert!(boardc::verify::verify_fab_outputs(&board_6l, &fab_6l).is_err());
+
+    fs::write(
+        &manifest_6l.gbrjob,
+        orig_job.replace("\"Finish\": \"ENIG\"", "\"Finish\": \"None\""),
+    )
+    .unwrap();
+    assert!(boardc::verify::verify_fab_outputs(&board_6l, &fab_6l).is_err());
+
+    fs::write(&manifest_6l.gbrjob, "{not json").unwrap();
+    assert!(boardc::verify::verify_fab_outputs(&board_6l, &fab_6l).is_err());
+
+    fs::remove_file(&manifest_6l.gbrjob).unwrap();
+    assert!(boardc::verify::verify_fab_outputs(&board_6l, &fab_6l).is_err());
+    fs::write(&manifest_6l.gbrjob, &orig_job).unwrap();
+
     // Default stackup (omitted in TOML) on 2-layer board: 1.6 mm, Finish="None", no ViaProtection, 1.51 mm core.
     let spec_2l: BoardSpec =
         toml::from_str("name = \"def_2l\"\nsize_nm = [20000000, 10000000]\n").unwrap();
@@ -1102,6 +1132,45 @@ pin_nets = { "1" = "SIG", "2" = "GND" }
         .map(|e| e["Thickness"].as_f64().unwrap())
         .collect();
     assert_eq!(diels_2l, vec![1.51]);
+
+    // 4-layer default dielectric split with remainder (1_475_000 / 3) preserves exact total thickness.
+    let board_4l = make_4layer_board();
+    let (cu_4l, diel_4l) = board_4l.resolved_stackup_thicknesses();
+    assert_eq!(diel_4l.len(), 3);
+    let total_4l: i64 = cu_4l.iter().map(|(_, t)| *t).sum::<i64>()
+        + diel_4l.iter().sum::<i64>()
+        + 2 * boardc::ir::SOLDER_MASK_THICKNESS_NM;
+    assert_eq!(total_4l, board_4l.effective_board_thickness_nm());
+
+    // 1-layer board emits a single substrate dielectric (1.545 mm) and `[rules] via_at_smd = true` enables POFV metadata.
+    let fab_1l = tmp.join("fab_1l");
+    let spec_1l: BoardSpec = toml::from_str(
+        "name = \"one_layer\"\nsize_nm = [20000000, 10000000]\n[[layers]]\nname = \"F.Cu\"\nkind = \"signal\"\nside = \"top\"\n[rules]\nvia_at_smd = true\n",
+    )
+    .unwrap();
+    let board_1l = BoardIr::from_spec(&spec_1l).unwrap();
+    assert!(board_1l.stackup.pofv);
+    let manifest_1l = export_fab(&board_1l, &fab_1l, &FabOptions::default()).unwrap();
+    let job_1l: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_1l.gbrjob).unwrap()).unwrap();
+    assert_eq!(job_1l["GeneralSpecs"]["LayerNumber"], 1);
+    assert_eq!(
+        job_1l["GeneralSpecs"]["ViaProtection"],
+        serde_json::json!(["VII"])
+    );
+    let diels_1l: Vec<f64> = job_1l["MaterialStackup"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["Type"] == "Dielectric")
+        .map(|e| e["Thickness"].as_f64().unwrap())
+        .collect();
+    assert_eq!(diels_1l, vec![1.545]);
+    assert!(
+        boardc::verify::verify_fab_outputs(&board_1l, &fab_1l)
+            .unwrap()
+            .passed
+    );
 
     // Spec validation catches invalid thickness_nm and mismatched/non-positive dielectric_nm.
     let mut bad_thick = spec_6l.clone();

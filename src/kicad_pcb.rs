@@ -74,12 +74,8 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     for node in items.iter().skip(1) {
         match node.tag() {
             Some("general") => {
-                if let Some(t) = node
-                    .find_child("thickness")
-                    .and_then(|n| f64_at(n, 1))
-                    .filter(|&v| v > 0.0)
-                {
-                    stackup.thickness_nm = mm(t);
+                if let Some(t) = node.find_child("thickness").and_then(positive_mm_nm) {
+                    stackup.thickness_nm = t;
                 }
             }
             Some("title_block") => {
@@ -136,7 +132,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     if layers.is_empty() {
         layers = default_two_layer_stackup();
     }
-    if stackup.dielectric_nm.len() != layers.len().saturating_sub(1) {
+    if stackup.dielectric_nm.len() != layers.len().saturating_sub(1).max(1) {
         stackup.dielectric_nm.clear();
     }
 
@@ -356,6 +352,19 @@ fn parse_layers_block(node: &SExp) -> Vec<LayerDef> {
     out
 }
 
+fn positive_mm_nm(node: &SExp) -> Option<Nm> {
+    f64_at(node, 1).filter(|&v| v > 0.0).map(mm)
+}
+
+fn is_dielectric_stackup_layer(node: &SExp, layer_type: &str) -> bool {
+    layer_type.eq_ignore_ascii_case("core")
+        || layer_type.eq_ignore_ascii_case("prepreg")
+        || atom_at(node, 1).is_some_and(|n| {
+            n.get(..10)
+                .is_some_and(|p| p.eq_ignore_ascii_case("dielectric"))
+        })
+}
+
 fn parse_setup(node: &SExp, thickness: &mut HashMap<String, Nm>, stackup: &mut Stackup) {
     if child_atom(node, "filling") == Some("yes") || child_atom(node, "capping") == Some("yes") {
         stackup.pofv = true;
@@ -363,10 +372,7 @@ fn parse_setup(node: &SExp, thickness: &mut HashMap<String, Nm>, stackup: &mut S
     let Some(st) = node.find_child("stackup") else {
         return;
     };
-    if let Some(fin) = child_atom(st, "copper_finish")
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
-    {
+    if let Some(fin) = child_atom(st, "copper_finish").and_then(Stackup::normalize_finish) {
         stackup.finish = Some(fin.to_string());
     }
     let mut copper_seen = 0usize;
@@ -374,43 +380,29 @@ fn parse_setup(node: &SExp, thickness: &mut HashMap<String, Nm>, stackup: &mut S
     let mut dielectrics: Vec<Nm> = Vec::new();
     for child in st.children_with_tag("layer") {
         let layer_type = child_atom(child, "type").unwrap_or("");
-        if layer_type == "copper" {
+        if layer_type.eq_ignore_ascii_case("copper") {
             if copper_seen > 0 && gap_sum > 0 {
                 dielectrics.push(gap_sum);
             }
             gap_sum = 0;
             copper_seen += 1;
             if let Some(name) = atom_at(child, 1)
-                && let Some(t) = child
-                    .find_child("thickness")
-                    .and_then(|n| f64_at(n, 1))
-                    .filter(|&v| v > 0.0)
+                && let Some(t) = child.find_child("thickness").and_then(positive_mm_nm)
             {
-                thickness.insert(name.to_string(), mm(t));
+                thickness.insert(name.to_string(), t);
             }
-        } else if copper_seen > 0
-            && (matches!(layer_type, "core" | "prepreg")
-                || atom_at(child, 1).is_some_and(|n| n.starts_with("dielectric")))
-        {
-            if let Some(t) = child
-                .find_child("thickness")
-                .and_then(|n| f64_at(n, 1))
-                .filter(|&v| v > 0.0)
-            {
-                gap_sum += mm(t);
-            }
-            for sub in child.children_with_tag("addsublayer") {
-                if let Some(t) = sub
-                    .find_child("thickness")
-                    .and_then(|n| f64_at(n, 1))
-                    .filter(|&v| v > 0.0)
-                {
-                    gap_sum += mm(t);
-                }
-            }
+        } else if copper_seen > 0 && is_dielectric_stackup_layer(child, layer_type) {
+            // KiCad multi-ply dielectrics put sibling `(thickness ...)` nodes after bare `addsublayer`.
+            gap_sum += child
+                .children_with_tag("thickness")
+                .filter_map(positive_mm_nm)
+                .sum::<Nm>();
         }
     }
-    if copper_seen > 1 && dielectrics.len() == copper_seen - 1 {
+    if copper_seen == 1 && gap_sum > 0 && dielectrics.is_empty() {
+        dielectrics.push(gap_sum);
+    }
+    if copper_seen >= 1 && dielectrics.len() == copper_seen.saturating_sub(1).max(1) {
         stackup.dielectric_nm = dielectrics;
     }
 }

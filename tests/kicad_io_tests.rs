@@ -413,6 +413,11 @@ fn export_and_import_kicad_pcb_roundtrip_stackup_thickness_finish_dielectric_and
     let board = BoardIr::from_spec(&spec).unwrap();
     let rendered = render_kicad_pcb(&board);
 
+    assert!(board.rules.via_at_smd, "stackup.pofv must sync via_at_smd");
+    assert!(
+        rendered.contains("(version 20260206)"),
+        "POFV export must use KiCad 10 schema version"
+    );
     assert!(
         rendered.contains("(thickness 1)"),
         "missing 1mm general thickness:\n{rendered}"
@@ -434,11 +439,11 @@ fn export_and_import_kicad_pcb_roundtrip_stackup_thickness_finish_dielectric_and
 
     let reimported = parse_kicad_pcb(&rendered, None).expect("reimport rendered kicad_pcb");
     assert_eq!(reimported.stackup, board.stackup);
-    assert!(reimported.rules.via_at_smd);
+    assert_eq!(reimported.rules.via_at_smd, board.rules.via_at_smd);
     assert_eq!(reimported.layers[0].thickness_nm, Some(35_000));
     assert_eq!(reimported.layers[1].thickness_nm, Some(17_500));
 
-    // Default 2-layer board omits POFV and copper_finish and emits 1.6 mm / 1.51 mm core.
+    // Default 2-layer board uses KiCad 9 version, omits POFV and copper_finish, emits 1.6 mm / 1.51 mm core.
     let def_board = BoardIr::from_spec(&BoardSpec {
         name: "def_rt".into(),
         size_nm: Some([mm(20.0), mm(10.0)]),
@@ -446,6 +451,7 @@ fn export_and_import_kicad_pcb_roundtrip_stackup_thickness_finish_dielectric_and
     })
     .unwrap();
     let def_rendered = render_kicad_pcb(&def_board);
+    assert!(def_rendered.contains("(version 20241229)"));
     assert!(def_rendered.contains("(thickness 1.6)"));
     assert!(def_rendered.contains("(layer \"dielectric 1\" (type \"core\") (thickness 1.51)"));
     assert!(!def_rendered.contains("(copper_finish"));
@@ -453,15 +459,15 @@ fn export_and_import_kicad_pcb_roundtrip_stackup_thickness_finish_dielectric_and
     assert!(!def_rendered.contains("(capping"));
     assert!(!def_rendered.contains("(filling"));
 
-    // Multi-sublayer dielectric entries between two copper layers sum into one gap entry.
-    let multi_sub = r#"(kicad_pcb (version 20241229)
+    // Real KiCad bare `addsublayer` syntax and mixed-case Core/Dielectric names sum into one gap entry.
+    let multi_sub = r#"(kicad_pcb (version 20260206)
         (general (thickness 1.2))
         (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
         (setup
             (stackup
                 (layer "F.Cu" (type "copper") (thickness 0.035))
-                (layer "dielectric 1" (type "prepreg") (thickness 0.1) (addsublayer (thickness 0.2)))
-                (layer "dielectric 1" (type "core") (thickness 0.8))
+                (layer "Dielectric 1" (type "Prepreg") (thickness 0.1) (material "FR4") addsublayer (thickness 0.2) (material "FR4"))
+                (layer "Dielectric 1" (type "Core") (thickness 0.8))
                 (layer "B.Cu" (type "copper") (thickness 0.035))
                 (copper_finish "HAL lead-free")
             )

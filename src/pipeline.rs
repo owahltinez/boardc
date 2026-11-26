@@ -13,7 +13,7 @@ use crate::geom::point_in_polygon;
 use crate::ir::{
     BgaShadowRule, BoardIr, CapProximityRule, Constraints, DesignRules, FilledPour, FootprintDef,
     Keepout, LayerDef, LayerKind, MatchGroupRule, MaxLengthRule, MinViasRule, NetClass, NetDef, Nm,
-    PadKind, Placement, PourSpec, Pt, Track, Via, safe_slug, save_board_json,
+    PadKind, Placement, PourSpec, Pt, Track, Via, fnv1a_128, safe_slug, save_board_json,
 };
 use crate::place::{
     PlaceOptions, PlaceReport, PowerViaOptions, PowerViaReport, legalize_placement,
@@ -29,8 +29,6 @@ use crate::svg::write_board_svgs;
 use crate::zones::{ZoneChoke, ZoneReport, fill_zones};
 
 const CACHE_SCHEMA: &str = "v2";
-const FNV_OFFSET_BASIS_128: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-const FNV_PRIME_128: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Pipeline stage identifier in execution order.
@@ -121,15 +119,6 @@ struct PreflightBlockers<'a> {
     sealed_pads: &'a [PreflightSealedPad],
     blocked_nets: &'a [PreflightBlockedNet],
     fixed_violations: &'a [PreflightFixedViolation],
-}
-
-fn fnv1a_128(bytes: &[u8]) -> u128 {
-    let mut hash = FNV_OFFSET_BASIS_128;
-    for &b in bytes {
-        hash ^= b as u128;
-        hash = hash.wrapping_mul(FNV_PRIME_128);
-    }
-    hash
 }
 
 fn normalize_neg_zero(val: &mut serde_json::Value) {
