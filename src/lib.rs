@@ -21,6 +21,7 @@ pub mod kicad_export;
 mod kicad_export_items;
 mod kicad_geom;
 pub mod kicad_io;
+mod kicad_net;
 mod kicad_pcb;
 mod kicad_pro;
 pub mod pipeline;

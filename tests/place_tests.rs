@@ -63,6 +63,7 @@ fn cap_placement(
         exclude_from_bom: false,
         exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
+        ..Default::default()
     }
 }
 
@@ -115,6 +116,7 @@ fn overlapping_decoupling_caps_legalized_with_cap_proximity_and_zero_overlaps() 
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             // All three caps initially overlap each other (and C1/C2 sit on top of U1 / far away).
             cap_placement("C1", (15.0, 10.0), 0.0, Side::Top, "VDD", "GND"),
@@ -156,6 +158,7 @@ fn overlapping_decoupling_caps_legalized_with_cap_proximity_and_zero_overlaps() 
         },
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
@@ -247,6 +250,7 @@ fn movable_cap_pushed_out_of_bga_shadow_and_keepout() {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             // Seeded directly inside U1's opposite-side BGA shadow on Bottom.
             cap_placement("C1", (15.0, 10.0), 0.0, Side::Bottom, "VDD", "GND"),
@@ -284,6 +288,7 @@ fn movable_cap_pushed_out_of_bga_shadow_and_keepout() {
         },
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
@@ -363,6 +368,7 @@ fn power_via_solver_thermal_array_and_plane_drops_clean_drc_and_no_chokes() {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             cap_placement("C1", (12.0, 14.0), 0.0, Side::Top, "VDD", "GND"),
             cap_placement("C2", (12.0, 10.5), 0.0, Side::Top, "VDD", "GND"),
@@ -429,6 +435,7 @@ fn power_via_solver_thermal_array_and_plane_drops_clean_drc_and_no_chokes() {
         },
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
@@ -523,6 +530,7 @@ fn power_via_solver_does_not_seal_adjacent_bga_pads_and_cli_place_works() {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             cap_placement("C1", (15.0, 10.0), 0.0, Side::Top, "VDD", "GND"),
         ],
@@ -563,6 +571,7 @@ fn power_via_solver_does_not_seal_adjacent_bga_pads_and_cli_place_works() {
         },
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();

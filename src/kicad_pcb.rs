@@ -7,8 +7,8 @@ use viahop::sexp::{self, SExp};
 use crate::geom::{ensure_ccw, local_to_board, polygon_area};
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FilledPour, FootprintDef, Keepout, LayerDef, LayerKind,
-    NetDef, Nm, Placement, PourPoly, PourSpec, Pt, Side, Stackup, Track, Via, default_net_class,
-    default_two_layer_stackup, mm,
+    NetDef, Nm, Placement, PourPoly, PourSpec, Pt, SchematicMeta, Side, Stackup, Track, Via,
+    default_net_class, default_two_layer_stackup, mm,
 };
 use crate::kicad_geom::{
     atom_at, chain_segments, child_atom, collect_poly_or_segment, discretize_arc, f64_at, has_flag,
@@ -549,6 +549,7 @@ fn parse_placed_footprint(
         }
     }
 
+    let orig_fp_name = fp_def.name.clone();
     let fp_key = match footprints.get(&fp_def.name) {
         Some(existing)
             if existing.pads == fp_def.pads
@@ -591,6 +592,57 @@ fn parse_placed_footprint(
         }
     }
 
+    let path = child_atom(node, "path")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let sheetname = child_atom(node, "sheetname")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| parse_footprint_prop(node, "Sheetname", "").filter(|s| !s.is_empty()));
+    let sheetfile = child_atom(node, "sheetfile")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| parse_footprint_prop(node, "Sheetfile", "").filter(|s| !s.is_empty()));
+    let mut fields = BTreeMap::new();
+    for prop in node.children_with_tag("property") {
+        let Some(k) = atom_at(prop, 1).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if matches!(
+            k,
+            "Reference" | "Value" | "Footprint" | "Sheetname" | "Sheetfile"
+        ) || k.starts_with("ki_")
+        {
+            continue;
+        }
+        if let Some(v) = atom_at(prop, 2).filter(|s| !s.is_empty()) {
+            if k == "Datasheet" && v == "~" {
+                continue;
+            }
+            fields.insert(k.to_string(), v.to_string());
+        }
+    }
+    let mpn = fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("mpn"))
+        .map(|(_, v)| v.clone());
+    let lcsc = fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("lcsc"))
+        .map(|(_, v)| v.clone());
+    let has_sch = path.is_some()
+        || sheetname.is_some()
+        || sheetfile.is_some()
+        || !fields.is_empty()
+        || orig_fp_name != fp_key;
+    let schematic = has_sch.then(|| SchematicMeta {
+        path,
+        sheetname,
+        sheetfile,
+        footprint: (!orig_fp_name.is_empty()).then_some(orig_fp_name),
+        fields,
+    });
+
     let mut pin_nets = BTreeMap::new();
     for (pin, net) in pad_nets {
         pin_nets.insert(pin, net);
@@ -604,12 +656,13 @@ fn parse_placed_footprint(
         side,
         locked: has_flag(node, "locked"),
         pin_nets,
-        mpn: None,
-        lcsc: None,
+        mpn,
+        lcsc,
         dnp,
         exclude_from_bom,
         exclude_from_pos,
         cpl_rotation_offset_deg: 0.0,
+        schematic,
     });
     Ok(())
 }

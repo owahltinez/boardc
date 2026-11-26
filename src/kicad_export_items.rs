@@ -385,7 +385,13 @@ pub(crate) fn write_footprint(
         "board_only"
     };
 
-    let _ = writeln!(out, "\t(footprint \"{}\"", esc(&fp.name));
+    let fp_id = pl
+        .schematic
+        .as_ref()
+        .and_then(|s| s.footprint.as_deref())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&fp.name);
+    let _ = writeln!(out, "\t(footprint \"{}\"", esc(fp_id));
     let _ = writeln!(out, "\t\t(layer \"{cu_layer}\")");
     let _ = writeln!(out, "\t\t(uuid \"{}\")", uuids.next());
     let _ = writeln!(
@@ -407,6 +413,32 @@ pub(crate) fn write_footprint(
         esc(&pl.value),
         uuids.next()
     );
+    if let Some(sch) = &pl.schematic {
+        for (k, v) in &sch.fields {
+            if matches!(
+                k.as_str(),
+                "Reference" | "Value" | "Footprint" | "Sheetname" | "Sheetfile"
+            ) {
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "\t\t(property \"{}\" \"{}\" (at 0 0 0) (layer \"{fab_layer}\") (hide yes) (uuid \"{}\") (effects (font (size 1 1) (thickness 0.15))))",
+                esc(k),
+                esc(v),
+                uuids.next()
+            );
+        }
+        if let Some(path) = sch.path.as_deref().filter(|s| !s.is_empty()) {
+            let _ = writeln!(out, "\t\t(path \"{}\")", esc(path));
+        }
+        if let Some(sheetname) = sch.sheetname.as_deref().filter(|s| !s.is_empty()) {
+            let _ = writeln!(out, "\t\t(sheetname \"{}\")", esc(sheetname));
+        }
+        if let Some(sheetfile) = sch.sheetfile.as_deref().filter(|s| !s.is_empty()) {
+            let _ = writeln!(out, "\t\t(sheetfile \"{}\")", esc(sheetfile));
+        }
+    }
     let _ = write!(out, "\t\t(attr {attr}");
     if pl.exclude_from_pos {
         out.push_str(" exclude_from_pos_files");

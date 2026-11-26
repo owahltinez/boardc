@@ -95,6 +95,7 @@ kicad-cli pcb render out/board.kicad_pcb -o out/render_bot.png --side bottom --q
 ## Spec Quick Reference
 
 - Parametric footprints supported natively: `chip2_pin` (`0201`/`0402`/`0603`/`0805`), `bga`, `qfn`, `sot23`, `pin_header`, plus `custom` pads/courtyards/graphics/keepouts.
+- External KiCad libraries & netlists: set `footprint_libs = ["path/to/lib.pretty"]` to load `.kicad_mod` footprints directly and `netlist = "path/to/design.net"` to import `.kicad_net`/`.net` pin nets, values, MPN/LCSC, DNP/BOM flags, and schematic `path`/`sheetname`/`sheetfile` metadata (preserved through `export-kicad` for `kicad-cli pcb drc --schematic-parity`).
 - Stackup (`[stackup]`): `thickness_nm`, `finish`, `pofv` (via plugging + filling + capping), and `dielectric_nm` (emitted to `<name>-job.gbrjob` and KiCad `(general)`/`(setup (stackup ...))`).
 - Constraints (`[constraints]`): `max_lengths`, `match_groups`, `cap_proximity`, `min_vias`, and `bga_shadows`.
 - Keepout kinds: `all`, `track`, `via`, `copper` (pours only, allows tracks), `placement`, or `custom` (`tracks`/`vias`/`copper`/`placement` booleans).

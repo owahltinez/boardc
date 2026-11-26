@@ -309,15 +309,37 @@ fn sample_spec() -> BoardSpec {
     }
 }
 
+fn spec_base_dir(path: &Path) -> Option<&Path> {
+    path.parent().filter(|p| !p.as_os_str().is_empty())
+}
+
+fn is_board_spec_json(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&text)
+    else {
+        return false;
+    };
+    map.contains_key("footprint_libs") || map.contains_key("netlist") || map.contains_key("size_nm")
+}
+
 fn load_board_input(path: &Path) -> Result<BoardIr, String> {
-    if path.extension().and_then(|s| s.to_str()) == Some("kicad_pcb") {
+    if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("kicad_pcb"))
+    {
         import_kicad_pcb(path, None)
+    } else if is_board_spec_json(path) {
+        let spec = load_spec_file(path)?;
+        BoardIr::from_spec_with_base(&spec, spec_base_dir(path))
     } else {
         match load_board_json(path) {
             Ok(ir) => Ok(ir),
             Err(_) => {
                 let spec = load_spec_file(path)?;
-                BoardIr::from_spec(&spec)
+                BoardIr::from_spec_with_base(&spec, spec_base_dir(path))
             }
         }
     }
@@ -353,7 +375,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::DumpSpec { input, format, out } => {
             let text = if let Some(path) = input {
                 let spec = load_spec_file(&path)?;
-                let ir = BoardIr::from_spec(&spec)?;
+                let ir = BoardIr::from_spec_with_base(&spec, spec_base_dir(&path))?;
                 serde_json::to_string_pretty(&ir)
                     .map_err(|e| format!("failed to serialize BoardIr: {e}"))?
             } else {

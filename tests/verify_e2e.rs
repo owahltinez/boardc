@@ -76,6 +76,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "R2".into(),
@@ -95,6 +96,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "R3".into(),
@@ -114,6 +116,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "R4".into(),
@@ -133,6 +136,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "J1".into(),
@@ -152,6 +156,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
         ],
         keepouts: Vec::new(),
@@ -191,6 +196,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
         constraints: Default::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();

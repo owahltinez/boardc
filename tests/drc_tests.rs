@@ -68,6 +68,7 @@ fn place_pin1(refdes: &str, fp: &str, x_mm: f64, y_mm: f64, side: Side, net: &st
         exclude_from_bom: false,
         exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
+        ..Default::default()
     }
 }
 
@@ -103,6 +104,7 @@ fn base_board() -> BoardIr {
         constraints: Constraints::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
     BoardIr::from_spec(&spec).unwrap()
 }
@@ -254,6 +256,7 @@ fn copper_clearances_and_filled_pour_clearances() {
         constraints: Default::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
     // Add track violating via#0
     spec.tracks.push(Track {
@@ -398,6 +401,7 @@ fn mechanical_drill_edge_keepout_and_courtyard_checks() {
         constraints: Default::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
     spec.placements
         .push(place_pin1("U4", "SMD", 20.5, 5.5, Side::Top, "SIG"));
@@ -491,6 +495,7 @@ fn connectivity_through_filled_pour_and_via_and_open_net() {
         constraints: Default::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
@@ -579,6 +584,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "C1".into(),
@@ -595,6 +601,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             // Passive on Bottom under U1 (allowed when allow_passives=true)
             Placement {
@@ -612,6 +619,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             // Active IC on Bottom under U1 (must violate BgaShadow)
             Placement {
@@ -629,6 +637,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
         ],
         keepouts: Vec::new(),
@@ -693,6 +702,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
         },
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
 
     let board = BoardIr::from_spec(&spec).unwrap();
@@ -814,6 +824,7 @@ fn cluster_kicad_drc_json_maps_coordinates_and_clusters_hotspots() {
         constraints: Default::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
     spec.vias.push(Via {
         net: "GND".into(),

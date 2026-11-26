@@ -15,6 +15,9 @@ use crate::kicad_geom::{
     atom_at, chain_segments, child_atom, collect_poly_or_segment, f64_at, parse_at, parse_fill,
     parse_graphic_node, parse_layers_list, parse_net_ref, parse_pt, parse_pts, parse_stroke_width,
 };
+pub use crate::kicad_net::{
+    KicadNetlist, NetlistComponent, NetlistNet, load_kicad_net, parse_kicad_net,
+};
 use crate::kicad_pcb;
 use crate::shapes::{capsule_poly, circle_poly, paths64_to_polys, polys_to_paths64, rect_poly};
 
