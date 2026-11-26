@@ -1,6 +1,9 @@
-use crate::fab_gerber::{GerberBuilder, pad_world_shape_with_margin};
-use crate::geom::{EPS_NM, local_to_board, pad_world_layers, remap_layer_for_side};
-use crate::ir::{BBoxNm, BoardIr, Graphic, Nm, Placement, Pt, Side};
+use gerber_types::Polarity;
+
+use crate::fab_gerber::GerberBuilder;
+use crate::fab_silk_clip::{MaskClipper, collect_mask_openings};
+use crate::geom::{local_to_board, polygon_area, remap_layer_for_side};
+use crate::ir::{BBoxNm, BoardIr, Graphic, Nm, Placement, PourPoly, Pt, Side};
 use crate::shapes::ResolvedShape;
 
 pub(crate) fn is_silk_layer(layer: &str, side: Side) -> bool {
@@ -8,48 +11,6 @@ pub(crate) fn is_silk_layer(layer: &str, side: Side) -> bool {
         Side::Top => matches!(layer, "F.Silk" | "F.SilkS" | "F.Silkscreen"),
         Side::Bottom => matches!(layer, "B.Silk" | "B.SilkS" | "B.Silkscreen"),
     }
-}
-
-pub(crate) fn collect_mask_openings(
-    board: &BoardIr,
-    side: Side,
-    cu_layers: &[String],
-) -> Vec<ResolvedShape> {
-    let mask_name = match side {
-        Side::Top => "F.Mask",
-        Side::Bottom => "B.Mask",
-    };
-    let cu_name = side.cu_layer();
-    let mut openings = Vec::new();
-    for pl in &board.placements {
-        let Some(fp) = board.footprints.get(&pl.footprint) else {
-            continue;
-        };
-        for pad in &fp.pads {
-            if !pad_world_layers(pad, pl.side, cu_layers)
-                .iter()
-                .any(|l| l == mask_name)
-            {
-                continue;
-            }
-            let margin = pad.mask_margin_nm.unwrap_or(board.rules.mask_expansion_nm);
-            if let Some(shape) = pad_world_shape_with_margin(pad, pl, margin) {
-                openings.push(shape);
-            }
-        }
-    }
-    for via in &board.vias {
-        if !via.tented && via.touches_layer(cu_name, &board.layers) {
-            let r = via.diameter / 2 + board.rules.mask_expansion_nm;
-            if r > 0 {
-                openings.push(ResolvedShape::Circle {
-                    center: via.pos,
-                    radius: r,
-                });
-            }
-        }
-    }
-    openings
 }
 
 /// Returns a 5x7 stroke polyline glyph (coordinates in `[0..=4] x [0..=6]`) for ASCII chars.
@@ -269,50 +230,6 @@ pub(crate) fn text_stroke_segments(
     segs
 }
 
-fn segment_hits_mask(a: Pt, b: Pt, radius: Nm, openings: &[ResolvedShape], clr: Nm) -> bool {
-    let req = (radius + clr) as f64;
-    let sb = BBoxNm::from_pts(&[a, b]).expand(radius + clr);
-    openings.iter().any(|op| {
-        if !op.bbox().intersects(sb) {
-            return false;
-        }
-        if a == b {
-            op.dist_to_point(a) < req
-        } else {
-            op.dist_to_capsule(a, b, radius + clr) < 0.0
-        }
-    })
-}
-
-fn point_hits_mask(p: Pt, radius: Nm, openings: &[ResolvedShape], clr: Nm) -> bool {
-    let sb = BBoxNm::from_pt(p, radius + clr);
-    openings
-        .iter()
-        .any(|op| op.bbox().intersects(sb) && op.dist_to_circle(p, radius + clr) < 0.0)
-}
-
-fn emit_clipped_segment(
-    builder: &mut GerberBuilder,
-    a: Pt,
-    b: Pt,
-    width: Nm,
-    openings: &[ResolvedShape],
-    clr: Nm,
-    depth: u8,
-) {
-    let r = (width / 2).max(10_000);
-    if !segment_hits_mask(a, b, r, openings, clr) {
-        builder.stroke_segment(a, b, width);
-        return;
-    }
-    if depth >= 3 || a.dist(b) < (width.max(100_000) as f64) {
-        return;
-    }
-    let mid = Pt::new((a.x + b.x) / 2, (a.y + b.y) / 2);
-    emit_clipped_segment(builder, a, mid, width, openings, clr, depth + 1);
-    emit_clipped_segment(builder, mid, b, width, openings, clr, depth + 1);
-}
-
 fn placement_local_bbox(fp: &crate::ir::FootprintDef) -> BBoxNm {
     if !fp.courtyard.is_empty() {
         return BBoxNm::from_pts(&fp.courtyard);
@@ -336,6 +253,41 @@ pub(crate) fn refdes_local_pos(board: &BoardIr, pl: &Placement) -> Pt {
     Pt::new((b.min_x + b.max_x) / 2, b.max_y + 450_000)
 }
 
+fn filled_graphic_shape(g: &Graphic, pl: Option<&Placement>) -> Option<ResolvedShape> {
+    let map_pt = |p: Pt| match pl {
+        Some(pl) => local_to_board(p, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side),
+        None => p,
+    };
+    match g {
+        Graphic::Circle {
+            center,
+            radius,
+            fill: true,
+            ..
+        } if *radius > 0 => Some(ResolvedShape::Circle {
+            center: map_pt(*center),
+            radius: *radius,
+        }),
+        Graphic::Rect {
+            min,
+            max,
+            fill: true,
+            ..
+        } => Some(ResolvedShape::polygon(vec![
+            map_pt(*min),
+            map_pt(Pt::new(max.x, min.y)),
+            map_pt(*max),
+            map_pt(Pt::new(min.x, max.y)),
+        ])),
+        Graphic::Poly {
+            verts, fill: true, ..
+        } if verts.len() >= 3 => Some(ResolvedShape::polygon(
+            verts.iter().map(|&v| map_pt(v)).collect(),
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) fn emit_silk_layer(
     builder: &mut GerberBuilder,
     board: &BoardIr,
@@ -348,8 +300,10 @@ pub(crate) fn emit_silk_layer(
     } else {
         Vec::new()
     };
-    let clr = board.rules.silk_clearance_nm;
+    let mut clipper = MaskClipper::new(openings, board.rules.silk_clearance_nm);
     let mut raw_segs: Vec<(Pt, Pt, Nm)> = Vec::new();
+    let mut filled_graphics: Vec<(&Graphic, Option<&Placement>)> = Vec::new();
+    let mut pin1_dots: Vec<(Pt, Nm)> = Vec::new();
 
     for pl in &board.placements {
         let Some(fp) = board.footprints.get(&pl.footprint) else {
@@ -357,27 +311,14 @@ pub(crate) fn emit_silk_layer(
         };
         let mut has_silk_dot = false;
         for g in &fp.graphics {
-            let layer = match g {
-                Graphic::Line { layer, .. }
-                | Graphic::Rect { layer, .. }
-                | Graphic::Circle { layer, .. }
-                | Graphic::Poly { layer, .. } => remap_layer_for_side(layer, pl.side),
-            };
+            let layer = remap_layer_for_side(g.layer(), pl.side);
             if !is_silk_layer(&layer, side) {
                 continue;
             }
             if matches!(g, Graphic::Circle { fill: true, .. }) {
                 has_silk_dot = true;
             }
-            collect_graphic_strokes_or_emit(
-                builder,
-                g,
-                Some(pl),
-                &openings,
-                clr,
-                clip_to_mask,
-                &mut raw_segs,
-            );
+            collect_silk_graphic(g, Some(pl), &mut raw_segs, &mut filled_graphics);
         }
 
         if pl.side == side && !pl.dnp {
@@ -395,10 +336,7 @@ pub(crate) fn emit_silk_layer(
                 };
                 let dot_local = Pt::new(b.min_x.min(pad1.pos.x) + dx, pad1.pos.y + dy);
                 let dot_world = local_to_board(dot_local, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
-                let dot_r = 120_000;
-                if !clip_to_mask || !point_hits_mask(dot_world, dot_r, &openings, clr) {
-                    builder.flash_circle(dot_world, dot_r * 2);
-                }
+                pin1_dots.push((dot_world, 120_000));
             }
             if !pl.refdes.is_empty() {
                 let text_center = refdes_local_pos(board, pl);
@@ -412,42 +350,59 @@ pub(crate) fn emit_silk_layer(
     }
 
     for g in &board.graphics {
-        let layer = match g {
-            Graphic::Line { layer, .. }
-            | Graphic::Rect { layer, .. }
-            | Graphic::Circle { layer, .. }
-            | Graphic::Poly { layer, .. } => layer.as_str(),
-        };
-        if is_silk_layer(layer, side) {
-            collect_graphic_strokes_or_emit(
-                builder,
-                g,
-                None,
-                &openings,
-                clr,
-                clip_to_mask,
-                &mut raw_segs,
-            );
+        if is_silk_layer(g.layer(), side) {
+            collect_silk_graphic(g, None, &mut raw_segs, &mut filled_graphics);
         }
     }
 
+    // Emit clipped filled regions (with Clear holes) first so Clear polarity never erases strokes or dots.
+    let mut clipped_polys: Vec<PourPoly> = Vec::new();
+    let mut unclipped_filled: Vec<(&Graphic, Option<&Placement>)> = Vec::new();
+    for (g, pl) in filled_graphics {
+        if clip_to_mask
+            && let Some(sh) = filled_graphic_shape(g, pl)
+            && let Some(polys) = clipper.clip_filled_shape(&sh)
+        {
+            clipped_polys.extend(polys);
+        } else {
+            unclipped_filled.push((g, pl));
+        }
+    }
+    clipped_polys.sort_by(|a, b| polygon_area(&b.outer).total_cmp(&polygon_area(&a.outer)));
+    for poly in &clipped_polys {
+        builder.fill_region(&poly.outer, Polarity::Dark);
+        for hole in &poly.holes {
+            builder.fill_region(hole, Polarity::Clear);
+        }
+    }
+    for (g, pl) in unclipped_filled {
+        builder.emit_graphic(g, pl);
+    }
+
+    for (dot_world, dot_r) in pin1_dots {
+        if !clip_to_mask || !clipper.point_hits_mask(dot_world, dot_r) {
+            builder.flash_circle(dot_world, dot_r * 2);
+        }
+    }
+
+    let mut clipped_buf = Vec::new();
     for (a, b, w) in raw_segs {
         if clip_to_mask {
-            emit_clipped_segment(builder, a, b, w, &openings, clr, 0);
+            clipper.clip_segment(a, b, w, &mut clipped_buf);
+            for &(ca, cb) in &clipped_buf {
+                builder.stroke_segment(ca, cb, w);
+            }
         } else {
             builder.stroke_segment(a, b, w);
         }
     }
 }
 
-fn collect_graphic_strokes_or_emit(
-    builder: &mut GerberBuilder,
-    g: &Graphic,
-    pl: Option<&Placement>,
-    openings: &[ResolvedShape],
-    clr: Nm,
-    clip_to_mask: bool,
+fn collect_silk_graphic<'a>(
+    g: &'a Graphic,
+    pl: Option<&'a Placement>,
     out_segs: &mut Vec<(Pt, Pt, Nm)>,
+    out_filled: &mut Vec<(&'a Graphic, Option<&'a Placement>)>,
 ) {
     let map_pt = |p: Pt| match pl {
         Some(pl) => local_to_board(p, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side),
@@ -495,39 +450,9 @@ fn collect_graphic_strokes_or_emit(
                 out_segs.push((pts[i], pts[(i + 1) % pts.len()], *width));
             }
         }
-        Graphic::Circle {
-            center,
-            radius,
-            fill: true,
-            ..
-        } => {
-            let c = map_pt(*center);
-            if !clip_to_mask || !point_hits_mask(c, *radius, openings, clr) {
-                builder.flash_circle(c, *radius * 2);
-            }
-        }
-        other => {
-            let shape_opt = match other {
-                Graphic::Rect { min, max, .. } => Some(ResolvedShape::polygon(vec![
-                    map_pt(*min),
-                    map_pt(Pt::new(max.x, min.y)),
-                    map_pt(*max),
-                    map_pt(Pt::new(min.x, max.y)),
-                ])),
-                Graphic::Poly { verts, .. } if verts.len() >= 3 => Some(ResolvedShape::polygon(
-                    verts.iter().map(|&v| map_pt(v)).collect(),
-                )),
-                _ => None,
-            };
-            let blocked = clip_to_mask
-                && shape_opt.is_some_and(|sh| {
-                    openings
-                        .iter()
-                        .any(|op| op.dist_to_shape(&sh) < clr as f64 - EPS_NM)
-                });
-            if !blocked {
-                builder.emit_graphic(other, pl);
-            }
-        }
+        Graphic::Circle { fill: true, .. }
+        | Graphic::Rect { fill: true, .. }
+        | Graphic::Poly { fill: true, .. } => out_filled.push((g, pl)),
+        _ => {}
     }
 }

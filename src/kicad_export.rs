@@ -153,6 +153,15 @@ fn write_setup(out: &mut String, board: &BoardIr) {
         nm_to_mm(board.rules.mask_expansion_nm)
     );
     out.push_str("\t\t(allow_soldermask_bridges_in_footprints no)\n");
+    if board.pofv_enabled() || !board.vias.is_empty() {
+        let yn = if board.pofv_enabled() || board.vias.iter().any(|v| v.tented) {
+            "yes"
+        } else {
+            "no"
+        };
+        let _ = writeln!(out, "\t\t(tenting (front {yn}) (back {yn}))");
+        let _ = writeln!(out, "\t\t(covering (front {yn}) (back {yn}))");
+    }
     if board.pofv_enabled() {
         out.push_str("\t\t(plugging (front yes) (back yes))\n");
         out.push_str("\t\t(capping yes)\n");
@@ -243,7 +252,7 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
     let mut uuids = UuidGen(0);
     let net_ids = collect_net_ids(board);
 
-    let kicad_version = if board.pofv_enabled() {
+    let kicad_version = if board.pofv_enabled() || !board.vias.is_empty() {
         "20260206"
     } else {
         "20241229"
@@ -313,11 +322,18 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
         );
     }
 
+    let cu_layers = board.copper_layer_names();
     for via in &board.vias {
         let net_id = net_ids.get(&via.net).copied().unwrap_or(0);
+        let kind = if via.is_through_hole(&cu_layers, &board.layers) {
+            ""
+        } else {
+            "blind "
+        };
+        let yn = if via.tented { "yes" } else { "no" };
         let _ = writeln!(
             out,
-            "\t(via (at {:.6} {:.6}) (size {:.6}) (drill {:.6}) (layers \"{}\" \"{}\") (net {net_id}) (uuid \"{}\"))",
+            "\t(via {kind}(at {:.6} {:.6}) (size {:.6}) (drill {:.6}) (layers \"{}\" \"{}\") (tenting (front {yn}) (back {yn})) (covering (front {yn}) (back {yn})) (net {net_id}) (uuid \"{}\"))",
             nm_to_mm(via.pos.x),
             nm_to_mm(-via.pos.y),
             nm_to_mm(via.diameter),

@@ -64,12 +64,13 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     let mut pours = Vec::new();
     let mut filled_pours = Vec::new();
     let mut tracks = Vec::new();
-    let mut vias = Vec::new();
+    let mut parsed_vias = Vec::new();
     let mut graphics = Vec::new();
     let mut edge_open: Vec<Vec<Pt>> = Vec::new();
     let mut edge_closed: Vec<Vec<Pt>> = Vec::new();
     let mut layer_thickness: HashMap<String, Nm> = HashMap::new();
     let mut stackup = Stackup::default();
+    let mut setup_default_tented: Option<bool> = None;
 
     for node in items.iter().skip(1) {
         match node.tag() {
@@ -86,7 +87,12 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                 }
             }
             Some("layers") => layers = parse_layers_block(node),
-            Some("setup") => parse_setup(node, &mut layer_thickness, &mut stackup),
+            Some("setup") => parse_setup(
+                node,
+                &mut layer_thickness,
+                &mut stackup,
+                &mut setup_default_tented,
+            ),
             Some("net") => {
                 if let (Some(id), Some(n)) = (f64_at(node, 1).map(|v| v as i64), atom_at(node, 2))
                     && !n.is_empty()
@@ -104,7 +110,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
             )?,
             Some("segment") => tracks.push(parse_segment(node, &net_id_map)?),
             Some("arc") => tracks.extend(parse_track_arc(node, &net_id_map)?),
-            Some("via") => vias.push(parse_via(node, &net_id_map)?),
+            Some("via") => parsed_vias.push(parse_via(node, &net_id_map)?),
             Some("zone") => parse_board_zone(
                 node,
                 &net_id_map,
@@ -123,6 +129,15 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
             _ => {}
         }
     }
+
+    let default_tented = setup_default_tented.unwrap_or(true);
+    let vias: Vec<Via> = parsed_vias
+        .into_iter()
+        .map(|(mut via, override_tented)| {
+            via.tented = override_tented.unwrap_or(default_tented);
+            via
+        })
+        .collect();
 
     for layer in &mut layers {
         if let Some(&t) = layer_thickness.get(&layer.name) {
@@ -365,7 +380,55 @@ fn is_dielectric_stackup_layer(node: &SExp, layer_type: &str) -> bool {
         })
 }
 
-fn parse_setup(node: &SExp, thickness: &mut HashMap<String, Nm>, stackup: &mut Stackup) {
+fn parse_tenting_list(attr: &SExp) -> Option<bool> {
+    let front = child_atom(attr, "front").map(|v| v == "yes");
+    let back = child_atom(attr, "back").map(|v| v == "yes");
+    match (front, back) {
+        (Some(f), Some(b)) => Some(f && b),
+        (Some(s), None) | (None, Some(s)) => Some(s),
+        (None, None) => {
+            let mut has_side = false;
+            let mut has_none = false;
+            for tok in attr.as_list().into_iter().flatten().skip(1) {
+                match tok.as_atom() {
+                    Some("front") | Some("back") => has_side = true,
+                    Some("none") => has_none = true,
+                    _ => {}
+                }
+            }
+            if has_side {
+                Some(true)
+            } else if has_none {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn parse_via_tenting_override(node: &SExp) -> Option<bool> {
+    node.find_child("tenting")
+        .and_then(parse_tenting_list)
+        .or_else(|| node.find_child("covering").and_then(parse_tenting_list))
+}
+
+fn parse_setup(
+    node: &SExp,
+    thickness: &mut HashMap<String, Nm>,
+    stackup: &mut Stackup,
+    default_tented: &mut Option<bool>,
+) {
+    if let Some(t) = parse_via_tenting_override(node) {
+        *default_tented = Some(t);
+    } else if default_tented.is_none()
+        && node
+            .find_child("pcbplotparams")
+            .and_then(|p| child_atom(p, "viasonmask"))
+            == Some("true")
+    {
+        *default_tented = Some(false);
+    }
     if child_atom(node, "filling") == Some("yes") || child_atom(node, "capping") == Some("yes") {
         stackup.pofv = true;
     }
@@ -593,14 +656,17 @@ fn parse_track_arc(node: &SExp, net_id_map: &HashMap<i64, String>) -> Result<Vec
         .collect())
 }
 
-fn parse_via(node: &SExp, net_id_map: &HashMap<i64, String>) -> Result<Via, String> {
+fn parse_via(
+    node: &SExp,
+    net_id_map: &HashMap<i64, String>,
+) -> Result<(Via, Option<bool>), String> {
     let layers_vec = parse_layers_list(node, None);
     let layers = match layers_vec.as_slice() {
         [a, b, ..] => (a.clone(), b.clone()),
         [a] => (a.clone(), a.clone()),
         _ => ("F.Cu".into(), "B.Cu".into()),
     };
-    Ok(Via {
+    let via = Via {
         net: parse_net_ref(node, net_id_map),
         pos: node
             .find_child("at")
@@ -619,5 +685,6 @@ fn parse_via(node: &SExp, net_id_map: &HashMap<i64, String>) -> Result<Via, Stri
         layers,
         locked: has_flag(node, "locked"),
         tented: true,
-    })
+    };
+    Ok((via, parse_via_tenting_override(node)))
 }

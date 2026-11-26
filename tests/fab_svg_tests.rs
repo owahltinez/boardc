@@ -1187,3 +1187,338 @@ pin_nets = { "1" = "SIG", "2" = "GND" }
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+fn gerber_stroke_segments_mm(path: &std::path::Path) -> Vec<((f64, f64), (f64, f64))> {
+    use gerber_types::{Command, DCode, FunctionCode, GCode, Operation};
+    let file = fs::File::open(path).unwrap();
+    let doc = gerber_parser::parse(BufReader::new(file)).unwrap();
+    assert!(doc.errors().is_empty(), "{:?}", doc.errors());
+    let mut cur = (0.0_f64, 0.0_f64);
+    let mut in_region = false;
+    let mut segs = Vec::new();
+    for cmd in doc.commands() {
+        match cmd {
+            Command::FunctionCode(FunctionCode::GCode(GCode::RegionMode(on))) => {
+                in_region = *on;
+            }
+            Command::FunctionCode(FunctionCode::DCode(DCode::Operation(op))) => {
+                let prev = cur;
+                let coords = match op {
+                    Operation::Move(c) | Operation::Interpolate(c, _) | Operation::Flash(c) => c,
+                };
+                if let Some(c) = coords {
+                    if let Some(x) = c.x {
+                        cur.0 = f64::from(x);
+                    }
+                    if let Some(y) = c.y {
+                        cur.1 = f64::from(y);
+                    }
+                }
+                if !in_region && matches!(op, Operation::Interpolate(_, _)) {
+                    segs.push((prev, cur));
+                }
+            }
+            _ => {}
+        }
+    }
+    segs
+}
+
+#[test]
+fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
+    use boardc::ir::Graphic;
+
+    let tmp = fresh_tmp_dir("silk_clip");
+    let mut footprints = BTreeMap::new();
+    footprints.insert(
+        "PAD_2MM".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Rect {
+                    width: mm(2.0),
+                    height: mm(2.0),
+                },
+                pos: Pt::new(0, 0),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            }],
+            courtyard: Vec::new(),
+            graphics: Vec::new(),
+            keepouts: Vec::new(),
+        },
+    );
+    footprints.insert(
+        "PAD_CIRC".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Circle { diameter: mm(1.0) },
+                pos: Pt::new(0, 0),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            }],
+            courtyard: Vec::new(),
+            graphics: Vec::new(),
+            keepouts: Vec::new(),
+        },
+    );
+    footprints.insert(
+        "PAD_OVAL".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Oval {
+                    width: mm(2.4),
+                    height: mm(1.0),
+                },
+                pos: Pt::new(0, 0),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            }],
+            courtyard: Vec::new(),
+            graphics: Vec::new(),
+            keepouts: Vec::new(),
+        },
+    );
+
+    let spec = BoardSpec {
+        name: "silk_clip".into(),
+        size_nm: Some([mm(40.0), mm(30.0)]),
+        footprints,
+        placements: vec![
+            Placement {
+                refdes: String::new(),
+                footprint: "PAD_2MM".into(),
+                pos: Pt::new(mm(10.0), mm(10.0)),
+                dnp: true,
+                ..Default::default()
+            },
+            Placement {
+                refdes: String::new(),
+                footprint: "PAD_CIRC".into(),
+                pos: Pt::new(mm(11.0), mm(21.0)),
+                dnp: true,
+                ..Default::default()
+            },
+            Placement {
+                refdes: String::new(),
+                footprint: "PAD_OVAL".into(),
+                pos: Pt::new(mm(25.0), mm(21.0)),
+                rot_deg: 45.0,
+                dnp: true,
+                ..Default::default()
+            },
+        ],
+        vias: vec![
+            Via {
+                net: "VCC".into(),
+                pos: Pt::new(mm(20.0), mm(10.0)),
+                diameter: mm(1.0),
+                drill: mm(0.4),
+                layers: ("F.Cu".into(), "B.Cu".into()),
+                locked: true,
+                tented: false,
+            },
+            Via {
+                net: "GND".into(),
+                pos: Pt::new(mm(25.0), mm(10.0)),
+                diameter: mm(1.0),
+                drill: mm(0.4),
+                layers: ("F.Cu".into(), "B.Cu".into()),
+                locked: true,
+                tented: true,
+            },
+        ],
+        graphics: vec![
+            // Long 10 mm stroke crossing 2x2 pad at (10, 10).
+            Graphic::Line {
+                layer: "F.SilkS".into(),
+                a: Pt::new(mm(5.0), mm(10.0)),
+                b: Pt::new(mm(15.0), mm(10.0)),
+                width: mm(0.15),
+            },
+            // Stroke crossing untented via at (20, 10) and tented via at (25, 10).
+            Graphic::Line {
+                layer: "F.SilkS".into(),
+                a: Pt::new(mm(17.0), mm(10.0)),
+                b: Pt::new(mm(28.0), mm(10.0)),
+                width: mm(0.15),
+            },
+            // Board F.Mask graphic opening [30, 9]..[32, 11] crossed by vertical silk line.
+            Graphic::Rect {
+                layer: "F.Mask".into(),
+                min: Pt::new(mm(30.0), mm(9.0)),
+                max: Pt::new(mm(32.0), mm(11.0)),
+                width: 0,
+                fill: true,
+            },
+            Graphic::Line {
+                layer: "F.SilkS".into(),
+                a: Pt::new(mm(31.0), mm(6.0)),
+                b: Pt::new(mm(31.0), mm(14.0)),
+                width: mm(0.15),
+            },
+            // Filled silkscreen rect wrapping circular pad at (11, 21).
+            Graphic::Rect {
+                layer: "F.SilkS".into(),
+                min: Pt::new(mm(8.0), mm(18.0)),
+                max: Pt::new(mm(14.0), mm(24.0)),
+                width: 0,
+                fill: true,
+            },
+            // Diagonal stroke crossing rotated oval pad at (25, 21).
+            Graphic::Line {
+                layer: "F.SilkS".into(),
+                a: Pt::new(mm(21.0), mm(17.0)),
+                b: Pt::new(mm(29.0), mm(25.0)),
+                width: mm(0.15),
+            },
+        ],
+        rules: DesignRules {
+            mask_expansion_nm: mm(0.05),
+            silk_clearance_nm: mm(0.15),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let board = BoardIr::from_spec(&spec).unwrap();
+    let board_path = tmp.join("board.json");
+    boardc::ir::save_board_json(&board, &board_path).unwrap();
+
+    // CLI `--subtract-soldermask` must succeed and produce exact clipped silkscreen.
+    let fab_clipped = tmp.join("fab_clipped");
+    let res_sub = Command::new(env!("CARGO_BIN_EXE_boardc"))
+        .args([
+            "fab",
+            board_path.to_str().unwrap(),
+            "-o",
+            fab_clipped.to_str().unwrap(),
+            "--subtract-soldermask",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        res_sub.status.success(),
+        "boardc fab --subtract-soldermask failed: {}",
+        String::from_utf8_lossy(&res_sub.stderr)
+    );
+
+    let segs = gerber_stroke_segments_mm(&fab_clipped.join("F_Silkscreen.gto"));
+    let find_hseg = |y_mm: f64, x_lo: f64, x_hi: f64| {
+        segs.iter().any(|&((x0, y0), (x1, y1))| {
+            let (a, b) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
+            (y0 - y_mm).abs() < 0.005
+                && (y1 - y_mm).abs() < 0.005
+                && (a - x_lo).abs() < 0.01
+                && (b - x_hi).abs() < 0.01
+        })
+    };
+
+    // 2x2 pad + 0.05 mask + 0.075 half-width + 0.15 silk_clearance => gap [8.725, 11.275].
+    assert!(
+        find_hseg(10.0, 5.0, 8.725) && find_hseg(10.0, 11.275, 15.0),
+        "expected exact clipped pad segments [5, 8.725] and [11.275, 15], got: {segs:?}"
+    );
+    // Untented via r=0.5 + 0.05 + 0.075 + 0.15 = 0.775 around x=20 => [17, 19.225] & [20.775, 28]; tented via at x=25 unclipped.
+    assert!(
+        find_hseg(10.0, 17.0, 19.225) && find_hseg(10.0, 20.775, 28.0),
+        "expected exact clipped untented-via segments (tented via untouched), got: {segs:?}"
+    );
+    // Board F.Mask rect [30, 9]..[32, 11] + 0.075 + 0.15 => vertical gap [8.775, 11.225].
+    let has_vseg = |y_lo: f64, y_hi: f64| {
+        segs.iter().any(|&((x0, y0), (x1, y1))| {
+            let (a, b) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
+            (x0 - 31.0).abs() < 0.005
+                && (x1 - 31.0).abs() < 0.005
+                && (a - y_lo).abs() < 0.01
+                && (b - y_hi).abs() < 0.01
+        })
+    };
+    assert!(
+        has_vseg(6.0, 8.775) && has_vseg(11.225, 14.0),
+        "expected vertical stroke clipped against F.Mask board graphic, got: {segs:?}"
+    );
+
+    // Diagonal stroke crossing rotated oval pad at (25, 21) must split cleanly into two pieces outside pad.
+    let diag_segs: Vec<_> = segs
+        .iter()
+        .filter(|&&((x0, y0), (x1, y1))| {
+            x0 >= 20.5 && x1 <= 29.5 && y0 >= 16.5 && y1 <= 25.5 && (x1 - x0).abs() > 0.1
+        })
+        .collect();
+    assert_eq!(
+        diag_segs.len(),
+        2,
+        "expected diagonal stroke split into 2 pieces by rotated oval pad, got: {diag_segs:?}"
+    );
+
+    // Filled silkscreen rect wrapping circular pad must survive as G36* region with %LPC*% cutout hole.
+    let silk_txt = fs::read_to_string(fab_clipped.join("F_Silkscreen.gto")).unwrap();
+    assert!(
+        silk_txt.contains("G36*") && silk_txt.contains("%LPC*%"),
+        "expected clipped filled silkscreen region with cutout hole"
+    );
+    let last_lpc = silk_txt.rfind("%LPC*%").unwrap();
+    let last_lpd = silk_txt.rfind("%LPD*%").unwrap();
+    assert!(
+        last_lpd > last_lpc,
+        "strokes must be emitted after filled silkscreen %LPC*% holes"
+    );
+
+    let rep = boardc::verify::verify_fab_outputs(&board, &fab_clipped).unwrap();
+    assert!(rep.passed, "clipped fab verify failed: {:?}", rep.errors);
+
+    // CLI `--no-clip-silk` preserves full unclipped stroke (5, 10) -> (15, 10).
+    let fab_raw = tmp.join("fab_raw");
+    let res_raw = Command::new(env!("CARGO_BIN_EXE_boardc"))
+        .args([
+            "fab",
+            board_path.to_str().unwrap(),
+            "-o",
+            fab_raw.to_str().unwrap(),
+            "--no-clip-silk",
+        ])
+        .output()
+        .unwrap();
+    assert!(res_raw.status.success());
+    let raw_segs = gerber_stroke_segments_mm(&fab_raw.join("F_Silkscreen.gto"));
+    assert!(
+        raw_segs.iter().any(|&((x0, y0), (x1, y1))| {
+            (y0 - 10.0).abs() < 0.005
+                && (y1 - 10.0).abs() < 0.005
+                && (x0 - 5.0).abs() < 0.01
+                && (x1 - 15.0).abs() < 0.01
+        }),
+        "expected unclipped (5,10)->(15,10) segment with --no-clip-silk, got: {raw_segs:?}"
+    );
+
+    // Passing both `--subtract-soldermask` and `--no-clip-silk` must fail with a CLI conflict error.
+    let res_conflict = Command::new(env!("CARGO_BIN_EXE_boardc"))
+        .args([
+            "fab",
+            board_path.to_str().unwrap(),
+            "-o",
+            fab_raw.to_str().unwrap(),
+            "--subtract-soldermask",
+            "--no-clip-silk",
+        ])
+        .output()
+        .unwrap();
+    assert!(!res_conflict.status.success());
+
+    let _ = fs::remove_dir_all(&tmp);
+}

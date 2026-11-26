@@ -12,6 +12,7 @@ pub mod fab;
 mod fab_gerber;
 mod fab_job;
 mod fab_silk;
+mod fab_silk_clip;
 pub mod footprints;
 pub mod geom;
 pub mod ir;

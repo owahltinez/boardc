@@ -100,7 +100,7 @@ pub(crate) fn inflate_round_outer(paths: &Paths64, delta: Nm) -> Paths64 {
     )
 }
 
-fn shape_inflated_poly(shape: &ResolvedShape, delta: Nm) -> Vec<Pt> {
+pub(crate) fn shape_inflated_poly(shape: &ResolvedShape, delta: Nm) -> Vec<Pt> {
     match shape {
         ResolvedShape::Circle { center, radius } => circle_poly_outer(*center, *radius + delta),
         ResolvedShape::Capsule { a, b, radius } => {
