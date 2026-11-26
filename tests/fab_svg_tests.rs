@@ -733,6 +733,22 @@ max = { x = 400000, y = 400000 }
 width = 0
 fill = true
 
+[footprints.PASTE_GFX_ONLY]
+kind = "custom"
+[[footprints.PASTE_GFX_ONLY.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "rect", width = 1000000, height = 1000000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu", "F.Mask"]
+[[footprints.PASTE_GFX_ONLY.graphics]]
+kind = "rect"
+layer = "F.Paste"
+min = { x = -350000, y = -350000 }
+max = { x = 350000, y = 350000 }
+width = 0
+fill = true
+
 [footprints.TP_PAD]
 kind = "custom"
 [[footprints.TP_PAD.pads]]
@@ -764,6 +780,13 @@ value = "0R"
 pos = { x = 20000000, y = 8000000 }
 side = "bottom"
 dnp = true
+
+[[placements]]
+refdes = "U_PASTE_GFX"
+footprint = "PASTE_GFX_ONLY"
+value = "STENCIL"
+pos = { x = 20000000, y = 14000000 }
+side = "top"
 
 [[placements]]
 refdes = "TP1"
@@ -804,6 +827,10 @@ exclude_from_pos = true
     assert!(
         near(&f_paste_pts, 10.0, 8.0, 2.0),
         "R1 missing from F_Paste"
+    );
+    assert!(
+        near(&f_paste_pts, 20.0, 14.0, 1.0),
+        "populated footprint F.Paste graphic (no paste pad) missing from F_Paste"
     );
     assert!(
         near(&f_paste_pts, 30.0, 20.0, 2.0),
@@ -879,35 +906,25 @@ exclude_from_pos = true
     let top_svg = render_board_svg(&board, None, &SvgOptions::default());
     let silk_start = top_svg.find("id=\"silkscreen\"").unwrap();
     let silk_end = top_svg[silk_start..].find("</g>").unwrap() + silk_start;
-    let silk_svg = &top_svg[silk_start..silk_end];
-    // Top SVG uses SVG Y = -board_y, so TP1 at (30, 20) draws refdes lines near x in [28, 32], y in [-22, -19].
-    let svg_has_silk_near = |cx: f64, cy_board: f64| {
-        silk_svg.lines().any(|line| {
-            let Some(x1) = line
-                .split("x1=\"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .and_then(|s| s.parse::<f64>().ok())
-            else {
-                return false;
-            };
-            let Some(y1) = line
-                .split("y1=\"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .and_then(|s| s.parse::<f64>().ok())
-            else {
-                return false;
-            };
-            (x1 - cx).abs() <= 2.5 && (y1 + cy_board).abs() <= 2.5
-        })
+    let svg_attr = |line: &str, name: &str| {
+        line.split_once(name)?
+            .1
+            .split('"')
+            .next()?
+            .parse::<f64>()
+            .ok()
     };
+    // Top SVG uses SVG Y = -board_y; negate y1 back to board coordinates to reuse `near`.
+    let svg_silk_pts: Vec<(f64, f64)> = top_svg[silk_start..silk_end]
+        .lines()
+        .filter_map(|line| Some((svg_attr(line, "x1=\"")?, -svg_attr(line, "y1=\"")?)))
+        .collect();
     assert!(
-        svg_has_silk_near(30.0, 20.5),
+        near(&svg_silk_pts, 30.0, 20.5, 2.5),
         "TP1 should appear on SVG silkscreen"
     );
     assert!(
-        !svg_has_silk_near(10.0, 20.5),
+        !near(&svg_silk_pts, 10.0, 20.5, 2.5),
         "R_DNP_TOP should be hidden on SVG silkscreen"
     );
 
