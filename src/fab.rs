@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use gerber_types::{ExtendedPosition, FileFunction, Polarity, Position, Profile};
 use serde::{Deserialize, Serialize};
 
-pub use crate::fab_drawings::render_drill_report;
-use crate::fab_drawings::{
-    collect_drill_sections, format_drill_report, has_bottom_assembly, render_assembly_svg,
+use crate::fab_assembly::{has_bottom_assembly, render_assembly_svg};
+pub use crate::fab_drills::render_drill_report;
+use crate::fab_drills::{
+    collect_drill_sections, emit_excellon_section, format_drill_report,
     render_drill_map_svg_with_sections,
 };
 use crate::fab_gerber::{
@@ -17,10 +18,10 @@ use crate::fab_job::emit_gbrjob;
 use crate::fab_silk::{emit_silk_layer, push_graphic_mask_shapes};
 use crate::geom::{pad_copper_layers, pad_world_layers, polygon_area, remap_layer_for_side};
 use crate::ir::{
-    BoardIr, FootprintDef, LayerKind, Nm, PadKind, Placement, PourPoly, Pt, Side, nm_to_mm,
-    safe_slug,
+    BoardIr, FootprintDef, LayerKind, PadKind, Placement, PourPoly, Side, nm_to_mm, safe_slug,
 };
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
+use crate::svg::DEFAULT_SVG_MARGIN_MM;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -68,12 +69,7 @@ impl FabManifest {
         out.push(self.cpl_csv.clone());
         out.push(self.gbrjob.clone());
         out.extend(self.assembly_svgs.iter().cloned());
-        if let Some(ref p) = self.drill_map_svg {
-            out.push(p.clone());
-        }
-        if let Some(ref p) = self.drill_report {
-            out.push(p.clone());
-        }
+        out.extend(self.drill_map_svg.iter().chain(&self.drill_report).cloned());
         out
     }
 }
@@ -295,39 +291,6 @@ fn emit_edge_cuts(board: &BoardIr, out_path: &Path) -> Result<(), String> {
     b.write_file(out_path)
 }
 
-fn emit_excellon(
-    path: &Path,
-    by_dia: &BTreeMap<Nm, Vec<Pt>>,
-    span_comment: Option<(&str, &str)>,
-) -> Result<(), String> {
-    let mut out = String::new();
-    out.push_str("M48\n");
-    out.push_str("; DRILL file {boardc}\n");
-    if let Some((l0, l1)) = span_comment {
-        out.push_str(&format!("; LAYER_SPAN={l0}..{l1}\n"));
-    }
-    out.push_str("; FORMAT={-:-/ absolute / metric / decimal}\n");
-    out.push_str("FMAT,2\n");
-    out.push_str("METRIC,TZ\n");
-    for (idx, dia) in by_dia.keys().enumerate() {
-        out.push_str(&format!("T{:02}C{:.4}\n", idx + 1, nm_to_mm(*dia)));
-    }
-    out.push_str("%\n");
-    out.push_str("G90\n");
-    out.push_str("G05\n");
-    for (idx, pts) in by_dia.values().enumerate() {
-        out.push_str(&format!("T{:02}\n", idx + 1));
-        for pt in pts {
-            out.push_str(&format!("X{:.4}Y{:.4}\n", nm_to_mm(pt.x), nm_to_mm(pt.y)));
-        }
-    }
-    if !by_dia.is_empty() {
-        out.push_str("T00\n");
-    }
-    out.push_str("M30\n");
-    fs::write(path, out).map_err(|e| format!("failed to write drill '{}': {e}", path.display()))
-}
-
 fn csv_escape(field: &str) -> String {
     if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
@@ -466,8 +429,7 @@ pub fn export_fab(
     let mut drill_files = Vec::with_capacity(drill_sections.len());
     for sec in &drill_sections {
         let path = out_dir.join(&sec.filename);
-        let span = sec.span.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
-        emit_excellon(&path, &sec.by_dia, span)?;
+        emit_excellon_section(&path, sec)?;
         drill_files.push(path);
     }
 
@@ -481,20 +443,26 @@ pub fn export_fab(
     let mut assembly_svgs = Vec::new();
     if cfg.assembly {
         let top_path = out_dir.join(format!("{slug}-assembly-top.svg"));
-        fs::write(&top_path, render_assembly_svg(board, Side::Top, 2.0))
-            .map_err(|e| format!("failed to write '{}': {e}", top_path.display()))?;
+        fs::write(
+            &top_path,
+            render_assembly_svg(board, Side::Top, DEFAULT_SVG_MARGIN_MM),
+        )
+        .map_err(|e| format!("failed to write '{}': {e}", top_path.display()))?;
         assembly_svgs.push(top_path);
         if has_bottom_assembly(board) {
             let bot_path = out_dir.join(format!("{slug}-assembly-bottom.svg"));
-            fs::write(&bot_path, render_assembly_svg(board, Side::Bottom, 2.0))
-                .map_err(|e| format!("failed to write '{}': {e}", bot_path.display()))?;
+            fs::write(
+                &bot_path,
+                render_assembly_svg(board, Side::Bottom, DEFAULT_SVG_MARGIN_MM),
+            )
+            .map_err(|e| format!("failed to write '{}': {e}", bot_path.display()))?;
             assembly_svgs.push(bot_path);
         }
     }
 
     let drill_map_svg = if cfg.drill_map {
         let path = out_dir.join(format!("{slug}-drl_map.svg"));
-        let svg = render_drill_map_svg_with_sections(board, &drill_sections, 2.0);
+        let svg = render_drill_map_svg_with_sections(board, &drill_sections, DEFAULT_SVG_MARGIN_MM);
         fs::write(&path, svg).map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
         Some(path)
     } else {

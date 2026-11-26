@@ -616,7 +616,15 @@ fn run(cli: Cli) -> Result<(), String> {
             } else {
                 let mut extras = String::new();
                 if !manifest.assembly_svgs.is_empty() {
-                    extras.push_str(&format!(", {} assembly SVGs", manifest.assembly_svgs.len()));
+                    let noun = if manifest.assembly_svgs.len() == 1 {
+                        "SVG"
+                    } else {
+                        "SVGs"
+                    };
+                    extras.push_str(&format!(
+                        ", {} assembly {noun}",
+                        manifest.assembly_svgs.len()
+                    ));
                 }
                 if let Some(ref p) = manifest.drill_map_svg {
                     extras.push_str(&format!(", drill_map={}", p.display()));
@@ -644,7 +652,11 @@ fn run(cli: Cli) -> Result<(), String> {
             no_hotspots,
         } => {
             let ir = load_board_input(&input)?;
-            if out.extension().and_then(|s| s.to_str()) == Some("svg") {
+            let is_svg_file = out
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+            if is_svg_file {
                 let svg_view = if let Some(l) = layer {
                     SvgView::Layer(l)
                 } else {

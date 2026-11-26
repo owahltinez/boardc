@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
-use crate::geom::{UnionFind, local_to_board, pad_copper_layers, pad_to_world_shape};
+use crate::geom::{UnionFind, pad_copper_layers, pad_to_world_shape};
 use crate::ir::{BoardIr, Nm, PadKind, Pt};
 use crate::poly_index::IndexedPour;
 use crate::shapes::ResolvedShape;
@@ -137,55 +137,6 @@ pub(crate) fn match_drill_lists(
     }
     let extra = used.iter().filter(|u| !**u).count();
     (matched, mismatches + extra)
-}
-
-pub(crate) struct ExpectedDrills {
-    pub(crate) pth_through: DrillHits,
-    pub(crate) npth: DrillHits,
-    pub(crate) pth_spans: BTreeMap<(String, String), DrillHits>,
-}
-
-pub(crate) fn expected_drills(board: &BoardIr) -> ExpectedDrills {
-    let cu_layers = board.copper_layer_names();
-    let mut pth_through = Vec::new();
-    let mut npth = Vec::new();
-    let mut pth_spans: BTreeMap<(String, String), DrillHits> = BTreeMap::new();
-    for via in &board.vias {
-        if via.drill <= 0 {
-            continue;
-        }
-        if via.is_through_hole(&cu_layers, &board.layers) {
-            pth_through.push((via.drill, via.pos));
-        } else {
-            let span = via.span_layer_pair(&cu_layers, &board.layers);
-            pth_spans
-                .entry(span)
-                .or_default()
-                .push((via.drill, via.pos));
-        }
-    }
-    for pl in &board.placements {
-        let Some(fp) = board.footprints.get(&pl.footprint) else {
-            continue;
-        };
-        for pad in &fp.pads {
-            if let Some(drill) = pad.drill_nm
-                && drill > 0
-            {
-                let world = local_to_board(pad.pos, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
-                match pad.kind {
-                    PadKind::Tht => pth_through.push((drill, world)),
-                    PadKind::Npth => npth.push((drill, world)),
-                    PadKind::Smd => {}
-                }
-            }
-        }
-    }
-    ExpectedDrills {
-        pth_through,
-        npth,
-        pth_spans,
-    }
 }
 
 fn island_near_shape(shape: &ResolvedShape, island: &GerberIsland, tol_nm: f64) -> bool {
