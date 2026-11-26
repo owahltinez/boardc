@@ -156,7 +156,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Export RS-274X Gerbers, Gerber job file, Excellon drills, BOM, and CPL CSV.
+    /// Export RS-274X Gerbers, Gerber job file, Excellon drills, BOM, CPL, and optional drawings.
     Fab {
         input: PathBuf,
         #[arg(short, long)]
@@ -166,18 +166,28 @@ enum Command {
         subtract_soldermask: bool,
         #[arg(long)]
         no_clip_silk: bool,
+        /// Emit top (and mirrored bottom for 2-sided boards) assembly drawing SVGs.
+        #[arg(long)]
+        assembly: bool,
+        /// Emit drill map SVG with per-tool symbols and legend.
+        #[arg(long)]
+        drill_map: bool,
+        /// Emit text drill report (<name>-drl.rpt).
+        #[arg(long)]
+        drill_report: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Render 2D SVG layer and DRC hotspot views.
+    /// Render 2D SVG layer, assembly, drill map, and DRC hotspot views.
     Svg {
         input: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
         #[arg(long)]
         layer: Option<String>,
-        #[arg(long, default_value = "top")]
-        view: String,
+        /// View mode: top, bottom, assembly-top, assembly-bottom, or drill-map.
+        #[arg(long, conflicts_with = "layer")]
+        view: Option<String>,
         #[arg(long)]
         no_hotspots: bool,
     },
@@ -585,6 +595,9 @@ fn run(cli: Cli) -> Result<(), String> {
             out,
             subtract_soldermask: _,
             no_clip_silk,
+            assembly,
+            drill_map,
+            drill_report,
             json,
         } => {
             let ir = load_board_input(&input)?;
@@ -593,13 +606,26 @@ fn run(cli: Cli) -> Result<(), String> {
                 &out,
                 &FabOptions {
                     clip_silk_to_mask: !no_clip_silk,
+                    assembly,
+                    drill_map,
+                    drill_report,
                 },
             )?;
             if json {
                 print_json(&manifest, "FabManifest")?;
             } else {
+                let mut extras = String::new();
+                if !manifest.assembly_svgs.is_empty() {
+                    extras.push_str(&format!(", {} assembly SVGs", manifest.assembly_svgs.len()));
+                }
+                if let Some(ref p) = manifest.drill_map_svg {
+                    extras.push_str(&format!(", drill_map={}", p.display()));
+                }
+                if let Some(ref p) = manifest.drill_report {
+                    extras.push_str(&format!(", drill_report={}", p.display()));
+                }
                 println!(
-                    "Fab exported to '{}': {} gerbers, {} drills, job={}, BOM={}, CPL={}",
+                    "Fab exported to '{}': {} gerbers, {} drills, job={}, BOM={}, CPL={}{extras}",
                     out.display(),
                     manifest.gerber_files.len(),
                     manifest.drill_files.len(),
@@ -618,21 +644,40 @@ fn run(cli: Cli) -> Result<(), String> {
             no_hotspots,
         } => {
             let ir = load_board_input(&input)?;
-            let drc = (!no_hotspots).then(|| check_board_drc(&ir));
             if out.extension().and_then(|s| s.to_str()) == Some("svg") {
                 let svg_view = if let Some(l) = layer {
                     SvgView::Layer(l)
-                } else if view.eq_ignore_ascii_case("bottom") {
-                    SvgView::Bottom
                 } else {
-                    SvgView::Top
+                    match view
+                        .as_deref()
+                        .unwrap_or("top")
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "top" => SvgView::Top,
+                        "bottom" => SvgView::Bottom,
+                        "assembly-top" | "assembly_top" => SvgView::AssemblyTop,
+                        "assembly-bottom" | "assembly_bottom" => SvgView::AssemblyBottom,
+                        "drill-map" | "drill_map" => SvgView::DrillMap,
+                        other => {
+                            return Err(format!(
+                                "unknown SVG view '{other}' (expected top, bottom, assembly-top, assembly-bottom, drill-map)"
+                            ));
+                        }
+                    }
                 };
+                let needs_drc = !no_hotspots
+                    && !matches!(
+                        svg_view,
+                        SvgView::AssemblyTop | SvgView::AssemblyBottom | SvgView::DrillMap
+                    );
+                let drc = needs_drc.then(|| check_board_drc(&ir));
                 let svg = render_board_svg(
                     &ir,
                     drc.as_ref(),
                     &SvgOptions {
                         view: svg_view,
-                        show_hotspots: !no_hotspots,
+                        show_hotspots: needs_drc,
                         ..Default::default()
                     },
                 );
@@ -646,6 +691,10 @@ fn run(cli: Cli) -> Result<(), String> {
                     .map_err(|e| format!("failed to write '{}': {e}", out.display()))?;
                 println!("SVG written to '{}'", out.display());
             } else {
+                if layer.is_some() || view.is_some() {
+                    return Err("--view and --layer require an output path ending in '.svg'".into());
+                }
+                let drc = (!no_hotspots).then(|| check_board_drc(&ir));
                 let files = write_board_svgs(&ir, drc.as_ref(), &out)?;
                 println!("SVGs written to '{}': {} files", out.display(), files.len());
             }

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::drc::DrcReport;
+use crate::fab_drawings::{render_assembly_svg, render_drill_map_svg};
 use crate::fab_silk::{is_silk_layer, refdes_local_pos, text_stroke_segments};
 use crate::geom::{local_to_board, pad_copper_layers, remap_layer_for_side};
 use crate::ir::{BBoxNm, BoardIr, Graphic, PadKind, Pt, Side, mm, nm_to_mm, safe_slug};
@@ -13,6 +14,9 @@ pub enum SvgView {
     Top,
     Bottom,
     Layer(String),
+    AssemblyTop,
+    AssemblyBottom,
+    DrillMap,
 }
 
 #[derive(Debug, Clone)]
@@ -36,20 +40,20 @@ impl Default for SvgOptions {
     }
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
 
-fn svg_pt(pt: Pt, mirror_x: bool) -> (f64, f64) {
+pub(crate) fn svg_pt(pt: Pt, mirror_x: bool) -> (f64, f64) {
     let x = nm_to_mm(pt.x);
     let y = nm_to_mm(pt.y);
     (if mirror_x { -x } else { x }, -y)
 }
 
-fn poly_path_d(pts: &[Pt], mirror_x: bool) -> String {
+pub(crate) fn poly_path_d(pts: &[Pt], mirror_x: bool) -> String {
     let mut d = String::new();
     for (i, &p) in pts.iter().enumerate() {
         let (x, y) = svg_pt(p, mirror_x);
@@ -77,7 +81,12 @@ fn layer_color(layer: &str, idx: usize) -> &'static str {
     }
 }
 
-fn render_shape_svg(out: &mut String, shape: &ResolvedShape, color: &str, mirror_x: bool) {
+pub(crate) fn render_shape_svg(
+    out: &mut String,
+    shape: &ResolvedShape,
+    color: &str,
+    mirror_x: bool,
+) {
     match shape {
         ResolvedShape::Circle { center, radius } => {
             let (cx, cy) = svg_pt(*center, mirror_x);
@@ -104,16 +113,21 @@ fn render_shape_svg(out: &mut String, shape: &ResolvedShape, color: &str, mirror
     }
 }
 
-fn render_graphic_svg(
+pub(crate) fn render_graphic_svg(
     out: &mut String,
     g: &Graphic,
     pl: Option<&crate::ir::Placement>,
     color: &str,
     mirror_x: bool,
+    dash: Option<&str>,
 ) {
     let map_pt = |p: Pt| match pl {
         Some(pl) => local_to_board(p, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side),
         None => p,
+    };
+    let dash_attr = match dash {
+        Some(pattern) => format!(r#" stroke-dasharray="{pattern}""#),
+        None => String::new(),
     };
     match g {
         Graphic::Line { a, b, width, .. } => {
@@ -121,7 +135,7 @@ fn render_graphic_svg(
             let (bx, by) = svg_pt(map_pt(*b), mirror_x);
             let _ = writeln!(
                 out,
-                r#"  <line x1="{ax:.4}" y1="{ay:.4}" x2="{bx:.4}" y2="{by:.4}" stroke="{color}" stroke-width="{:.4}" stroke-linecap="round" />"#,
+                r#"  <line x1="{ax:.4}" y1="{ay:.4}" x2="{bx:.4}" y2="{by:.4}" stroke="{color}" stroke-width="{:.4}" stroke-linecap="round"{dash_attr} />"#,
                 nm_to_mm((*width).max(50_000))
             );
         }
@@ -144,7 +158,7 @@ fn render_graphic_svg(
             } else {
                 let _ = writeln!(
                     out,
-                    r#"  <path d="{d}" fill="none" stroke="{color}" stroke-width="{:.4}" stroke-linejoin="round" />"#,
+                    r#"  <path d="{d}" fill="none" stroke="{color}" stroke-width="{:.4}" stroke-linejoin="round"{dash_attr} />"#,
                     nm_to_mm((*width).max(50_000))
                 );
             }
@@ -166,7 +180,7 @@ fn render_graphic_svg(
             } else {
                 let _ = writeln!(
                     out,
-                    r#"  <circle cx="{cx:.4}" cy="{cy:.4}" r="{:.4}" fill="none" stroke="{color}" stroke-width="{:.4}" />"#,
+                    r#"  <circle cx="{cx:.4}" cy="{cy:.4}" r="{:.4}" fill="none" stroke="{color}" stroke-width="{:.4}"{dash_attr} />"#,
                     nm_to_mm(*radius),
                     nm_to_mm((*width).max(50_000))
                 );
@@ -182,7 +196,7 @@ fn render_graphic_svg(
             } else {
                 let _ = writeln!(
                     out,
-                    r#"  <path d="{d}" fill="none" stroke="{color}" stroke-width="{:.4}" stroke-linejoin="round" />"#,
+                    r#"  <path d="{d}" fill="none" stroke="{color}" stroke-width="{:.4}" stroke-linejoin="round"{dash_attr} />"#,
                     nm_to_mm((*width).max(50_000))
                 );
             }
@@ -191,7 +205,7 @@ fn render_graphic_svg(
     }
 }
 
-fn board_bbox_mm(board: &BoardIr) -> BBoxNm {
+pub(crate) fn board_bbox_mm(board: &BoardIr) -> BBoxNm {
     if !board.outline.is_empty() {
         return BBoxNm::from_pts(&board.outline);
     }
@@ -269,8 +283,14 @@ fn draw_copper_layer(
     out.push_str("  </g>\n");
 }
 
-/// Renders a composite Top/Bottom or single-layer 2D SVG with optional DRC hotspot overlays.
+/// Renders a composite Top/Bottom, single-layer, assembly, or drill-map 2D SVG.
 pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptions) -> String {
+    match cfg.view {
+        SvgView::AssemblyTop => return render_assembly_svg(board, Side::Top, cfg.margin_mm),
+        SvgView::AssemblyBottom => return render_assembly_svg(board, Side::Bottom, cfg.margin_mm),
+        SvgView::DrillMap => return render_drill_map_svg(board, cfg.margin_mm),
+        _ => {}
+    }
     let cu_layers = board.copper_layer_names();
     let mirror_x = matches!(cfg.view, SvgView::Bottom);
     let bb = board_bbox_mm(board);
@@ -338,6 +358,7 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
                 draw_order.push((i, n.as_str(), 0.92));
             }
         }
+        SvgView::AssemblyTop | SvgView::AssemblyBottom | SvgView::DrillMap => unreachable!(),
     }
     for (idx, name, opacity) in draw_order {
         draw_copper_layer(
@@ -398,7 +419,7 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
                 };
                 for g in &fp.graphics {
                     if is_silk_layer(&remap_layer_for_side(g.layer(), pl.side), side) {
-                        render_graphic_svg(&mut out, g, Some(pl), "#f1f5f9", mirror_x);
+                        render_graphic_svg(&mut out, g, Some(pl), "#f1f5f9", mirror_x, None);
                     }
                 }
                 if pl.side == side && !pl.dnp && !pl.refdes.is_empty() {
@@ -417,7 +438,7 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
             }
             for g in &board.graphics {
                 if is_silk_layer(g.layer(), side) {
-                    render_graphic_svg(&mut out, g, None, "#f1f5f9", mirror_x);
+                    render_graphic_svg(&mut out, g, None, "#f1f5f9", mirror_x, None);
                 }
             }
             out.push_str("  </g>\n");

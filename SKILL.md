@@ -75,8 +75,10 @@ boardc place board.toml -o placed.json --power-vias --json
 boardc route placed.json -o routed.json --ignore GND,VCC --threads 4 --json
 boardc zones routed.json -o filled.json --report zones.json
 boardc drc filled.json --json
-boardc fab filled.json -o fab_out --json
+boardc fab filled.json -o fab_out --assembly --drill-map --drill-report --json
 boardc svg filled.json -o preview_top.svg --view top
+boardc svg filled.json -o assembly_top.svg --view assembly-top
+boardc svg filled.json -o drill_map.svg --view drill-map
 boardc svg filled.json -o preview_in1.svg --layer In1.Cu
 ```
 
