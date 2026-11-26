@@ -1,0 +1,278 @@
+use std::fs;
+use std::process::Command;
+
+use boardc::geom::{pad_to_world_shape, polygon_area};
+use boardc::ir::{
+    Graphic, KeepoutKind, LayerKind, PadKind, PadShape, Pt, Side, load_board_json, mm,
+};
+use boardc::kicad_io::{import_kicad_pcb, parse_kicad_mod, parse_kicad_pcb};
+
+fn pad_center(shape: &boardc::geom::ResolvedShape) -> Pt {
+    let b = shape.bbox();
+    Pt::new((b.min_x + b.max_x) / 2, (b.min_y + b.max_y) / 2)
+}
+
+#[test]
+fn parse_kicad_mod_covers_pads_drills_courtyard_and_silkscreen() {
+    let src = r#"(footprint "TestPkg"
+        (version 20241229)
+        (layer "F.Cu")
+        (solder_mask_margin 0.05)
+        (fp_line (start -2.0 -1.0) (end 2.0 -1.0) (stroke (width 0.12) (type solid)) (layer "F.SilkS"))
+        (fp_arc (start 2.0 -1.0) (mid 2.2 0.0) (end 2.0 1.0) (stroke (width 0.12) (type solid)) (layer "F.SilkS"))
+        (fp_rect (start -1.0 -0.5) (end 1.0 0.5) (stroke (width 0.12) (type solid)) (fill no) (layer "F.SilkS"))
+        (fp_line (start -2.5 -1.5) (end 2.5 -1.5) (stroke (width 0.05) (type solid)) (layer "F.CrtYd"))
+        (fp_line (start 2.5 -1.5) (end 2.5 1.5) (stroke (width 0.05) (type solid)) (layer "F.CrtYd"))
+        (fp_line (start 2.5 1.5) (end -2.5 1.5) (stroke (width 0.05) (type solid)) (layer "F.CrtYd"))
+        (fp_line (start -2.5 1.5) (end -2.5 -1.5) (stroke (width 0.05) (type solid)) (layer "F.CrtYd"))
+        (pad "1" smd circle (at -1.5 -0.5) (size 0.4 0.4) (layers "F.Cu" "F.Mask" "F.Paste") (solder_mask_margin 0.03) (solder_paste_margin -0.02))
+        (pad "2" smd roundrect (at 1.5 0.5 90) (size 0.8 0.4) (layers "F.Cu" "F.Mask") (roundrect_rratio 0.25))
+        (pad "3" thru_hole oval (at 0 -1.0) (size 1.4 2.5) (drill oval 0.7 1.8) (layers "*.Cu" "*.Mask"))
+        (pad "" np_thru_hole circle (at 0 1.0) (size 1.0 1.0) (drill 1.0) (layers "*.Cu" "*.Mask"))
+        (pad "4" smd custom (at 0.5 -0.5) (size 0.3 0.3) (layers "F.Cu" "F.Mask")
+            (primitives (gr_poly (pts (xy -0.2 -0.2) (xy 0.2 -0.2) (xy 0 0.3)) (width 0) (fill yes))))
+        (model "${KICAD10_3DMODEL_DIR}/Test.step" (offset (xyz 0.1 0.2 0.3)) (scale (xyz 1 1 1)) (rotate (xyz 0 0 90)))
+    )"#;
+
+    let fp = parse_kicad_mod(src).expect("parse_kicad_mod");
+    assert_eq!(fp.name, "TestPkg");
+    assert_eq!(fp.pads.len(), 5);
+
+    assert_eq!(fp.pads[0].kind, PadKind::Smd);
+    assert_eq!(fp.pads[0].pos, Pt::new(mm(-1.5), mm(0.5)));
+    assert_eq!(fp.pads[0].shape, PadShape::Circle { diameter: mm(0.4) });
+    assert_eq!(fp.pads[0].mask_margin_nm, Some(mm(0.03)));
+    assert_eq!(fp.pads[0].paste_margin_nm, Some(mm(-0.02)));
+
+    assert_eq!(fp.pads[1].rot_deg, 90.0);
+    assert_eq!(
+        fp.pads[1].shape,
+        PadShape::RoundRect {
+            width: mm(0.8),
+            height: mm(0.4),
+            corner_radius: mm(0.1)
+        }
+    );
+
+    assert_eq!(fp.pads[2].kind, PadKind::Tht);
+    assert_eq!(fp.pads[2].drill_nm, Some(mm(0.7)));
+    assert_eq!(
+        fp.pads[2].shape,
+        PadShape::Oval {
+            width: mm(1.4),
+            height: mm(2.5)
+        }
+    );
+
+    assert_eq!(fp.pads[3].kind, PadKind::Npth);
+    assert_eq!(fp.pads[3].pos, Pt::new(0, mm(-1.0)));
+    assert_eq!(fp.pads[3].drill_nm, Some(mm(1.0)));
+
+    assert!(matches!(fp.pads[4].shape, PadShape::Poly { ref verts } if verts.len() == 3));
+    assert_eq!(fp.courtyard.len(), 4);
+    assert!((polygon_area(&fp.courtyard) - 15e12).abs() < 1e6);
+    assert!(
+        fp.graphics
+            .iter()
+            .any(|g| matches!(g, Graphic::Line { layer, .. } if layer == "F.SilkS"))
+    );
+    assert!(
+        fp.graphics
+            .iter()
+            .any(|g| matches!(g, Graphic::Rect { layer, .. } if layer == "F.SilkS"))
+    );
+    assert_eq!(fp.models.len(), 1);
+    assert_eq!(fp.models[0].path, "${KICAD10_3DMODEL_DIR}/Test.step");
+    assert_eq!(fp.models[0].offset_mm, [0.1, 0.2, 0.3]);
+    assert_eq!(fp.models[0].rotate_deg, [0.0, 0.0, 90.0]);
+}
+
+#[test]
+fn parse_kicad_pcb_handles_edge_cutout_bottom_flip_and_pro_rules() {
+    let pcb = r#"(kicad_pcb (version 20241229)
+        (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+        (net 1 "VCC")
+        (net 2 "GND")
+        (gr_line (start 0 0) (end 19 0) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (gr_arc (start 19 0) (mid 19.7071 0.2929) (end 20 1) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (gr_line (start 20 1) (end 20 10) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (gr_line (start 20 10) (end 0 10) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (gr_line (start 0 10) (end 0 0) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (gr_rect (start 4 4) (end 6 6) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (footprint "Lib:SOT23" (layer "B.Cu") (at 10 5 90)
+            (property "Reference" "U2")
+            (property "Value" "DEV")
+            (pad "1" smd rect (at -1 2 90) (size 1 0.5) (layers "B.Cu" "B.Mask") (net 1 "VCC"))
+            (pad "2" smd rect (at 1 -2 90) (size 1 0.5) (layers "B.Cu" "B.Mask") (net 2 "GND"))
+        )
+        (segment (start 12 4) (end 15 4) (width 0.2) (layer "B.Cu") (net 1 "VCC"))
+        (via (at 15 4) (size 0.5) (drill 0.25) (layers "F.Cu" "B.Cu") (net 1 "VCC"))
+        (zone (net 2 "GND") (layer "B.Cu") (connect_pads (clearance 0.2)) (min_thickness 0.15)
+            (fill yes (thermal_gap 0.25) (thermal_bridge_width 0.3) (island_removal_mode 0))
+            (polygon (pts (xy 1 1) (xy 19 1) (xy 19 9) (xy 1 9))))
+    )"#;
+    let pro = r#"{
+        "board": {"design_settings": {"rules": {"min_clearance": 0.12, "min_track_width": 0.14}}},
+        "net_settings": {
+            "classes": [{"name": "Default", "clearance": 0.12, "track_width": 0.14, "via_diameter": 0.45, "via_drill": 0.2}],
+            "netclass_assignments": {"VCC": "Default"}
+        }
+    }"#;
+
+    let ir = parse_kicad_pcb(pcb, Some(pro)).expect("parse_kicad_pcb");
+    assert_eq!(ir.cutouts.len(), 1);
+    assert_eq!(ir.rules.clearance_nm, mm(0.12));
+    assert_eq!(ir.rules.track_width_nm, mm(0.14));
+    assert_eq!(ir.rules.via_dia_nm, mm(0.45));
+    assert_eq!(ir.rules.via_drill_nm, mm(0.2));
+    assert_eq!(ir.tracks.len(), 1);
+    assert_eq!(ir.vias.len(), 1);
+    assert_eq!(ir.pours.len(), 1);
+
+    // U2 on B.Cu at KiCad (10, 5) rot 90 -> pad 1 KiCad local (-1, +2) rotated 90 in Y-down is (+2, +1) -> world (12, -6) mm.
+    let pl = &ir.placements[0];
+    let fp = &ir.footprints[&pl.footprint];
+    let p1 = pad_center(&pad_to_world_shape(&fp.pads[0], pl, 8));
+    assert_eq!(p1, Pt::new(mm(12.0), mm(-6.0)));
+    let p2 = pad_center(&pad_to_world_shape(&fp.pads[1], pl, 8));
+    assert_eq!(p2, Pt::new(mm(8.0), mm(-4.0)));
+}
+
+#[test]
+fn parse_kicad_pcb_handles_bottom_rotations_and_stackup_thickness() {
+    let pcb = r#"(kicad_pcb (version 20241229)
+        (layers
+            (0 "F.Cu" signal)
+            (1 "In1.Cu" power)
+            (2 "B.Cu" signal)
+        )
+        (setup
+            (stackup
+                (layer "F.Cu" (type "copper") (thickness 0.035))
+                (layer "In1.Cu" (type "copper") (thickness 0.0175))
+                (layer "B.Cu" (type "copper") (thickness 0.035))
+            )
+        )
+        (gr_rect (start 0 0) (end 30 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (footprint "Lib:Test2" (layer "B.Cu") (at 10 10 0)
+            (property "Reference" "B0")
+            (pad "1" smd rect (at 2 1 0) (size 0.5 0.5) (layers "B.Cu"))
+        )
+        (footprint "Lib:Test2" (layer "B.Cu") (at 10 10 180)
+            (property "Reference" "B180")
+            (pad "1" smd rect (at 2 1 180) (size 0.5 0.5) (layers "B.Cu"))
+        )
+        (footprint "Lib:Test2" (layer "B.Cu") (at 10 10 270)
+            (property "Reference" "B270")
+            (pad "1" smd rect (at 2 1 270) (size 0.5 0.5) (layers "B.Cu"))
+        )
+    )"#;
+    let ir = parse_kicad_pcb(pcb, None).expect("parse_kicad_pcb");
+    assert_eq!(ir.layers.len(), 3);
+    assert_eq!(ir.layers[0].thickness_nm, Some(35_000));
+    assert_eq!(ir.layers[1].kind, LayerKind::Plane);
+
+    let check = |refdes: &str, ex: f64, ey: f64| {
+        let pl = ir.placements.iter().find(|p| p.refdes == refdes).unwrap();
+        assert_eq!(pl.side, Side::Bottom);
+        let fp = &ir.footprints[&pl.footprint];
+        let c = pad_center(&pad_to_world_shape(&fp.pads[0], pl, 8));
+        assert_eq!(c, Pt::new(mm(ex), mm(ey)), "{refdes}");
+    };
+    // KiCad B.Cu local (2, 1) mapped to Y-up at rot 0/180/270 around KiCad (10, 10).
+    check("B0", 12.0, -11.0);
+    check("B180", 8.0, -9.0);
+    check("B270", 9.0, -12.0);
+}
+
+#[test]
+fn cli_import_kicad_writes_valid_board_ir_json() {
+    let tmp_dir = std::env::temp_dir().join("boardc_test_import_kicad");
+    fs::create_dir_all(&tmp_dir).unwrap();
+    let pcb_path = tmp_dir.join("mini.kicad_pcb");
+    let pro_path = tmp_dir.join("mini.kicad_pro");
+    let out_path = tmp_dir.join("mini.ir.json");
+
+    fs::write(
+        &pcb_path,
+        r#"(kicad_pcb (version 20241229)
+            (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+            (gr_rect (start 0 0) (end 10 10) (stroke (width 0.1)) (layer "Edge.Cuts"))
+            (footprint "R:0402" (layer "F.Cu") (at 5 5)
+                (property "Reference" "R1")
+                (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu") (net 1 "VCC")))
+        )"#,
+    )
+    .unwrap();
+    fs::write(
+        &pro_path,
+        r#"{"board":{"design_settings":{"rules":{"min_clearance":0.15}}}}"#,
+    )
+    .unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_boardc"))
+        .args([
+            "import-kicad",
+            pcb_path.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+            "--pro",
+            pro_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run boardc import-kicad");
+    assert!(status.success());
+
+    let ir = load_board_json(&out_path).expect("load output json");
+    let direct = import_kicad_pcb(&pcb_path, Some(&pro_path)).expect("direct import_kicad_pcb");
+    assert_eq!(ir, direct);
+    assert_eq!(ir.placements.len(), 1);
+    assert_eq!(ir.rules.clearance_nm, mm(0.15));
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn parse_kicad_pcb_preserves_multi_flag_keepout_and_custom_pad_anchor() {
+    let pcb = r#"(kicad_pcb (version 20241229)
+        (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+        (gr_rect (start 0 0) (end 20 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (footprint "Lib:CustomAnchor" (layer "F.Cu") (at 10 10)
+            (property "Reference" "J1")
+            (pad "1" smd custom (at 0 0) (size 1.0 1.0) (layers "F.Cu" "F.Mask")
+                (options (clearance outline) (anchor rect))
+                (primitives (gr_poly (pts (xy 0.2 -0.2) (xy 1.5 -0.2) (xy 1.5 0.2) (xy 0.2 0.2)) (width 0) (fill yes))))
+        )
+        (zone (net 0) (net_name "") (layer "F.Cu")
+            (keepout (tracks allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints allowed))
+            (polygon (pts (xy 2 2) (xy 6 2) (xy 6 6) (xy 2 6)))
+        )
+    )"#;
+    let ir = parse_kicad_pcb(pcb, None).expect("parse_kicad_pcb");
+    assert_eq!(ir.keepouts.len(), 1);
+    assert_eq!(
+        ir.keepouts[0].kind,
+        KeepoutKind::Custom {
+            tracks: false,
+            vias: true,
+            copper: true,
+            placement: false,
+        }
+    );
+    assert!(!ir.keepouts[0].kind.blocks_tracks());
+    assert!(ir.keepouts[0].kind.blocks_vias());
+    assert!(ir.keepouts[0].kind.blocks_copper());
+
+    let fp = &ir.footprints[&ir.placements[0].footprint];
+    match &fp.pads[0].shape {
+        PadShape::Poly { verts } => {
+            let min_x = verts.iter().map(|p| p.x).min().unwrap();
+            let max_x = verts.iter().map(|p| p.x).max().unwrap();
+            assert!(
+                min_x <= mm(-0.49) && max_x >= mm(1.49),
+                "expected union of anchor rect [-0.5, 0.5] and arm [0.2, 1.5], got [{min_x}, {max_x}]"
+            );
+        }
+        other => panic!("expected custom Poly pad, got {other:?}"),
+    }
+}

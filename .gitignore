@@ -1,0 +1,5 @@
+/target
+/Cargo.lock
+.boardc-cache/
+*.tmp
+*.bak
