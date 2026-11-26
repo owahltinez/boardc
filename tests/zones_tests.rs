@@ -138,6 +138,7 @@ fn priority_pour_overlap_and_edge_cutout_keepout_clearance() {
         },
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut ir = BoardIr::from_spec(&spec).unwrap();
@@ -289,6 +290,7 @@ fn antipad_subtraction_around_other_net_via_outer_and_inner_layers() {
         },
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut ir = BoardIr::from_spec(&spec).unwrap();
@@ -373,6 +375,7 @@ fn dead_island_removal_prunes_unconnected_components() {
         rules: DesignRules::default(),
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut ir = BoardIr::from_spec(&spec).unwrap();
@@ -434,6 +437,7 @@ fn thermal_relief_connection_has_four_spokes_and_moat() {
         rules: DesignRules::default(),
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut ir = BoardIr::from_spec(&spec).unwrap();
@@ -550,6 +554,7 @@ fn via_wall_chokes_power_pour_into_split_and_narrow_neck_naming_blockers() {
         },
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut ir_split = BoardIr::from_spec(&split_spec).unwrap();
@@ -692,6 +697,7 @@ fn cli_zones_writes_filled_board_and_report_json() {
         rules: DesignRules::default(),
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     std::fs::write(&spec_path, toml::to_string_pretty(&spec).unwrap()).unwrap();
 

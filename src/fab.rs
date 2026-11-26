@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::fab_gerber::{
     GerberBuilder, copper_gerber_filename, pad_anchor_world, pad_world_shape_with_margin,
 };
+use crate::fab_job::emit_gbrjob;
 use crate::fab_silk::emit_silk_layer;
 use crate::geom::{
     local_to_board, pad_copper_layers, pad_world_layers, polygon_area, remap_layer_for_side,
@@ -37,15 +38,17 @@ pub struct FabManifest {
     pub drill_files: Vec<PathBuf>,
     pub bom_csv: PathBuf,
     pub cpl_csv: PathBuf,
+    pub gbrjob: PathBuf,
 }
 
 impl FabManifest {
     pub fn all_files(&self) -> Vec<PathBuf> {
-        let mut out = Vec::with_capacity(self.gerber_files.len() + self.drill_files.len() + 2);
+        let mut out = Vec::with_capacity(self.gerber_files.len() + self.drill_files.len() + 3);
         out.extend(self.gerber_files.iter().cloned());
         out.extend(self.drill_files.iter().cloned());
         out.push(self.bom_csv.clone());
         out.push(self.cpl_csv.clone());
+        out.push(self.gbrjob.clone());
         out
     }
 }
@@ -462,13 +465,16 @@ pub fn export_fab(
 
     let bom_csv = out_dir.join(format!("{slug}_bom.csv"));
     let cpl_csv = out_dir.join(format!("{slug}_cpl.csv"));
+    let gbrjob = out_dir.join(format!("{slug}-job.gbrjob"));
     emit_bom_csv(board, &bom_csv)?;
     emit_cpl_csv(board, &cpl_csv)?;
+    emit_gbrjob(board, &cu_layers, &gbrjob)?;
 
     Ok(FabManifest {
         gerber_files,
         drill_files,
         bom_csv,
         cpl_csv,
+        gbrjob,
     })
 }

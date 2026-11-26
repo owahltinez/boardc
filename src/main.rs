@@ -156,7 +156,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Export RS-274X Gerbers, Excellon drills, BOM, and CPL CSV.
+    /// Export RS-274X Gerbers, Gerber job file, Excellon drills, BOM, and CPL CSV.
     Fab {
         input: PathBuf,
         #[arg(short, long)]
@@ -595,10 +595,11 @@ fn run(cli: Cli) -> Result<(), String> {
                 print_json(&manifest, "FabManifest")?;
             } else {
                 println!(
-                    "Fab exported to '{}': {} gerbers, {} drills, BOM={}, CPL={}",
+                    "Fab exported to '{}': {} gerbers, {} drills, job={}, BOM={}, CPL={}",
                     out.display(),
                     manifest.gerber_files.len(),
                     manifest.drill_files.len(),
+                    manifest.gbrjob.display(),
                     manifest.bom_csv.display(),
                     manifest.cpl_csv.display()
                 );

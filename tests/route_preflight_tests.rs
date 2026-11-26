@@ -144,6 +144,7 @@ fn build_2layer_board() -> BoardIr {
         rules: DesignRules::default(),
         constraints: Constraints::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     BoardIr::from_spec(&spec).unwrap()
 }
@@ -244,6 +245,7 @@ fn route_4layer_board_ir_with_inner_planes_clean_drc() {
         rules: DesignRules::default(),
         constraints: Constraints::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     let mut board = BoardIr::from_spec(&spec).unwrap();
     let vboard = to_viahop_board(&board, &HashSet::new(), None).unwrap();
@@ -440,6 +442,7 @@ fn length_constraints_propagate_to_viahop() {
                 ..Default::default()
             },
             graphics: Vec::new(),
+            stackup: Default::default(),
         };
         BoardIr::from_spec(&spec).unwrap()
     };
@@ -667,6 +670,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
             ..Default::default()
         },
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     let board = BoardIr::from_spec(&spec).unwrap();
 
@@ -808,6 +812,7 @@ fn preflight_catches_edge_keepout_blocked_net_and_fixed_violation() {
         rules: DesignRules::default(),
         constraints: Constraints::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     let board = BoardIr::from_spec(&spec).unwrap();
     let summary = run_preflight(&board, &HashSet::new()).unwrap();

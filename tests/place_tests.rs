@@ -155,6 +155,7 @@ fn overlapping_decoupling_caps_legalized_with_cap_proximity_and_zero_overlaps() 
             ..Default::default()
         },
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
@@ -282,6 +283,7 @@ fn movable_cap_pushed_out_of_bga_shadow_and_keepout() {
             ..Default::default()
         },
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
@@ -426,6 +428,7 @@ fn power_via_solver_thermal_array_and_plane_drops_clean_drc_and_no_chokes() {
             ..Default::default()
         },
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
@@ -559,6 +562,7 @@ fn power_via_solver_does_not_seal_adjacent_bga_pads_and_cli_place_works() {
             ..Default::default()
         },
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();

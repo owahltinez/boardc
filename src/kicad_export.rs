@@ -6,7 +6,7 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::geom::{ensure_ccw, polygon_signed_area_2};
-use crate::ir::{BoardIr, LayerKind, Nm, PourPoly, Pt, Side, nm_to_mm};
+use crate::ir::{BoardIr, LayerKind, Nm, PourPoly, Pt, SOLDER_MASK_THICKNESS_NM, Side, nm_to_mm};
 use crate::kicad_export_items::{
     UuidGen, esc, write_closed_poly_lines, write_footprint, write_graphic, write_keepout, write_pts,
 };
@@ -104,6 +104,64 @@ fn write_layers(out: &mut String, board: &BoardIr) {
     out.push_str("\t)\n");
 }
 
+fn write_setup(out: &mut String, board: &BoardIr) {
+    let layers = board.effective_layers();
+    let (cu_nm, diel_nm) = board.resolved_stackup_thicknesses();
+    let mask_mm = nm_to_mm(SOLDER_MASK_THICKNESS_NM);
+    out.push_str("\t(setup\n");
+    out.push_str("\t\t(stackup\n");
+    out.push_str("\t\t\t(layer \"F.SilkS\" (type \"Top Silk Screen\"))\n");
+    out.push_str("\t\t\t(layer \"F.Paste\" (type \"Top Solder Paste\"))\n");
+    let _ = writeln!(
+        out,
+        "\t\t\t(layer \"F.Mask\" (type \"Top Solder Mask\") (thickness {mask_mm}))"
+    );
+    for (idx, layer) in layers.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "\t\t\t(layer \"{}\" (type \"copper\") (thickness {}))",
+            esc(&layer.name),
+            nm_to_mm(cu_nm[idx])
+        );
+        if let Some(&d_nm) = diel_nm.get(idx) {
+            let kind = if diel_nm.len() == 1 || idx % 2 == 1 {
+                "core"
+            } else {
+                "prepreg"
+            };
+            let _ = writeln!(
+                out,
+                "\t\t\t(layer \"dielectric {}\" (type \"{kind}\") (thickness {}) (material \"FR4\") (epsilon_r 4.5) (loss_tangent 0.02))",
+                idx + 1,
+                nm_to_mm(d_nm)
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\t\t\t(layer \"B.Mask\" (type \"Bottom Solder Mask\") (thickness {mask_mm}))"
+    );
+    out.push_str("\t\t\t(layer \"B.Paste\" (type \"Bottom Solder Paste\"))\n");
+    out.push_str("\t\t\t(layer \"B.SilkS\" (type \"Bottom Silk Screen\"))\n");
+    if let Some(finish) = board.stackup.finish_trimmed() {
+        let _ = writeln!(out, "\t\t\t(copper_finish \"{}\")", esc(finish));
+    }
+    out.push_str("\t\t\t(dielectric_constraints no)\n");
+    out.push_str("\t\t)\n");
+    let _ = writeln!(
+        out,
+        "\t\t(pad_to_mask_clearance {:.6})",
+        nm_to_mm(board.rules.mask_expansion_nm)
+    );
+    out.push_str("\t\t(allow_soldermask_bridges_in_footprints no)\n");
+    if board.stackup.pofv {
+        out.push_str("\t\t(plugging (front yes) (back yes))\n");
+        out.push_str("\t\t(capping yes)\n");
+        out.push_str("\t\t(filling yes)\n");
+    }
+    out.push_str("\t)\n");
+}
+
 // Fractures a `PourPoly` (outer + holes) into a single KiCad keyhole-slit polygon.
 fn fracture_pour_poly(poly: &PourPoly) -> Vec<Pt> {
     let mut ring = poly.outer.clone();
@@ -190,7 +248,11 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
     out.push_str("\t(version 20241229)\n");
     out.push_str("\t(generator \"boardc\")\n");
     out.push_str("\t(generator_version \"0.1.0\")\n");
-    out.push_str("\t(general\n\t\t(thickness 1.6)\n\t)\n");
+    let _ = writeln!(
+        out,
+        "\t(general\n\t\t(thickness {})\n\t)",
+        nm_to_mm(board.effective_board_thickness_nm())
+    );
     out.push_str("\t(paper \"A4\")\n");
     let _ = writeln!(
         out,
@@ -198,11 +260,7 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
         esc(&board.name)
     );
     write_layers(&mut out, board);
-    let _ = writeln!(
-        out,
-        "\t(setup\n\t\t(pad_to_mask_clearance {:.6})\n\t\t(allow_soldermask_bridges_in_footprints no)\n\t)",
-        nm_to_mm(board.rules.mask_expansion_nm)
-    );
+    write_setup(&mut out, board);
     out.push_str("\t(net 0 \"\")\n");
     for (name, id) in &net_ids {
         let _ = writeln!(out, "\t(net {id} \"{}\")", esc(name));

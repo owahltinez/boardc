@@ -501,6 +501,22 @@ pub(crate) fn verify_fab_outputs_impl(
             return Err(format!("missing required assembly CSV '{}'", p.display()));
         }
     }
+    let job_path = fab_dir.join(format!("{slug}-job.gbrjob"));
+    let job_text = fs::read_to_string(&job_path).map_err(|e| {
+        format!(
+            "missing or unreadable Gerber job file '{}': {e}",
+            job_path.display()
+        )
+    })?;
+    let job_json: serde_json::Value = serde_json::from_str(&job_text)
+        .map_err(|e| format!("invalid Gerber job JSON '{}': {e}", job_path.display()))?;
+    if job_json["GeneralSpecs"]["LayerNumber"].as_u64() != Some(cu_layers.len() as u64) {
+        return Err(format!(
+            "Gerber job '{}' LayerNumber mismatch (expected {})",
+            job_path.display(),
+            cu_layers.len()
+        ));
+    }
 
     let mut gerber_paths: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(fab_dir)

@@ -102,6 +102,7 @@ fn base_board() -> BoardIr {
         rules: DesignRules::default(),
         constraints: Constraints::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     BoardIr::from_spec(&spec).unwrap()
 }
@@ -252,6 +253,7 @@ fn copper_clearances_and_filled_pour_clearances() {
         },
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     // Add track violating via#0
     spec.tracks.push(Track {
@@ -395,6 +397,7 @@ fn mechanical_drill_edge_keepout_and_courtyard_checks() {
         },
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     spec.placements
         .push(place_pin1("U4", "SMD", 20.5, 5.5, Side::Top, "SIG"));
@@ -487,6 +490,7 @@ fn connectivity_through_filled_pour_and_via_and_open_net() {
         rules: DesignRules::default(),
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
@@ -688,6 +692,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
             }],
         },
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let board = BoardIr::from_spec(&spec).unwrap();
@@ -808,6 +813,7 @@ fn cluster_kicad_drc_json_maps_coordinates_and_clusters_hotspots() {
         rules: DesignRules::default(),
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     spec.vias.push(Via {
         net: "GND".into(),

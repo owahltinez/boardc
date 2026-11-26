@@ -286,6 +286,7 @@ fn make_4layer_board() -> BoardIr {
         },
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
     let mut board = BoardIr::from_spec(&spec).unwrap();
     fill_zones(&mut board);
@@ -475,6 +476,12 @@ fn cli_fab_svg_and_build_emit_outputs() {
     let fab_json: serde_json::Value = serde_json::from_slice(&fab_res.stdout).unwrap();
     assert_eq!(fab_json["gerber_files"].as_array().unwrap().len(), 11);
     assert_eq!(fab_json["drill_files"].as_array().unwrap().len(), 2);
+    assert!(
+        fab_json["gbrjob"]
+            .as_str()
+            .unwrap()
+            .ends_with("fab_4layer-job.gbrjob")
+    );
 
     let svg_res = Command::new(env!("CARGO_BIN_EXE_boardc"))
         .args([
@@ -508,6 +515,11 @@ fn cli_fab_svg_and_build_emit_outputs() {
         rep.emitted_files
             .iter()
             .any(|p| p.ends_with("fab_4layer_bom.csv"))
+    );
+    assert!(
+        rep.emitted_files
+            .iter()
+            .any(|p| p.ends_with("fab_4layer-job.gbrjob"))
     );
     assert!(
         rep.emitted_files
@@ -935,6 +947,174 @@ exclude_from_pos = true
         "fab verification failed: {:?}",
         fab_rep.errors
     );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn stackup_toml_emits_gbrjob_with_thickness_finish_pofv_and_dielectrics() {
+    let tmp = fresh_tmp_dir("stackup_gbrjob");
+    let fab_6l = tmp.join("fab_6l");
+    let fab_2l = tmp.join("fab_2l");
+
+    let spec_6l_toml = r#"
+name = "six_layer_pofv"
+size_nm = [40000000, 30000000]
+
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+
+[[layers]]
+name = "In1.Cu"
+kind = "plane"
+
+[[layers]]
+name = "In2.Cu"
+kind = "signal"
+
+[[layers]]
+name = "In3.Cu"
+kind = "signal"
+
+[[layers]]
+name = "In4.Cu"
+kind = "plane"
+
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+
+[stackup]
+thickness_nm = 1000000
+finish = "ENIG"
+pofv = true
+dielectric_nm = [95000, 240000, 170000, 240000, 95000]
+
+[footprints.R0402]
+kind = "chip2_pin"
+package = "0402"
+
+[[placements]]
+refdes = "R1"
+footprint = "R0402"
+value = "10k"
+pos = { x = 15000000, y = 15000000 }
+pin_nets = { "1" = "SIG", "2" = "GND" }
+"#;
+    let spec_6l: BoardSpec = toml::from_str(spec_6l_toml).unwrap();
+    assert_eq!(spec_6l.stackup.thickness_nm, 1_000_000);
+    assert_eq!(spec_6l.stackup.finish.as_deref(), Some("ENIG"));
+    assert!(spec_6l.stackup.pofv);
+    assert_eq!(
+        spec_6l.stackup.dielectric_nm,
+        vec![95_000, 240_000, 170_000, 240_000, 95_000]
+    );
+
+    let board_6l = BoardIr::from_spec(&spec_6l).unwrap();
+    let manifest_6l = export_fab(&board_6l, &fab_6l, &FabOptions::default()).unwrap();
+    assert!(manifest_6l.gbrjob.ends_with("six_layer_pofv-job.gbrjob"));
+    assert!(manifest_6l.gbrjob.exists());
+    assert!(manifest_6l.all_files().contains(&manifest_6l.gbrjob));
+
+    let job: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_6l.gbrjob).unwrap()).unwrap();
+    assert_eq!(job["Header"]["GenerationSoftware"]["Vendor"], "boardc");
+    assert_eq!(job["GeneralSpecs"]["ProjectId"]["Name"], "six_layer_pofv");
+    assert_eq!(job["GeneralSpecs"]["Size"]["X"], 40.0);
+    assert_eq!(job["GeneralSpecs"]["Size"]["Y"], 30.0);
+    assert_eq!(job["GeneralSpecs"]["LayerNumber"], 6);
+    assert_eq!(job["GeneralSpecs"]["BoardThickness"], 1.0);
+    assert_eq!(job["GeneralSpecs"]["Finish"], "ENIG");
+    assert_eq!(
+        job["GeneralSpecs"]["ViaProtection"],
+        serde_json::json!(["VII"])
+    );
+
+    let files = job["FilesAttributes"].as_array().unwrap();
+    assert_eq!(files.len(), manifest_6l.gerber_files.len());
+    for f in files {
+        let rel = f["Path"].as_str().unwrap();
+        assert!(
+            fab_6l.join(rel).exists(),
+            "FilesAttributes path {rel} missing"
+        );
+    }
+    let find_file = |name: &str| files.iter().find(|f| f["Path"] == name).unwrap();
+    assert_eq!(find_file("F_Cu.gtl")["FileFunction"], "Copper,L1,Top");
+    assert_eq!(find_file("In1_Cu.g1")["FileFunction"], "Copper,L2,Inr");
+    assert_eq!(find_file("In4_Cu.g4")["FileFunction"], "Copper,L5,Inr");
+    assert_eq!(find_file("B_Cu.gbl")["FileFunction"], "Copper,L6,Bot");
+    assert_eq!(find_file("F_Mask.gts")["FileFunction"], "SolderMask,Top");
+    assert_eq!(find_file("F_Mask.gts")["FilePolarity"], "Negative");
+    assert_eq!(find_file("Edge_Cuts.gm1")["FileFunction"], "Profile");
+
+    let stack = job["MaterialStackup"].as_array().unwrap();
+    let dielectrics: Vec<f64> = stack
+        .iter()
+        .filter(|e| e["Type"] == "Dielectric")
+        .map(|e| e["Thickness"].as_f64().unwrap())
+        .collect();
+    assert_eq!(dielectrics, vec![0.095, 0.24, 0.17, 0.24, 0.095]);
+    let coppers: Vec<(&str, f64)> = stack
+        .iter()
+        .filter(|e| e["Type"] == "Copper")
+        .map(|e| {
+            (
+                e["Name"].as_str().unwrap(),
+                e["Thickness"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        coppers,
+        vec![
+            ("F.Cu", 0.035),
+            ("In1.Cu", 0.0175),
+            ("In2.Cu", 0.0175),
+            ("In3.Cu", 0.0175),
+            ("In4.Cu", 0.0175),
+            ("B.Cu", 0.035),
+        ]
+    );
+
+    let fab_rep = boardc::verify::verify_fab_outputs(&board_6l, &fab_6l).unwrap();
+    assert!(fab_rep.passed, "6-layer fab verify failed: {fab_rep:?}");
+
+    // Default stackup (omitted in TOML) on 2-layer board: 1.6 mm, Finish="None", no ViaProtection, 1.51 mm core.
+    let spec_2l: BoardSpec =
+        toml::from_str("name = \"def_2l\"\nsize_nm = [20000000, 10000000]\n").unwrap();
+    let board_2l = BoardIr::from_spec(&spec_2l).unwrap();
+    let manifest_2l = export_fab(&board_2l, &fab_2l, &FabOptions::default()).unwrap();
+    let job_2l: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_2l.gbrjob).unwrap()).unwrap();
+    assert_eq!(job_2l["GeneralSpecs"]["LayerNumber"], 2);
+    assert_eq!(job_2l["GeneralSpecs"]["BoardThickness"], 1.6);
+    assert_eq!(job_2l["GeneralSpecs"]["Finish"], "None");
+    assert!(job_2l["GeneralSpecs"].get("ViaProtection").is_none());
+    let diels_2l: Vec<f64> = job_2l["MaterialStackup"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["Type"] == "Dielectric")
+        .map(|e| e["Thickness"].as_f64().unwrap())
+        .collect();
+    assert_eq!(diels_2l, vec![1.51]);
+
+    // Spec validation catches invalid thickness_nm and mismatched/non-positive dielectric_nm.
+    let mut bad_thick = spec_6l.clone();
+    bad_thick.stackup.thickness_nm = 0;
+    assert!(BoardIr::from_spec(&bad_thick).is_err());
+
+    let mut bad_len = spec_6l.clone();
+    bad_len.stackup.dielectric_nm = vec![95_000, 240_000];
+    assert!(BoardIr::from_spec(&bad_len).is_err());
+
+    let mut bad_entry = spec_6l.clone();
+    bad_entry.stackup.dielectric_nm[2] = 0;
+    assert!(BoardIr::from_spec(&bad_entry).is_err());
 
     let _ = fs::remove_dir_all(&tmp);
 }

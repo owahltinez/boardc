@@ -190,6 +190,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
         },
         constraints: Default::default(),
         graphics: Vec::new(),
+        stackup: Default::default(),
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
