@@ -9,6 +9,7 @@ use gerber_types::{
     GCode, MacroBoolean, MacroContent, MacroDecimal, Operation, Polarity, Unit,
 };
 
+use crate::fab_drills::collect_drill_sections;
 use crate::fab_gerber::copper_gerber_filename;
 use crate::fab_job::verify_gbrjob;
 use crate::geom::{ensure_ccw, pts_to_path64};
@@ -17,8 +18,7 @@ use crate::poly_index::IndexedPour;
 use crate::shapes::{capsule_poly, circle_poly, oval_poly, rect_poly};
 use crate::verify::{ConnectivityCheck, DrillCheck, GerberFileCheck};
 use crate::verify_excellon::{
-    GerberIsland, check_gerber_connectivity, expected_drills, match_drill_lists,
-    parse_excellon_file,
+    GerberIsland, check_gerber_connectivity, match_drill_lists, parse_excellon_file,
 };
 use crate::zone_scene::paths_to_pour_polys;
 
@@ -555,48 +555,53 @@ pub(crate) fn verify_fab_outputs_impl(
         islands.append(&mut layer_islands);
     }
 
-    let exp = expected_drills(board);
-    let pth_path = fab_dir.join(format!("{slug}-PTH.drl"));
-    let npth_path = fab_dir.join(format!("{slug}-NPTH.drl"));
-    let parsed_pth = parse_excellon_file(&pth_path)?;
-    let parsed_npth = parse_excellon_file(&npth_path)?;
-    let (mut pth_matched, mut pth_mismatches) =
-        match_drill_lists(&exp.pth_through, &parsed_pth, 2_000);
-    let (npth_matched, npth_mismatches) = match_drill_lists(&exp.npth, &parsed_npth, 2_000);
-    let mut pth_expected_total = exp.pth_through.len();
-    let mut pth_parsed_total = parsed_pth.len();
+    let drill_sections = collect_drill_sections(board, &cu_layers);
+    let mut pth_expected = 0usize;
+    let mut pth_parsed = 0usize;
+    let mut pth_matched = 0usize;
+    let mut pth_mismatches = 0usize;
+    let mut npth_expected = 0usize;
+    let mut npth_parsed = 0usize;
+    let mut npth_matched = 0usize;
+    let mut npth_mismatches = 0usize;
+    let mut pth_groups = Vec::new();
 
-    let mut pth_groups = vec![(cu_layers.clone(), parsed_pth)];
-    for ((l0, l1), exp_hits) in &exp.pth_spans {
-        let span_path = fab_dir.join(format!(
-            "{slug}-PTH-{}-{}.drl",
-            safe_slug(l0),
-            safe_slug(l1)
-        ));
-        let parsed_span = parse_excellon_file(&span_path)?;
-        let (m, mm_cnt) = match_drill_lists(exp_hits, &parsed_span, 2_000);
-        pth_expected_total += exp_hits.len();
-        pth_parsed_total += parsed_span.len();
-        pth_matched += m;
-        pth_mismatches += mm_cnt;
-        let span_layers: Vec<String> = {
-            let i0 = cu_layers.iter().position(|l| l == l0);
-            let i1 = cu_layers.iter().position(|l| l == l1);
-            match (i0, i1) {
-                (Some(a), Some(b)) => cu_layers[a.min(b)..=a.max(b)].to_vec(),
-                _ => vec![l0.clone(), l1.clone()],
-            }
-        };
-        pth_groups.push((span_layers, parsed_span));
+    for sec in &drill_sections {
+        let parsed = parse_excellon_file(&fab_dir.join(&sec.filename))?;
+        let exp_hits = sec.flat_hits();
+        let (matched, mismatches) = match_drill_lists(&exp_hits, &parsed, 2_000);
+        if sec.plated {
+            pth_expected += exp_hits.len();
+            pth_parsed += parsed.len();
+            pth_matched += matched;
+            pth_mismatches += mismatches;
+            let span_layers = match &sec.span {
+                None => cu_layers.clone(),
+                Some((l0, l1)) => {
+                    let i0 = cu_layers.iter().position(|l| l == l0);
+                    let i1 = cu_layers.iter().position(|l| l == l1);
+                    match (i0, i1) {
+                        (Some(a), Some(b)) => cu_layers[a.min(b)..=a.max(b)].to_vec(),
+                        _ => vec![l0.clone(), l1.clone()],
+                    }
+                }
+            };
+            pth_groups.push((span_layers, parsed));
+        } else {
+            npth_expected += exp_hits.len();
+            npth_parsed += parsed.len();
+            npth_matched += matched;
+            npth_mismatches += mismatches;
+        }
     }
 
     let drill_check = DrillCheck {
         passed: pth_mismatches == 0 && npth_mismatches == 0,
-        pth_expected: pth_expected_total,
-        pth_parsed: pth_parsed_total,
+        pth_expected,
+        pth_parsed,
         pth_matched,
-        npth_expected: exp.npth.len(),
-        npth_parsed: parsed_npth.len(),
+        npth_expected,
+        npth_parsed,
         npth_matched,
         mismatches: pth_mismatches + npth_mismatches,
     };

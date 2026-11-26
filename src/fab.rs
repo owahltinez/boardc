@@ -5,29 +5,40 @@ use std::path::{Path, PathBuf};
 use gerber_types::{ExtendedPosition, FileFunction, Polarity, Position, Profile};
 use serde::{Deserialize, Serialize};
 
+use crate::fab_assembly::{has_bottom_assembly, render_assembly_svg};
+pub use crate::fab_drills::render_drill_report;
+use crate::fab_drills::{
+    collect_drill_sections, emit_excellon_section, format_drill_report,
+    render_drill_map_svg_with_sections,
+};
 use crate::fab_gerber::{
     GerberBuilder, copper_gerber_filename, pad_anchor_world, pad_world_shape_with_margin,
 };
 use crate::fab_job::emit_gbrjob;
 use crate::fab_silk::{emit_silk_layer, push_graphic_mask_shapes};
-use crate::geom::{
-    local_to_board, pad_copper_layers, pad_world_layers, polygon_area, remap_layer_for_side,
-};
+use crate::geom::{pad_copper_layers, pad_world_layers, polygon_area, remap_layer_for_side};
 use crate::ir::{
-    BoardIr, FootprintDef, LayerKind, Nm, PadKind, Placement, PourPoly, Pt, Side, nm_to_mm,
-    safe_slug,
+    BoardIr, FootprintDef, LayerKind, PadKind, Placement, PourPoly, Side, nm_to_mm, safe_slug,
 };
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
+use crate::svg::DEFAULT_SVG_MARGIN_MM;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FabOptions {
     pub clip_silk_to_mask: bool,
+    pub assembly: bool,
+    pub drill_map: bool,
+    pub drill_report: bool,
 }
 
 impl Default for FabOptions {
     fn default() -> Self {
         Self {
             clip_silk_to_mask: true,
+            assembly: false,
+            drill_map: false,
+            drill_report: false,
         }
     }
 }
@@ -39,16 +50,26 @@ pub struct FabManifest {
     pub bom_csv: PathBuf,
     pub cpl_csv: PathBuf,
     pub gbrjob: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assembly_svgs: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill_map_svg: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill_report: Option<PathBuf>,
 }
 
 impl FabManifest {
     pub fn all_files(&self) -> Vec<PathBuf> {
-        let mut out = Vec::with_capacity(self.gerber_files.len() + self.drill_files.len() + 3);
+        let mut out = Vec::with_capacity(
+            self.gerber_files.len() + self.drill_files.len() + self.assembly_svgs.len() + 5,
+        );
         out.extend(self.gerber_files.iter().cloned());
         out.extend(self.drill_files.iter().cloned());
         out.push(self.bom_csv.clone());
         out.push(self.cpl_csv.clone());
         out.push(self.gbrjob.clone());
+        out.extend(self.assembly_svgs.iter().cloned());
+        out.extend(self.drill_map_svg.iter().chain(&self.drill_report).cloned());
         out
     }
 }
@@ -270,45 +291,6 @@ fn emit_edge_cuts(board: &BoardIr, out_path: &Path) -> Result<(), String> {
     b.write_file(out_path)
 }
 
-fn emit_excellon(
-    path: &Path,
-    hits: &[(Nm, Pt)],
-    span_comment: Option<(&str, &str)>,
-) -> Result<(), String> {
-    let mut by_dia: BTreeMap<Nm, Vec<Pt>> = BTreeMap::new();
-    for &(dia, pt) in hits {
-        if dia > 0 {
-            by_dia.entry(dia).or_default().push(pt);
-        }
-    }
-    let mut out = String::new();
-    out.push_str("M48\n");
-    out.push_str("; DRILL file {boardc}\n");
-    if let Some((l0, l1)) = span_comment {
-        out.push_str(&format!("; LAYER_SPAN={l0}..{l1}\n"));
-    }
-    out.push_str("; FORMAT={-:-/ absolute / metric / decimal}\n");
-    out.push_str("FMAT,2\n");
-    out.push_str("METRIC,TZ\n");
-    for (idx, dia) in by_dia.keys().enumerate() {
-        out.push_str(&format!("T{:02}C{:.4}\n", idx + 1, nm_to_mm(*dia)));
-    }
-    out.push_str("%\n");
-    out.push_str("G90\n");
-    out.push_str("G05\n");
-    for (idx, pts) in by_dia.values().enumerate() {
-        out.push_str(&format!("T{:02}\n", idx + 1));
-        for pt in pts {
-            out.push_str(&format!("X{:.4}Y{:.4}\n", nm_to_mm(pt.x), nm_to_mm(pt.y)));
-        }
-    }
-    if !by_dia.is_empty() {
-        out.push_str("T00\n");
-    }
-    out.push_str("M30\n");
-    fs::write(path, out).map_err(|e| format!("failed to write drill '{}': {e}", path.display()))
-}
-
 fn csv_escape(field: &str) -> String {
     if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
@@ -443,50 +425,11 @@ pub fn export_fab(
     emit_edge_cuts(board, &edge_path)?;
     gerber_files.push(edge_path);
 
-    let mut pth_hits = Vec::new();
-    let mut npth_hits = Vec::new();
-    let mut span_hits: BTreeMap<(String, String), Vec<(Nm, Pt)>> = BTreeMap::new();
-    for via in &board.vias {
-        if via.is_through_hole(&cu_layers, &board.layers) {
-            pth_hits.push((via.drill, via.pos));
-        } else {
-            let span = via.span_layer_pair(&cu_layers, &board.layers);
-            span_hits
-                .entry(span)
-                .or_default()
-                .push((via.drill, via.pos));
-        }
-    }
-    for pl in &board.placements {
-        let Some(fp) = board.footprints.get(&pl.footprint) else {
-            continue;
-        };
-        for pad in &fp.pads {
-            if let Some(drill) = pad.drill_nm
-                && drill > 0
-            {
-                let world = local_to_board(pad.pos, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
-                match pad.kind {
-                    PadKind::Tht => pth_hits.push((drill, world)),
-                    PadKind::Npth => npth_hits.push((drill, world)),
-                    PadKind::Smd => {}
-                }
-            }
-        }
-    }
-
-    let pth_path = out_dir.join(format!("{slug}-PTH.drl"));
-    let npth_path = out_dir.join(format!("{slug}-NPTH.drl"));
-    emit_excellon(&pth_path, &pth_hits, None)?;
-    emit_excellon(&npth_path, &npth_hits, None)?;
-    let mut drill_files = vec![pth_path, npth_path];
-    for ((l0, l1), hits) in span_hits {
-        let path = out_dir.join(format!(
-            "{slug}-PTH-{}-{}.drl",
-            safe_slug(&l0),
-            safe_slug(&l1)
-        ));
-        emit_excellon(&path, &hits, Some((&l0, &l1)))?;
+    let drill_sections = collect_drill_sections(board, &cu_layers);
+    let mut drill_files = Vec::with_capacity(drill_sections.len());
+    for sec in &drill_sections {
+        let path = out_dir.join(&sec.filename);
+        emit_excellon_section(&path, sec)?;
         drill_files.push(path);
     }
 
@@ -497,11 +440,52 @@ pub fn export_fab(
     emit_cpl_csv(board, &cpl_csv)?;
     emit_gbrjob(board, &cu_layers, &gbrjob)?;
 
+    let mut assembly_svgs = Vec::new();
+    if cfg.assembly {
+        let top_path = out_dir.join(format!("{slug}-assembly-top.svg"));
+        fs::write(
+            &top_path,
+            render_assembly_svg(board, Side::Top, DEFAULT_SVG_MARGIN_MM),
+        )
+        .map_err(|e| format!("failed to write '{}': {e}", top_path.display()))?;
+        assembly_svgs.push(top_path);
+        if has_bottom_assembly(board) {
+            let bot_path = out_dir.join(format!("{slug}-assembly-bottom.svg"));
+            fs::write(
+                &bot_path,
+                render_assembly_svg(board, Side::Bottom, DEFAULT_SVG_MARGIN_MM),
+            )
+            .map_err(|e| format!("failed to write '{}': {e}", bot_path.display()))?;
+            assembly_svgs.push(bot_path);
+        }
+    }
+
+    let drill_map_svg = if cfg.drill_map {
+        let path = out_dir.join(format!("{slug}-drl_map.svg"));
+        let svg = render_drill_map_svg_with_sections(board, &drill_sections, DEFAULT_SVG_MARGIN_MM);
+        fs::write(&path, svg).map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
+        Some(path)
+    } else {
+        None
+    };
+
+    let drill_report = if cfg.drill_report {
+        let path = out_dir.join(format!("{slug}-drl.rpt"));
+        let rpt = format_drill_report(board, &cu_layers, &drill_sections);
+        fs::write(&path, rpt).map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
+        Some(path)
+    } else {
+        None
+    };
+
     Ok(FabManifest {
         gerber_files,
         drill_files,
         bom_csv,
         cpl_csv,
         gbrjob,
+        assembly_svgs,
+        drill_map_svg,
+        drill_report,
     })
 }

@@ -3,16 +3,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::drc::DrcReport;
+use crate::fab_assembly::render_assembly_svg;
+use crate::fab_drills::render_drill_map_svg;
 use crate::fab_silk::{is_silk_layer, refdes_local_pos, text_stroke_segments};
 use crate::geom::{local_to_board, pad_copper_layers, remap_layer_for_side};
 use crate::ir::{BBoxNm, BoardIr, Graphic, PadKind, Pt, Side, mm, nm_to_mm, safe_slug};
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
+
+pub(crate) const DEFAULT_SVG_MARGIN_MM: f64 = 2.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SvgView {
     Top,
     Bottom,
     Layer(String),
+    AssemblyTop,
+    AssemblyBottom,
+    DrillMap,
 }
 
 #[derive(Debug, Clone)]
@@ -31,25 +38,25 @@ impl Default for SvgOptions {
             show_hotspots: true,
             show_silk: true,
             show_drills: true,
-            margin_mm: 2.0,
+            margin_mm: DEFAULT_SVG_MARGIN_MM,
         }
     }
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
 
-fn svg_pt(pt: Pt, mirror_x: bool) -> (f64, f64) {
+pub(crate) fn svg_pt(pt: Pt, mirror_x: bool) -> (f64, f64) {
     let x = nm_to_mm(pt.x);
     let y = nm_to_mm(pt.y);
     (if mirror_x { -x } else { x }, -y)
 }
 
-fn poly_path_d(pts: &[Pt], mirror_x: bool) -> String {
+pub(crate) fn poly_path_d(pts: &[Pt], mirror_x: bool) -> String {
     let mut d = String::new();
     for (i, &p) in pts.iter().enumerate() {
         let (x, y) = svg_pt(p, mirror_x);
@@ -77,7 +84,12 @@ fn layer_color(layer: &str, idx: usize) -> &'static str {
     }
 }
 
-fn render_shape_svg(out: &mut String, shape: &ResolvedShape, color: &str, mirror_x: bool) {
+pub(crate) fn render_shape_svg(
+    out: &mut String,
+    shape: &ResolvedShape,
+    color: &str,
+    mirror_x: bool,
+) {
     match shape {
         ResolvedShape::Circle { center, radius } => {
             let (cx, cy) = svg_pt(*center, mirror_x);
@@ -104,7 +116,7 @@ fn render_shape_svg(out: &mut String, shape: &ResolvedShape, color: &str, mirror
     }
 }
 
-fn render_graphic_svg(
+pub(crate) fn render_graphic_svg(
     out: &mut String,
     g: &Graphic,
     pl: Option<&crate::ir::Placement>,
@@ -155,7 +167,7 @@ fn render_graphic_svg(
             width,
             fill,
             ..
-        } => {
+        } if *radius > 0 => {
             let (cx, cy) = svg_pt(map_pt(*center), mirror_x);
             if *fill {
                 let _ = writeln!(
@@ -191,11 +203,64 @@ fn render_graphic_svg(
     }
 }
 
-fn board_bbox_mm(board: &BoardIr) -> BBoxNm {
-    if !board.outline.is_empty() {
-        return BBoxNm::from_pts(&board.outline);
+pub(crate) fn sanitize_margin_mm(margin_mm: f64) -> f64 {
+    if margin_mm.is_finite() {
+        margin_mm.max(0.0)
+    } else {
+        DEFAULT_SVG_MARGIN_MM
     }
-    BBoxNm::new(0, 0, mm(40.0), mm(30.0))
+}
+
+pub(crate) fn board_svg_bounds(board: &BoardIr, mirror_x: bool) -> (f64, f64, f64, f64) {
+    let bb = if !board.outline.is_empty() {
+        BBoxNm::from_pts(&board.outline)
+    } else {
+        BBoxNm::new(0, 0, mm(40.0), mm(30.0))
+    };
+    let (min_x, max_x) = if mirror_x {
+        (-nm_to_mm(bb.max_x), -nm_to_mm(bb.min_x))
+    } else {
+        (nm_to_mm(bb.min_x), nm_to_mm(bb.max_x))
+    };
+    (min_x, max_x, -nm_to_mm(bb.max_y), -nm_to_mm(bb.min_y))
+}
+
+pub(crate) fn begin_svg(title: &str, min_x: f64, min_y: f64, vw: f64, vh: f64, bg: &str) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{min_x:.4} {min_y:.4} {vw:.4} {vh:.4}" width="{:.0}px" height="{:.0}px">"#,
+        (vw * 20.0).clamp(320.0, 2400.0),
+        (vh * 20.0).clamp(240.0, 2400.0)
+    );
+    let _ = writeln!(out, "  <title>{}</title>", xml_escape(title));
+    let _ = writeln!(
+        out,
+        r#"  <rect x="{min_x:.4}" y="{min_y:.4}" width="{vw:.4}" height="{vh:.4}" fill="{bg}" />"#
+    );
+    out
+}
+
+pub(crate) fn write_board_outline(
+    out: &mut String,
+    board: &BoardIr,
+    mirror_x: bool,
+    fill: &str,
+    stroke: &str,
+    stroke_width: &str,
+) {
+    if board.outline.is_empty() {
+        return;
+    }
+    let mut d = poly_path_d(&board.outline, mirror_x);
+    for cut in &board.cutouts {
+        d.push(' ');
+        d.push_str(&poly_path_d(cut, mirror_x));
+    }
+    let _ = writeln!(
+        out,
+        r#"  <path id="board_outline" d="{d}" fill="{fill}" fill-rule="evenodd" stroke="{stroke}" stroke-width="{stroke_width}" />"#
+    );
 }
 
 fn draw_copper_layer(
@@ -269,50 +334,25 @@ fn draw_copper_layer(
     out.push_str("  </g>\n");
 }
 
-/// Renders a composite Top/Bottom or single-layer 2D SVG with optional DRC hotspot overlays.
+/// Renders a composite Top/Bottom, single-layer, assembly, or drill-map 2D SVG.
 pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptions) -> String {
+    match cfg.view {
+        SvgView::AssemblyTop => return render_assembly_svg(board, Side::Top, cfg.margin_mm),
+        SvgView::AssemblyBottom => return render_assembly_svg(board, Side::Bottom, cfg.margin_mm),
+        SvgView::DrillMap => return render_drill_map_svg(board, cfg.margin_mm),
+        _ => {}
+    }
     let cu_layers = board.copper_layer_names();
     let mirror_x = matches!(cfg.view, SvgView::Bottom);
-    let bb = board_bbox_mm(board);
-    let min_x = if mirror_x {
-        -nm_to_mm(bb.max_x)
-    } else {
-        nm_to_mm(bb.min_x)
-    } - cfg.margin_mm;
-    let max_x = if mirror_x {
-        -nm_to_mm(bb.min_x)
-    } else {
-        nm_to_mm(bb.max_x)
-    } + cfg.margin_mm;
-    let min_y = -nm_to_mm(bb.max_y) - cfg.margin_mm;
-    let max_y = -nm_to_mm(bb.min_y) + cfg.margin_mm;
-    let vw = (max_x - min_x).max(1.0);
-    let vh = (max_y - min_y).max(1.0);
+    let margin = sanitize_margin_mm(cfg.margin_mm);
+    let (bx0, bx1, by0, by1) = board_svg_bounds(board, mirror_x);
+    let min_x = bx0 - margin;
+    let min_y = by0 - margin;
+    let vw = (bx1 - bx0 + 2.0 * margin).max(1.0);
+    let vh = (by1 - by0 + 2.0 * margin).max(1.0);
 
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{min_x:.4} {min_y:.4} {vw:.4} {vh:.4}" width="{:.0}px" height="{:.0}px">"#,
-        (vw * 20.0).clamp(320.0, 2400.0),
-        (vh * 20.0).clamp(240.0, 2400.0)
-    );
-    let _ = writeln!(out, "  <title>{}</title>", xml_escape(&board.name));
-    let _ = writeln!(
-        out,
-        r##"  <rect x="{min_x:.4}" y="{min_y:.4}" width="{vw:.4}" height="{vh:.4}" fill="#0d1117" />"##
-    );
-
-    if !board.outline.is_empty() {
-        let mut d = poly_path_d(&board.outline, mirror_x);
-        for cut in &board.cutouts {
-            d.push(' ');
-            d.push_str(&poly_path_d(cut, mirror_x));
-        }
-        let _ = writeln!(
-            out,
-            r##"  <path id="board_outline" d="{d}" fill="#14291d" fill-rule="evenodd" stroke="#facc15" stroke-width="0.12" />"##
-        );
-    }
+    let mut out = begin_svg(&board.name, min_x, min_y, vw, vh, "#0d1117");
+    write_board_outline(&mut out, board, mirror_x, "#14291d", "#facc15", "0.12");
 
     let mut draw_order: Vec<(usize, &str, f64)> = Vec::new();
     match &cfg.view {
@@ -338,6 +378,7 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
                 draw_order.push((i, n.as_str(), 0.92));
             }
         }
+        SvgView::AssemblyTop | SvgView::AssemblyBottom | SvgView::DrillMap => unreachable!(),
     }
     for (idx, name, opacity) in draw_order {
         draw_copper_layer(

@@ -9,6 +9,8 @@ mod drc_layout;
 mod drc_rules;
 mod drc_scene;
 pub mod fab;
+mod fab_assembly;
+mod fab_drills;
 mod fab_gerber;
 mod fab_job;
 mod fab_silk;
