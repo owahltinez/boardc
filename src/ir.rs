@@ -354,6 +354,10 @@ pub struct Placement {
     #[serde(default)]
     pub dnp: bool,
     #[serde(default)]
+    pub exclude_from_bom: bool,
+    #[serde(default)]
+    pub exclude_from_pos: bool,
+    #[serde(default)]
     pub cpl_rotation_offset_deg: f64,
 }
 

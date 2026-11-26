@@ -73,6 +73,8 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             Placement {
@@ -90,6 +92,8 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             Placement {
@@ -107,6 +111,8 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             Placement {
@@ -124,6 +130,8 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             Placement {
@@ -141,6 +149,8 @@ fn build_2layer_top_bottom_board() -> BoardIr {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
         ],

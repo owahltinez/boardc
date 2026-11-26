@@ -65,6 +65,8 @@ fn place_pin1(refdes: &str, fp: &str, x_mm: f64, y_mm: f64, side: Side, net: &st
         mpn: None,
         lcsc: None,
         dnp: false,
+        exclude_from_bom: false,
+        exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
     }
 }
@@ -570,6 +572,8 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             Placement {
@@ -584,6 +588,8 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             // Passive on Bottom under U1 (allowed when allow_passives=true)
@@ -599,6 +605,8 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             // Active IC on Bottom under U1 (must violate BgaShadow)
@@ -614,6 +622,8 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
         ],

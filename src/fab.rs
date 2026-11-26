@@ -76,13 +76,21 @@ fn copper_file_function(
     }
 }
 
-fn emit_board_and_fp_graphics(b: &mut GerberBuilder, board: &BoardIr, target_layer: &str) {
+fn emit_board_and_fp_graphics(
+    b: &mut GerberBuilder,
+    board: &BoardIr,
+    target_layer: &str,
+    skip_dnp: bool,
+) {
     for g in &board.graphics {
         if g.layer() == target_layer {
             b.emit_graphic(g, None);
         }
     }
     for pl in &board.placements {
+        if skip_dnp && pl.dnp {
+            continue;
+        }
         let Some(fp) = board.footprints.get(&pl.footprint) else {
             continue;
         };
@@ -140,7 +148,7 @@ fn emit_copper_layer(
             }
         }
     }
-    emit_board_and_fp_graphics(&mut b, board, layer);
+    emit_board_and_fp_graphics(&mut b, board, layer, false);
     for via in &board.vias {
         if via.touches_layer(layer, &board.layers) {
             b.flash_circle(via.pos, via.diameter);
@@ -177,7 +185,7 @@ fn emit_mask_layer(
             }
         }
     }
-    emit_board_and_fp_graphics(&mut b, board, mask_name);
+    emit_board_and_fp_graphics(&mut b, board, mask_name, false);
     for via in &board.vias {
         if !via.tented && via.touches_layer(side.cu_layer(), &board.layers) {
             let dia = via.diameter + 2 * board.rules.mask_expansion_nm;
@@ -201,6 +209,9 @@ fn emit_paste_layer(
     };
     let mut b = GerberBuilder::new(FileFunction::Paste(pos));
     for pl in &board.placements {
+        if pl.dnp {
+            continue;
+        }
         let Some(fp) = board.footprints.get(&pl.footprint) else {
             continue;
         };
@@ -220,7 +231,7 @@ fn emit_paste_layer(
             }
         }
     }
-    emit_board_and_fp_graphics(&mut b, board, paste_name);
+    emit_board_and_fp_graphics(&mut b, board, paste_name, true);
     b.write_file(out_path)
 }
 
@@ -291,7 +302,7 @@ fn emit_bom_csv(board: &BoardIr, path: &Path) -> Result<(), String> {
     }
     let mut groups: BTreeMap<BomKey, Vec<String>> = BTreeMap::new();
     for pl in &board.placements {
-        if pl.dnp {
+        if pl.dnp || pl.exclude_from_bom {
             continue;
         }
         let comment = if pl.value.trim().is_empty() {
@@ -325,8 +336,11 @@ fn emit_bom_csv(board: &BoardIr, path: &Path) -> Result<(), String> {
 }
 
 fn emit_cpl_csv(board: &BoardIr, path: &Path) -> Result<(), String> {
-    let mut active: Vec<&crate::ir::Placement> =
-        board.placements.iter().filter(|p| !p.dnp).collect();
+    let mut active: Vec<&crate::ir::Placement> = board
+        .placements
+        .iter()
+        .filter(|p| !p.dnp && !p.exclude_from_pos)
+        .collect();
     active.sort_by(|a, b| a.refdes.cmp(&b.refdes));
     let mut out = String::from("Designator,Mid X,Mid Y,Layer,Rotation\n");
     for pl in active {
