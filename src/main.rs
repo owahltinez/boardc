@@ -161,6 +161,9 @@ enum Command {
         input: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
+        /// Clip silkscreen against solder mask openings (enabled by default).
+        #[arg(long, conflicts_with = "no_clip_silk")]
+        subtract_soldermask: bool,
         #[arg(long)]
         no_clip_silk: bool,
         #[arg(long)]
@@ -580,6 +583,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Fab {
             input,
             out,
+            subtract_soldermask: _,
             no_clip_silk,
             json,
         } => {
