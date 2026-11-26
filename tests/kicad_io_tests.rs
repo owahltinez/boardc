@@ -355,3 +355,131 @@ fn parse_and_export_kicad_pcb_roundtrip_dnp_and_virtual_attrs() {
         assert_eq!(flags(&reimported, refdes), flags(&ir, refdes), "{refdes}");
     }
 }
+
+#[test]
+fn export_and_import_kicad_pcb_roundtrip_stackup_thickness_finish_dielectric_and_pofv() {
+    use boardc::ir::{BoardIr, BoardSpec, LayerDef, Stackup};
+    use boardc::kicad_export::render_kicad_pcb;
+
+    let spec = BoardSpec {
+        name: "stackup_rt".into(),
+        size_nm: Some([mm(40.0), mm(30.0)]),
+        layers: vec![
+            LayerDef {
+                name: "F.Cu".into(),
+                kind: LayerKind::Signal,
+                side: Some(Side::Top),
+                thickness_nm: Some(35_000),
+            },
+            LayerDef {
+                name: "In1.Cu".into(),
+                kind: LayerKind::Plane,
+                side: None,
+                thickness_nm: Some(17_500),
+            },
+            LayerDef {
+                name: "In2.Cu".into(),
+                kind: LayerKind::Signal,
+                side: None,
+                thickness_nm: Some(17_500),
+            },
+            LayerDef {
+                name: "In3.Cu".into(),
+                kind: LayerKind::Signal,
+                side: None,
+                thickness_nm: Some(17_500),
+            },
+            LayerDef {
+                name: "In4.Cu".into(),
+                kind: LayerKind::Plane,
+                side: None,
+                thickness_nm: Some(17_500),
+            },
+            LayerDef {
+                name: "B.Cu".into(),
+                kind: LayerKind::Signal,
+                side: Some(Side::Bottom),
+                thickness_nm: Some(35_000),
+            },
+        ],
+        stackup: Stackup {
+            thickness_nm: 1_000_000,
+            finish: Some("ENIG".into()),
+            pofv: true,
+            dielectric_nm: vec![95_000, 240_000, 170_000, 240_000, 95_000],
+        },
+        ..Default::default()
+    };
+    let board = BoardIr::from_spec(&spec).unwrap();
+    let rendered = render_kicad_pcb(&board);
+
+    assert!(board.rules.via_at_smd, "stackup.pofv must sync via_at_smd");
+    assert!(
+        rendered.contains("(version 20260206)"),
+        "POFV export must use KiCad 10 schema version"
+    );
+    assert!(
+        rendered.contains("(thickness 1)"),
+        "missing 1mm general thickness:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("(thickness 1.6)"),
+        "hardcoded 1.6mm leaked:\n{rendered}"
+    );
+    assert!(rendered.contains("(stackup\n"), "missing (stackup) block");
+    assert!(rendered.contains("(copper_finish \"ENIG\")"));
+    assert!(rendered.contains("(layer \"dielectric 1\" (type \"prepreg\") (thickness 0.095)"));
+    assert!(rendered.contains("(layer \"dielectric 2\" (type \"core\") (thickness 0.24)"));
+    assert!(rendered.contains("(layer \"dielectric 3\" (type \"prepreg\") (thickness 0.17)"));
+    assert!(rendered.contains("(layer \"dielectric 4\" (type \"core\") (thickness 0.24)"));
+    assert!(rendered.contains("(layer \"dielectric 5\" (type \"prepreg\") (thickness 0.095)"));
+    assert!(rendered.contains("(plugging (front yes) (back yes))"));
+    assert!(rendered.contains("(capping yes)"));
+    assert!(rendered.contains("(filling yes)"));
+
+    let reimported = parse_kicad_pcb(&rendered, None).expect("reimport rendered kicad_pcb");
+    assert_eq!(reimported.stackup, board.stackup);
+    assert_eq!(reimported.rules.via_at_smd, board.rules.via_at_smd);
+    assert_eq!(reimported.layers[0].thickness_nm, Some(35_000));
+    assert_eq!(reimported.layers[1].thickness_nm, Some(17_500));
+
+    // Default 2-layer board uses KiCad 9 version, omits POFV and copper_finish, emits 1.6 mm / 1.51 mm core.
+    let def_board = BoardIr::from_spec(&BoardSpec {
+        name: "def_rt".into(),
+        size_nm: Some([mm(20.0), mm(10.0)]),
+        ..Default::default()
+    })
+    .unwrap();
+    let def_rendered = render_kicad_pcb(&def_board);
+    assert!(def_rendered.contains("(version 20241229)"));
+    assert!(def_rendered.contains("(thickness 1.6)"));
+    assert!(def_rendered.contains("(layer \"dielectric 1\" (type \"core\") (thickness 1.51)"));
+    assert!(!def_rendered.contains("(copper_finish"));
+    assert!(!def_rendered.contains("(plugging"));
+    assert!(!def_rendered.contains("(capping"));
+    assert!(!def_rendered.contains("(filling"));
+
+    // Real KiCad bare `addsublayer` syntax and mixed-case Core/Dielectric names sum into one gap entry.
+    let multi_sub = r#"(kicad_pcb (version 20260206)
+        (general (thickness 1.2))
+        (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+        (setup
+            (stackup
+                (layer "F.Cu" (type "copper") (thickness 0.035))
+                (layer "Dielectric 1" (type "Prepreg") (thickness 0.1) (material "FR4") addsublayer (thickness 0.2) (material "FR4"))
+                (layer "Dielectric 1" (type "Core") (thickness 0.8))
+                (layer "B.Cu" (type "copper") (thickness 0.035))
+                (copper_finish "HAL lead-free")
+            )
+        )
+        (gr_rect (start 0 0) (end 20 10) (stroke (width 0.1)) (layer "Edge.Cuts"))
+    )"#;
+    let parsed_multi = parse_kicad_pcb(multi_sub, None).expect("parse multi-sublayer stackup");
+    assert_eq!(parsed_multi.stackup.thickness_nm, 1_200_000);
+    assert_eq!(
+        parsed_multi.stackup.finish.as_deref(),
+        Some("HAL lead-free")
+    );
+    assert!(!parsed_multi.stackup.pofv);
+    assert_eq!(parsed_multi.stackup.dielectric_nm, vec![1_100_000]);
+}

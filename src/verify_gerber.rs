@@ -10,6 +10,7 @@ use gerber_types::{
 };
 
 use crate::fab_gerber::copper_gerber_filename;
+use crate::fab_job::verify_gbrjob;
 use crate::geom::{ensure_ccw, pts_to_path64};
 use crate::ir::{BBoxNm, BoardIr, Nm, Pt, mm, safe_slug};
 use crate::poly_index::IndexedPour;
@@ -501,6 +502,12 @@ pub(crate) fn verify_fab_outputs_impl(
             return Err(format!("missing required assembly CSV '{}'", p.display()));
         }
     }
+    verify_gbrjob(
+        board,
+        &cu_layers,
+        fab_dir,
+        &fab_dir.join(format!("{slug}-job.gbrjob")),
+    )?;
 
     let mut gerber_paths: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(fab_dir)

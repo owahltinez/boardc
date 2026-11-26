@@ -93,6 +93,7 @@ kicad-cli pcb render out/board.kicad_pcb -o out/render_bot.png --side bottom --q
 ## Spec Quick Reference
 
 - Parametric footprints supported natively: `chip2_pin` (`0201`/`0402`/`0603`/`0805`), `bga`, `qfn`, `sot23`, `pin_header`, plus `custom` pads/courtyards/graphics/keepouts.
+- Stackup (`[stackup]`): `thickness_nm`, `finish`, `pofv` (via plugging + filling + capping), and `dielectric_nm` (emitted to `<name>-job.gbrjob` and KiCad `(general)`/`(setup (stackup ...))`).
 - Constraints (`[constraints]`): `max_lengths`, `match_groups`, `cap_proximity`, `min_vias`, and `bga_shadows`.
 - Keepout kinds: `all`, `track`, `via`, `copper` (pours only, allows tracks), `placement`, or `custom` (`tracks`/`vias`/`copper`/`placement` booleans).
 - `boardc` embeds `viahop` statically; you do not need `viahop` installed separately unless you specifically need Specctra `.dsn`/`.ses` Freerouting compatibility.

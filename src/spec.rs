@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::footprints;
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FootprintDef, Graphic, Keepout, LayerDef, NetClass, NetDef,
-    Nm, PadDef, Placement, PourSpec, Pt, Track, Via, default_net_class, default_two_layer_stackup,
+    Nm, PadDef, Placement, PourSpec, Pt, Stackup, Track, Via, default_net_class,
+    default_two_layer_stackup,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +118,8 @@ pub struct BoardSpec {
     pub constraints: Constraints,
     #[serde(default)]
     pub graphics: Vec<Graphic>,
+    #[serde(default)]
+    pub stackup: Stackup,
 }
 
 impl BoardIr {
@@ -185,6 +188,28 @@ impl BoardIr {
                 "design rules track_width_nm, via_dia_nm, and via_drill_nm must be > 0".into(),
             );
         }
+        if spec.stackup.thickness_nm <= 0 {
+            return Err("stackup.thickness_nm must be > 0".into());
+        }
+        if spec.stackup.dielectric_nm.iter().any(|&d| d <= 0) {
+            return Err("stackup.dielectric_nm entries must be > 0".into());
+        }
+        let expected_dielectrics = layers.len().saturating_sub(1).max(1);
+        if !spec.stackup.dielectric_nm.is_empty()
+            && spec.stackup.dielectric_nm.len() != expected_dielectrics
+        {
+            return Err(format!(
+                "stackup.dielectric_nm length ({}) must equal {expected_dielectrics}",
+                spec.stackup.dielectric_nm.len()
+            ));
+        }
+        let mut rules = spec.rules.clone();
+        let mut stackup = spec.stackup.clone();
+        // Keep stackup POFV and via-in-pad DRC/routing flags consistent across the pipeline and fab exports.
+        if stackup.pofv || rules.via_at_smd {
+            rules.via_at_smd = true;
+            stackup.pofv = true;
+        }
         Ok(Self {
             name: spec.name.clone(),
             outline,
@@ -199,9 +224,10 @@ impl BoardIr {
             vias: spec.vias.clone(),
             net_classes: spec.net_classes.clone(),
             nets,
-            rules: spec.rules.clone(),
+            rules,
             constraints: spec.constraints.clone(),
             graphics: spec.graphics.clone(),
+            stackup,
         })
     }
 }

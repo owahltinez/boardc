@@ -22,6 +22,15 @@ pub fn safe_slug(name: &str) -> String {
     if s.is_empty() { "board".into() } else { s }
 }
 
+pub(crate) fn fnv1a_128(bytes: &[u8]) -> u128 {
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for &b in bytes {
+        hash ^= b as u128;
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    hash
+}
+
 pub fn default_two_layer_stackup() -> Vec<LayerDef> {
     vec![
         LayerDef {
@@ -44,6 +53,10 @@ pub type Nm = i64;
 
 pub const UM: Nm = 1_000;
 pub const MM: Nm = 1_000_000;
+pub const DEFAULT_BOARD_THICKNESS_NM: Nm = 1_600_000;
+pub const SOLDER_MASK_THICKNESS_NM: Nm = 10_000;
+pub const OUTER_COPPER_THICKNESS_NM: Nm = 35_000;
+pub const INNER_COPPER_THICKNESS_NM: Nm = 17_500;
 
 pub fn mm(v: f64) -> Nm {
     (v * MM as f64).round() as Nm
@@ -207,6 +220,39 @@ pub struct LayerDef {
     pub side: Option<Side>,
     #[serde(default)]
     pub thickness_nm: Option<Nm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Stackup {
+    pub thickness_nm: Nm,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish: Option<String>,
+    pub pofv: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dielectric_nm: Vec<Nm>,
+}
+
+impl Default for Stackup {
+    fn default() -> Self {
+        Self {
+            thickness_nm: DEFAULT_BOARD_THICKNESS_NM,
+            finish: None,
+            pofv: false,
+            dielectric_nm: Vec::new(),
+        }
+    }
+}
+
+impl Stackup {
+    pub fn normalize_finish(raw: &str) -> Option<&str> {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none")).then_some(trimmed)
+    }
+
+    pub fn finish_trimmed(&self) -> Option<&str> {
+        self.finish.as_deref().and_then(Self::normalize_finish)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -744,6 +790,8 @@ pub struct BoardIr {
     pub constraints: Constraints,
     #[serde(default)]
     pub graphics: Vec<Graphic>,
+    #[serde(default)]
+    pub stackup: Stackup,
 }
 
 impl BoardIr {
@@ -753,6 +801,58 @@ impl BoardIr {
         } else {
             self.layers.clone()
         }
+    }
+
+    pub fn effective_board_thickness_nm(&self) -> Nm {
+        if self.stackup.thickness_nm > 0 {
+            self.stackup.thickness_nm
+        } else {
+            DEFAULT_BOARD_THICKNESS_NM
+        }
+    }
+
+    pub fn pofv_enabled(&self) -> bool {
+        self.stackup.pofv || self.rules.via_at_smd
+    }
+
+    /// Resolves `(copper_layer_name, thickness_nm)` and dielectric thicknesses (in nm) top-to-bottom.
+    pub fn resolved_stackup_thicknesses(&self) -> (Vec<(&str, Nm)>, Vec<Nm>) {
+        let cu: Vec<(&str, Nm)> = if self.layers.is_empty() {
+            vec![
+                ("F.Cu", OUTER_COPPER_THICKNESS_NM),
+                ("B.Cu", OUTER_COPPER_THICKNESS_NM),
+            ]
+        } else {
+            let n = self.layers.len();
+            self.layers
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let thick =
+                        l.thickness_nm
+                            .filter(|&t| t > 0)
+                            .unwrap_or(if i == 0 || i + 1 == n {
+                                OUTER_COPPER_THICKNESS_NM
+                            } else {
+                                INNER_COPPER_THICKNESS_NM
+                            });
+                    (l.name.as_str(), thick)
+                })
+                .collect()
+        };
+        let gap_count = cu.len().saturating_sub(1).max(1);
+        if self.stackup.dielectric_nm.len() == gap_count
+            && self.stackup.dielectric_nm.iter().all(|&d| d > 0)
+        {
+            return (cu, self.stackup.dielectric_nm.clone());
+        }
+        let total_cu: Nm = cu.iter().map(|(_, t)| *t).sum();
+        let rem = (self.effective_board_thickness_nm() - total_cu - 2 * SOLDER_MASK_THICKNESS_NM)
+            .max(gap_count as Nm * 1_000);
+        let base = rem / gap_count as Nm;
+        let mut diel_nm = vec![base; gap_count];
+        diel_nm[gap_count / 2] += rem % gap_count as Nm;
+        (cu, diel_nm)
     }
 
     pub fn copper_layer_names(&self) -> Vec<String> {
