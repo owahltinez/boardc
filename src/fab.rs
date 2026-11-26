@@ -12,7 +12,10 @@ use crate::fab_silk::emit_silk_layer;
 use crate::geom::{
     local_to_board, pad_copper_layers, pad_world_layers, polygon_area, remap_layer_for_side,
 };
-use crate::ir::{BoardIr, LayerKind, Nm, PadKind, PourPoly, Pt, Side, nm_to_mm, safe_slug};
+use crate::ir::{
+    BoardIr, FootprintDef, LayerKind, Nm, PadKind, Placement, PourPoly, Pt, Side, nm_to_mm,
+    safe_slug,
+};
 use crate::shapes::pad_to_world_shape;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,20 +79,18 @@ fn copper_file_function(
     }
 }
 
-fn emit_board_and_fp_graphics(b: &mut GerberBuilder, board: &BoardIr, target_layer: &str) {
+fn emit_board_graphics(b: &mut GerberBuilder, board: &BoardIr, target_layer: &str) {
     for g in &board.graphics {
         if g.layer() == target_layer {
             b.emit_graphic(g, None);
         }
     }
-    for pl in &board.placements {
-        let Some(fp) = board.footprints.get(&pl.footprint) else {
-            continue;
-        };
-        for g in &fp.graphics {
-            if remap_layer_for_side(g.layer(), pl.side) == target_layer {
-                b.emit_graphic(g, Some(pl));
-            }
+}
+
+fn emit_fp_graphics(b: &mut GerberBuilder, fp: &FootprintDef, pl: &Placement, target_layer: &str) {
+    for g in &fp.graphics {
+        if remap_layer_for_side(g.layer(), pl.side) == target_layer {
+            b.emit_graphic(g, Some(pl));
         }
     }
 }
@@ -139,8 +140,9 @@ fn emit_copper_layer(
                 b.flash_shape(&shape, pad_anchor_world(pad, pl));
             }
         }
+        emit_fp_graphics(&mut b, fp, pl, layer);
     }
-    emit_board_and_fp_graphics(&mut b, board, layer);
+    emit_board_graphics(&mut b, board, layer);
     for via in &board.vias {
         if via.touches_layer(layer, &board.layers) {
             b.flash_circle(via.pos, via.diameter);
@@ -176,8 +178,9 @@ fn emit_mask_layer(
                 b.flash_shape(&shape, pad_anchor_world(pad, pl));
             }
         }
+        emit_fp_graphics(&mut b, fp, pl, mask_name);
     }
-    emit_board_and_fp_graphics(&mut b, board, mask_name);
+    emit_board_graphics(&mut b, board, mask_name);
     for via in &board.vias {
         if !via.tented && via.touches_layer(side.cu_layer(), &board.layers) {
             let dia = via.diameter + 2 * board.rules.mask_expansion_nm;
@@ -201,6 +204,9 @@ fn emit_paste_layer(
     };
     let mut b = GerberBuilder::new(FileFunction::Paste(pos));
     for pl in &board.placements {
+        if pl.dnp {
+            continue;
+        }
         let Some(fp) = board.footprints.get(&pl.footprint) else {
             continue;
         };
@@ -219,8 +225,9 @@ fn emit_paste_layer(
                 b.flash_shape(&shape, pad_anchor_world(pad, pl));
             }
         }
+        emit_fp_graphics(&mut b, fp, pl, paste_name);
     }
-    emit_board_and_fp_graphics(&mut b, board, paste_name);
+    emit_board_graphics(&mut b, board, paste_name);
     b.write_file(out_path)
 }
 
@@ -291,7 +298,7 @@ fn emit_bom_csv(board: &BoardIr, path: &Path) -> Result<(), String> {
     }
     let mut groups: BTreeMap<BomKey, Vec<String>> = BTreeMap::new();
     for pl in &board.placements {
-        if pl.dnp {
+        if pl.dnp || pl.exclude_from_bom {
             continue;
         }
         let comment = if pl.value.trim().is_empty() {
@@ -325,8 +332,11 @@ fn emit_bom_csv(board: &BoardIr, path: &Path) -> Result<(), String> {
 }
 
 fn emit_cpl_csv(board: &BoardIr, path: &Path) -> Result<(), String> {
-    let mut active: Vec<&crate::ir::Placement> =
-        board.placements.iter().filter(|p| !p.dnp).collect();
+    let mut active: Vec<&crate::ir::Placement> = board
+        .placements
+        .iter()
+        .filter(|p| !p.dnp && !p.exclude_from_pos)
+        .collect();
     active.sort_by(|a, b| a.refdes.cmp(&b.refdes));
     let mut out = String::from("Designator,Mid X,Mid Y,Layer,Rotation\n");
     for pl in active {

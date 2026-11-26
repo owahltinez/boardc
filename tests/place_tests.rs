@@ -60,6 +60,8 @@ fn cap_placement(
         mpn: None,
         lcsc: None,
         dnp: false,
+        exclude_from_bom: false,
+        exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
     }
 }
@@ -110,6 +112,8 @@ fn overlapping_decoupling_caps_legalized_with_cap_proximity_and_zero_overlaps() 
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             // All three caps initially overlap each other (and C1/C2 sit on top of U1 / far away).
@@ -239,6 +243,8 @@ fn movable_cap_pushed_out_of_bga_shadow_and_keepout() {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             // Seeded directly inside U1's opposite-side BGA shadow on Bottom.
@@ -352,6 +358,8 @@ fn power_via_solver_thermal_array_and_plane_drops_clean_drc_and_no_chokes() {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             cap_placement("C1", (12.0, 14.0), 0.0, Side::Top, "VDD", "GND"),
@@ -509,6 +517,8 @@ fn power_via_solver_does_not_seal_adjacent_bga_pads_and_cli_place_works() {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             cap_placement("C1", (15.0, 10.0), 0.0, Side::Top, "VDD", "GND"),

@@ -66,6 +66,8 @@ fn place_2pin(
         mpn: None,
         lcsc: None,
         dnp: false,
+        exclude_from_bom: false,
+        exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
     }
 }
@@ -117,6 +119,8 @@ fn build_2layer_board() -> BoardIr {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             place_2pin("R1", "R_0603", (23.0, 14.0), 0.0, Side::Top, "SIG_A", "VCC"),
@@ -530,6 +534,8 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             });
         }
@@ -546,6 +552,8 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
         mpn: None,
         lcsc: None,
         dnp: false,
+        exclude_from_bom: false,
+        exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
     });
 
@@ -582,6 +590,8 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
         mpn: None,
         lcsc: None,
         dnp: false,
+        exclude_from_bom: false,
+        exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
     });
     placements.push(Placement {
@@ -596,6 +606,8 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
         mpn: None,
         lcsc: None,
         dnp: false,
+        exclude_from_bom: false,
+        exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
     });
 
@@ -742,6 +754,8 @@ fn preflight_catches_edge_keepout_blocked_net_and_fixed_violation() {
         mpn: None,
         lcsc: None,
         dnp: false,
+        exclude_from_bom: false,
+        exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
     };
 

@@ -67,6 +67,8 @@ fn pad_place(refdes: &str, fp: &str, x_mm: f64, y_mm: f64, net: &str) -> Placeme
         mpn: None,
         lcsc: None,
         dnp: false,
+        exclude_from_bom: false,
+        exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
     }
 }
@@ -665,6 +667,8 @@ fn cli_zones_writes_filled_board_and_report_json() {
             mpn: None,
             lcsc: None,
             dnp: false,
+            exclude_from_bom: false,
+            exclude_from_pos: false,
             cpl_rotation_offset_deg: 0.0,
         }],
         keepouts: Vec::new(),

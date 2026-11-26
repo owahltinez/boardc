@@ -107,6 +107,8 @@ fn make_4layer_board() -> BoardIr {
                 mpn: Some("STM32TEST".into()),
                 lcsc: Some("C12345".into()),
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             Placement {
@@ -121,6 +123,8 @@ fn make_4layer_board() -> BoardIr {
                 mpn: Some("CAP100N".into()),
                 lcsc: Some("C1525".into()),
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             Placement {
@@ -135,6 +139,8 @@ fn make_4layer_board() -> BoardIr {
                 mpn: Some("CAP100N".into()),
                 lcsc: Some("C1525".into()),
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 90.0,
             },
             Placement {
@@ -149,6 +155,8 @@ fn make_4layer_board() -> BoardIr {
                 mpn: Some("RES0".into()),
                 lcsc: Some("C9999".into()),
                 dnp: true,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             Placement {
@@ -163,6 +171,8 @@ fn make_4layer_board() -> BoardIr {
                 mpn: None,
                 lcsc: None,
                 dnp: false,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
             Placement {
@@ -177,6 +187,8 @@ fn make_4layer_board() -> BoardIr {
                 mpn: None,
                 lcsc: None,
                 dnp: true,
+                exclude_from_bom: false,
+                exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
             },
         ],
@@ -659,6 +671,269 @@ fn regression_cw_poly_mask_expands_and_blind_via_splits_drill_file() {
     assert!(
         fab_rep.passed,
         "blind via fab verification failed: {fab_rep:?}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+fn gerber_op_coords_mm(path: &std::path::Path) -> Vec<(f64, f64)> {
+    use gerber_types::{Command, DCode, FunctionCode, Operation};
+    let file = fs::File::open(path).unwrap();
+    let doc = gerber_parser::parse(BufReader::new(file)).unwrap();
+    assert!(doc.errors().is_empty(), "{:?}", doc.errors());
+    let mut cur = (0.0_f64, 0.0_f64);
+    let mut pts = Vec::new();
+    for cmd in doc.commands() {
+        if let Command::FunctionCode(FunctionCode::DCode(DCode::Operation(op))) = cmd {
+            let coords = match op {
+                Operation::Move(c) | Operation::Interpolate(c, _) | Operation::Flash(c) => c,
+            };
+            if let Some(c) = coords {
+                if let Some(x) = c.x {
+                    cur.0 = f64::from(x);
+                }
+                if let Some(y) = c.y {
+                    cur.1 = f64::from(y);
+                }
+            }
+            if !matches!(op, Operation::Move(_)) {
+                pts.push(cur);
+            }
+        }
+    }
+    pts
+}
+
+#[test]
+fn dnp_skips_paste_and_exclude_flags_filter_bom_cpl_without_hiding_silk_or_svg() {
+    let tmp = fresh_tmp_dir("dnp_paste_virtual");
+    let fab_dir = tmp.join("fab");
+
+    let toml_spec = r#"
+name = "dnp_virtual"
+size_nm = [40000000, 30000000]
+
+[footprints.R_0402]
+kind = "chip2_pin"
+package = "0402"
+
+[footprints.DNP_WITH_PASTE_GFX]
+kind = "custom"
+[[footprints.DNP_WITH_PASTE_GFX.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "rect", width = 1000000, height = 1000000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu", "F.Mask", "F.Paste"]
+[[footprints.DNP_WITH_PASTE_GFX.graphics]]
+kind = "rect"
+layer = "F.Paste"
+min = { x = -400000, y = -400000 }
+max = { x = 400000, y = 400000 }
+width = 0
+fill = true
+
+[footprints.PASTE_GFX_ONLY]
+kind = "custom"
+[[footprints.PASTE_GFX_ONLY.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "rect", width = 1000000, height = 1000000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu", "F.Mask"]
+[[footprints.PASTE_GFX_ONLY.graphics]]
+kind = "rect"
+layer = "F.Paste"
+min = { x = -350000, y = -350000 }
+max = { x = 350000, y = 350000 }
+width = 0
+fill = true
+
+[footprints.TP_PAD]
+kind = "custom"
+[[footprints.TP_PAD.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 1000000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu", "F.Mask", "F.Paste"]
+
+[[placements]]
+refdes = "R1"
+footprint = "R_0402"
+value = "10k"
+pos = { x = 10000000, y = 8000000 }
+side = "top"
+
+[[placements]]
+refdes = "R_DNP_TOP"
+footprint = "DNP_WITH_PASTE_GFX"
+value = "0R"
+pos = { x = 10000000, y = 20000000 }
+side = "top"
+dnp = true
+
+[[placements]]
+refdes = "R_DNP_BOT"
+footprint = "R_0402"
+value = "0R"
+pos = { x = 20000000, y = 8000000 }
+side = "bottom"
+dnp = true
+
+[[placements]]
+refdes = "U_PASTE_GFX"
+footprint = "PASTE_GFX_ONLY"
+value = "STENCIL"
+pos = { x = 20000000, y = 14000000 }
+side = "top"
+
+[[placements]]
+refdes = "TP1"
+footprint = "TP_PAD"
+value = "TEST"
+pos = { x = 30000000, y = 20000000 }
+side = "top"
+exclude_from_bom = true
+exclude_from_pos = true
+
+[[placements]]
+refdes = "J_NO_BOM"
+footprint = "R_0402"
+value = "1k"
+pos = { x = 20000000, y = 20000000 }
+side = "top"
+exclude_from_bom = true
+
+[[placements]]
+refdes = "J_NO_POS"
+footprint = "R_0402"
+value = "2k"
+pos = { x = 30000000, y = 8000000 }
+side = "top"
+exclude_from_pos = true
+"#;
+
+    let spec: BoardSpec = toml::from_str(toml_spec).unwrap();
+    let board = BoardIr::from_spec(&spec).unwrap();
+    let manifest = export_fab(&board, &fab_dir, &FabOptions::default()).unwrap();
+
+    // F_Paste must include R1 and TP1, and have zero pads or paste graphics around R_DNP_TOP (10, 20).
+    let f_paste_pts = gerber_op_coords_mm(&fab_dir.join("F_Paste.gtp"));
+    let near = |pts: &[(f64, f64)], cx: f64, cy: f64, r: f64| {
+        pts.iter()
+            .any(|&(x, y)| (x - cx).abs() <= r && (y - cy).abs() <= r)
+    };
+    assert!(
+        near(&f_paste_pts, 10.0, 8.0, 2.0),
+        "R1 missing from F_Paste"
+    );
+    assert!(
+        near(&f_paste_pts, 20.0, 14.0, 1.0),
+        "populated footprint F.Paste graphic (no paste pad) missing from F_Paste"
+    );
+    assert!(
+        near(&f_paste_pts, 30.0, 20.0, 2.0),
+        "TP1 missing from F_Paste"
+    );
+    assert!(
+        !near(&f_paste_pts, 10.0, 20.0, 2.5),
+        "DNP part R_DNP_TOP must not emit paste pads or paste graphics: {f_paste_pts:?}"
+    );
+
+    // B_Paste must be completely empty because the only bottom part is R_DNP_BOT.
+    let b_paste_pts = gerber_op_coords_mm(&fab_dir.join("B_Paste.gbp"));
+    assert!(
+        b_paste_pts.is_empty(),
+        "DNP bottom part must not emit B_Paste: {b_paste_pts:?}"
+    );
+
+    // Copper and solder mask openings remain on DNP pads for optional hand population.
+    assert!(near(
+        &gerber_op_coords_mm(&fab_dir.join("F_Cu.gtl")),
+        10.0,
+        20.0,
+        2.0
+    ));
+    assert!(near(
+        &gerber_op_coords_mm(&fab_dir.join("F_Mask.gts")),
+        10.0,
+        20.0,
+        2.0
+    ));
+    assert!(near(
+        &gerber_op_coords_mm(&fab_dir.join("B_Cu.gbl")),
+        20.0,
+        8.0,
+        2.0
+    ));
+    assert!(near(
+        &gerber_op_coords_mm(&fab_dir.join("B_Mask.gbs")),
+        20.0,
+        8.0,
+        2.0
+    ));
+
+    // BOM omits dnp and exclude_from_bom, keeps R1 and J_NO_POS.
+    let bom = fs::read_to_string(&manifest.bom_csv).unwrap();
+    assert!(bom.contains("R1"));
+    assert!(bom.contains("J_NO_POS"));
+    assert!(!bom.contains("R_DNP_TOP"));
+    assert!(!bom.contains("R_DNP_BOT"));
+    assert!(!bom.contains("TP1"));
+    assert!(!bom.contains("J_NO_BOM"));
+
+    // CPL omits dnp and exclude_from_pos, keeps R1 and J_NO_BOM.
+    let cpl = fs::read_to_string(&manifest.cpl_csv).unwrap();
+    assert!(cpl.contains("R1,"));
+    assert!(cpl.contains("J_NO_BOM,"));
+    assert!(!cpl.contains("R_DNP_TOP"));
+    assert!(!cpl.contains("R_DNP_BOT"));
+    assert!(!cpl.contains("TP1"));
+    assert!(!cpl.contains("J_NO_POS"));
+
+    // Silkscreen and SVG keep TP1 refdes (non-DNP virtual footprint) while omitting R_DNP_TOP refdes.
+    let f_silk_pts = gerber_op_coords_mm(&fab_dir.join("F_Silkscreen.gto"));
+    assert!(
+        near(&f_silk_pts, 30.0, 20.5, 2.5),
+        "virtual footprint TP1 should keep silkscreen refdes"
+    );
+    assert!(
+        !near(&f_silk_pts, 10.0, 20.5, 2.5),
+        "DNP part R_DNP_TOP should omit silkscreen refdes"
+    );
+
+    let top_svg = render_board_svg(&board, None, &SvgOptions::default());
+    let silk_start = top_svg.find("id=\"silkscreen\"").unwrap();
+    let silk_end = top_svg[silk_start..].find("</g>").unwrap() + silk_start;
+    let svg_attr = |line: &str, name: &str| {
+        line.split_once(name)?
+            .1
+            .split('"')
+            .next()?
+            .parse::<f64>()
+            .ok()
+    };
+    // Top SVG uses SVG Y = -board_y; negate y1 back to board coordinates to reuse `near`.
+    let svg_silk_pts: Vec<(f64, f64)> = top_svg[silk_start..silk_end]
+        .lines()
+        .filter_map(|line| Some((svg_attr(line, "x1=\"")?, -svg_attr(line, "y1=\"")?)))
+        .collect();
+    assert!(
+        near(&svg_silk_pts, 30.0, 20.5, 2.5),
+        "TP1 should appear on SVG silkscreen"
+    );
+    assert!(
+        !near(&svg_silk_pts, 10.0, 20.5, 2.5),
+        "R_DNP_TOP should be hidden on SVG silkscreen"
+    );
+
+    // Independent verifier must pass cleanly (including empty B_Paste.gbp).
+    let fab_rep = boardc::verify::verify_fab_outputs(&board, &fab_dir).unwrap();
+    assert!(
+        fab_rep.passed,
+        "fab verification failed: {:?}",
+        fab_rep.errors
     );
 
     let _ = fs::remove_dir_all(&tmp);

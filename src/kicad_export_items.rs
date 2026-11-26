@@ -407,7 +407,17 @@ pub(crate) fn write_footprint(
         esc(&pl.value),
         uuids.next()
     );
-    let _ = writeln!(out, "\t\t(attr {attr})");
+    let _ = write!(out, "\t\t(attr {attr}");
+    if pl.exclude_from_pos {
+        out.push_str(" exclude_from_pos_files");
+    }
+    if pl.exclude_from_bom {
+        out.push_str(" exclude_from_bom");
+    }
+    if pl.dnp {
+        out.push_str(" dnp");
+    }
+    out.push_str(")\n");
 
     for g in &fp.graphics {
         let layer = g.layer();

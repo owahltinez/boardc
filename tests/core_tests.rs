@@ -105,6 +105,8 @@ fn pad_world_shape_and_courtyard_transform() {
         mpn: None,
         lcsc: None,
         dnp: false,
+        exclude_from_bom: false,
+        exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
     };
     let p1 = pad_to_world_shape(&fp.pads[0], &pl, 8);
@@ -261,6 +263,8 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             mpn: None,
             lcsc: None,
             dnp: false,
+            exclude_from_bom: false,
+            exclude_from_pos: false,
             cpl_rotation_offset_deg: 0.0,
         }],
         keepouts: vec![],

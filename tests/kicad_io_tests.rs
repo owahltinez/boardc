@@ -276,3 +276,82 @@ fn parse_kicad_pcb_preserves_multi_flag_keepout_and_custom_pad_anchor() {
         other => panic!("expected custom Poly pad, got {other:?}"),
     }
 }
+
+#[test]
+fn parse_and_export_kicad_pcb_roundtrip_dnp_and_virtual_attrs() {
+    let pcb = r#"(kicad_pcb (version 20241229)
+        (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+        (gr_rect (start 0 0) (end 30 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (footprint "Lib:R_0402" (layer "F.Cu") (at 5 5)
+            (property "Reference" "R1")
+            (property "Value" "10k")
+            (attr smd)
+            (pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask" "F.Paste"))
+        )
+        (footprint "Lib:R_0402" (layer "F.Cu") (at 10 5)
+            (property "Reference" "R_DNP")
+            (property "Value" "0R")
+            (attr smd dnp)
+            (pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask" "F.Paste"))
+        )
+        (footprint "Lib:TestPad" (layer "F.Cu") (at 15 5)
+            (property "Reference" "TP1")
+            (property "Value" "TP")
+            (attr smd exclude_from_pos_files exclude_from_bom)
+            (pad "1" smd circle (at 0 0) (size 0.8 0.8) (layers "F.Cu" "F.Mask"))
+        )
+        (footprint "Lib:HDR" (layer "F.Cu") (at 20 5)
+            (property "Reference" "J1")
+            (property "Value" "HDR")
+            (attr through_hole exclude_from_bom)
+            (pad "1" thru_hole circle (at 0 0) (size 1.4 1.4) (drill 0.8) (layers "*.Cu" "*.Mask"))
+        )
+        (footprint "Lib:Hole" (layer "F.Cu") (at 25 5)
+            (property "Reference" "H1")
+            (property "Value" "M3")
+            (attr board_only exclude_from_pos_files)
+            (pad "1" np_thru_hole circle (at 0 0) (size 3.0 3.0) (drill 3.0) (layers "*.Cu" "*.Mask"))
+        )
+        (footprint "Lib:Legacy" (layer "F.Cu") (at 5 15)
+            (property "Reference" "V1")
+            (property "Value" "VIRT")
+            (attr virtual)
+            (pad "1" smd circle (at 0 0) (size 0.8 0.8) (layers "F.Cu" "F.Mask"))
+        )
+        (footprint "Lib:R_0402" (layer "F.Cu") (at 10 15)
+            (property "Reference" "R_ALL")
+            (property "Value" "0R")
+            (attr smd dnp exclude_from_bom exclude_from_pos_files)
+            (pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask" "F.Paste"))
+        )
+    )"#;
+
+    let ir = parse_kicad_pcb(pcb, None).expect("parse_kicad_pcb");
+    let flags = |board: &boardc::ir::BoardIr, refdes: &str| {
+        let p = board
+            .placements
+            .iter()
+            .find(|p| p.refdes == refdes)
+            .unwrap();
+        (p.dnp, p.exclude_from_bom, p.exclude_from_pos)
+    };
+    assert_eq!(flags(&ir, "R1"), (false, false, false));
+    assert_eq!(flags(&ir, "R_DNP"), (true, false, false));
+    assert_eq!(flags(&ir, "TP1"), (false, true, true));
+    assert_eq!(flags(&ir, "J1"), (false, true, false));
+    assert_eq!(flags(&ir, "H1"), (false, false, true));
+    assert_eq!(flags(&ir, "V1"), (false, true, true));
+    assert_eq!(flags(&ir, "R_ALL"), (true, true, true));
+
+    let exported = boardc::kicad_export::render_kicad_pcb(&ir);
+    assert!(exported.contains("(attr smd dnp)"));
+    assert!(exported.contains("(attr smd exclude_from_pos_files exclude_from_bom)"));
+    assert!(exported.contains("(attr through_hole exclude_from_bom)"));
+    assert!(exported.contains("(attr board_only exclude_from_pos_files)"));
+    assert!(exported.contains("(attr smd exclude_from_pos_files exclude_from_bom dnp)"));
+
+    let reimported = parse_kicad_pcb(&exported, None).expect("reimport exported pcb");
+    for refdes in ["R1", "R_DNP", "TP1", "J1", "H1", "V1", "R_ALL"] {
+        assert_eq!(flags(&reimported, refdes), flags(&ir, refdes), "{refdes}");
+    }
+}

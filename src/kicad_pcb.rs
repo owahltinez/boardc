@@ -450,6 +450,24 @@ fn parse_placed_footprint(
         }
     };
 
+    let mut dnp = false;
+    let mut exclude_from_bom = false;
+    let mut exclude_from_pos = false;
+    for attr in node.children_with_tag("attr") {
+        for tok in attr.as_list().into_iter().flatten().skip(1) {
+            match tok.as_atom() {
+                Some("dnp") => dnp = true,
+                Some("exclude_from_bom") => exclude_from_bom = true,
+                Some("exclude_from_pos_files") => exclude_from_pos = true,
+                Some("virtual") => {
+                    exclude_from_bom = true;
+                    exclude_from_pos = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
     let mut pin_nets = BTreeMap::new();
     for (pin, net) in pad_nets {
         pin_nets.insert(pin, net);
@@ -465,7 +483,9 @@ fn parse_placed_footprint(
         pin_nets,
         mpn: None,
         lcsc: None,
-        dnp: false,
+        dnp,
+        exclude_from_bom,
+        exclude_from_pos,
         cpl_rotation_offset_deg: 0.0,
     });
     Ok(())
