@@ -134,21 +134,20 @@ pub(crate) fn check_cap_proximity(board: &BoardIr, pads: &[PadItem], out: &mut V
     }
 }
 
-pub(crate) fn check_constraints(board: &BoardIr, pads: &[PadItem], out: &mut Vec<Violation>) {
+pub(crate) fn collect_net_lengths(board: &BoardIr) -> BTreeMap<&str, f64> {
     let mut net_lengths: BTreeMap<&str, f64> = BTreeMap::new();
-    let mut net_pos: BTreeMap<&str, Pt> = BTreeMap::new();
     for t in &board.tracks {
         *net_lengths.entry(t.net.as_str()).or_insert(0.0) += t.a.dist(t.b);
-        net_pos
-            .entry(t.net.as_str())
-            .or_insert_with(|| t.a.midpoint(t.b));
     }
-    for pad in pads {
-        if !pad.net.is_empty() {
-            net_pos.entry(pad.net.as_str()).or_insert(pad.center);
-        }
-    }
+    net_lengths
+}
 
+pub(crate) fn check_length_constraints(
+    board: &BoardIr,
+    net_lengths: &BTreeMap<&str, f64>,
+    net_pos: &BTreeMap<&str, Pt>,
+    out: &mut Vec<Violation>,
+) {
     for rule in &board.constraints.max_lengths {
         for net in &rule.nets {
             let len = net_lengths.get(net.as_str()).copied().unwrap_or(0.0);
@@ -230,6 +229,31 @@ pub(crate) fn check_constraints(board: &BoardIr, pads: &[PadItem], out: &mut Vec
             }
         }
     }
+}
+
+pub(crate) fn count_length_violations(board: &BoardIr) -> usize {
+    let net_lengths = collect_net_lengths(board);
+    let net_pos = BTreeMap::new();
+    let mut out = Vec::new();
+    check_length_constraints(board, &net_lengths, &net_pos, &mut out);
+    out.len()
+}
+
+pub(crate) fn check_constraints(board: &BoardIr, pads: &[PadItem], out: &mut Vec<Violation>) {
+    let net_lengths = collect_net_lengths(board);
+    let mut net_pos: BTreeMap<&str, Pt> = BTreeMap::new();
+    for t in &board.tracks {
+        net_pos
+            .entry(t.net.as_str())
+            .or_insert_with(|| t.a.midpoint(t.b));
+    }
+    for pad in pads {
+        if !pad.net.is_empty() {
+            net_pos.entry(pad.net.as_str()).or_insert(pad.center);
+        }
+    }
+
+    check_length_constraints(board, &net_lengths, &net_pos, out);
 
     check_cap_proximity(board, pads, out);
 

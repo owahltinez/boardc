@@ -28,7 +28,7 @@ For coding agents, run `boardc skill install` (or read [SKILL.md](SKILL.md) dire
 - **Placement & Power Vias** (`src/place.rs`): Deterministic placement legalizer (courtyards, keepouts, edge clearance, BGA shadow rules, decoupling-capacitor proximity) and power-via / thermal-array solver landing into inner planes without sealing BGA channels or pinching pours.
 - **Zone Filler & Choke Analysis** (`src/zones.rs`): Priority-ordered Clipper2 copper pours with edge/keepout/antipad clearances, thermal reliefs, dead-island and sliver pruning, plus copper-graph split-pour and narrow-neck choke detection.
 - **Continuous DRC & Hotspot Clusterer** (`src/drc.rs`): Continuous `Nm` DRC across clearances, hole-to-hole, drill-to-copper, edge clearance, annular ring, keepouts, courtyards, connectivity across tracks/vias/filled pours, and length/match/proximity constraints, grouped into spatial and shared-object hotspots (plus `kicad-cli` JSON hotspot clustering).
-- **In-Memory Routing & Preflight** (`src/preflight.rs`, `src/route.rs`): Sub-second pre-routing feasibility gate and direct in-memory `BoardIr -> viahop::Board` bridge with incremental `--reroute-nets` support.
+- **In-Memory Routing, Length Tuning & Preflight** (`src/preflight.rs`, `src/route.rs`, `src/tune.rs`): Sub-second pre-routing feasibility gate, direct in-memory `BoardIr -> viahop::Board` bridge with incremental `--reroute-nets` support, and automatic DRC-clean trombone meandering for `constraints.match_groups` (`boardc tune` or `--no-tune` on `route`/`build`).
 - **Staged Compiler Pipeline** (`src/pipeline.rs`): Content-hashed stage caching in `.boardc-cache/` (`place -> power-via -> preflight -> route -> zones -> drc -> fab/svg`).
 - **Manufacturing & Visual Outputs** (`src/fab.rs`, `src/svg.rs`): Native RS-274X/Gerber X2 copper, mask, paste, silkscreen (clipped to solder mask), and `Edge.Cuts`, metric Excellon PTH/NPTH and blind/buried span drills, JLCPCB BOM/CPL CSVs, and zero-dependency 2D SVGs with optional DRC hotspot overlays.
 
@@ -45,7 +45,8 @@ For coding agents, run `boardc skill install` (or read [SKILL.md](SKILL.md) dire
 boardc build <INPUT> [--out-dir <DIR>] [--cache-dir .boardc-cache] [--no-cache] [--fail-on-preflight] [--reroute-nets NET,...] [--json]
 boardc preflight <INPUT> [--ignore NET,...] [--json]
 boardc place <INPUT> [-o <OUT_BOARD_JSON>] [--power-vias] [--json]
-boardc route <INPUT> [-o <OUT_BOARD_JSON>] [--reroute-nets NET,...] [--via-at-smd] [--json]
+boardc route <INPUT> [-o <OUT_BOARD_JSON>] [--reroute-nets NET,...] [--via-at-smd] [--no-tune] [--json]
+boardc tune <INPUT> [-o <OUT_BOARD_JSON>] [--only NET,...] [--ignore NET,...] [--json]
 boardc zones <INPUT> [-o <OUT_BOARD_JSON>] [--report <REPORT_JSON>]
 boardc erc <INPUT> [--json]
 boardc drc <INPUT> [--kicad-drc <KICAD_DRC_JSON>] [--json]
