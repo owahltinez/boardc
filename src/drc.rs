@@ -15,6 +15,7 @@ use crate::drc_scene::{
     collect_drills, collect_keepouts, collect_pads, collect_pours, collect_tracks, collect_vias,
     compute_max_clearance,
 };
+use crate::drc_silk::check_silkscreen;
 use crate::ir::{BoardIr, Nm, Pt};
 
 pub const DEFAULT_CLUSTER_RADIUS_NM: Nm = 2_000_000;
@@ -29,6 +30,8 @@ pub enum ViolationKind {
     MinAnnularRing,
     MinTraceWidth,
     EdgeClearance,
+    SilkOverCopper,
+    SilkEdgeClearance,
     Keepout,
     ViaAtSmd,
     CourtyardOverlap,
@@ -128,6 +131,7 @@ pub fn check_board_drc(board: &BoardIr) -> DrcReport {
             check_keepouts(board, &tracks, &pads, &vias, &pours, &keepouts, &mut v);
             check_courtyards_and_component_edges(board, &keepouts, &mut v);
             check_constraints(board, &pads, &mut v);
+            check_silkscreen(board, &cu_layers, &pads, &vias, &mut v);
             v
         });
         let h_conn = s.spawn(|| {

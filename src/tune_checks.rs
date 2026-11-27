@@ -41,7 +41,7 @@ fn build_mask_layer_index(
         return None;
     }
     let items: Vec<(String, ResolvedShape, BBoxNm)> =
-        collect_mask_openings(board, cu_layers, pads, vias, side)
+        collect_mask_openings(board, cu_layers, pads, vias, side, false)
             .into_iter()
             .map(|op| (op.net.to_string(), op.shape, op.bbox))
             .collect();
