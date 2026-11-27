@@ -82,7 +82,7 @@ fn push_group<'a>(
 
 fn is_unconnected_net(net: &str) -> bool {
     const PREFIX: &[u8] = b"unconnected-(";
-    let bytes = net.trim().as_bytes();
+    let bytes = net.as_bytes();
     bytes.len() >= PREFIX.len() && bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
 }
 
@@ -99,21 +99,15 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
         if net_name.trim().is_empty() {
             continue;
         }
-        let unconn = is_unconnected_net(net_name);
         for (refdes, pin) in &nd.pins {
-            let key = (refdes.as_str(), pin.as_str());
-            if unconn {
-                net_def_pins.entry(key).or_insert(net_name.as_str());
-            } else {
-                net_def_pins
-                    .entry(key)
-                    .and_modify(|cur| {
-                        if is_unconnected_net(cur) {
-                            *cur = net_name.as_str();
-                        }
-                    })
-                    .or_insert(net_name.as_str());
-            }
+            net_def_pins
+                .entry((refdes.as_str(), pin.as_str()))
+                .and_modify(|cur| {
+                    if is_unconnected_net(cur) {
+                        *cur = net_name.as_str();
+                    }
+                })
+                .or_insert(net_name.as_str());
         }
     }
 
@@ -123,7 +117,7 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
         .map(|p| p.net.as_str())
         .chain(board.filled_pours.iter().map(|p| p.net.as_str()))
         .chain(board.tracks.iter().map(|t| t.net.as_str()))
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .collect();
 
     for pl in &board.placements {
@@ -142,19 +136,12 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
                 continue;
             }
             let pin_name = pad.name.as_str();
-            let raw_net = pl
+            let net = pl
                 .pin_nets
                 .get(pin_name)
-                .map(|s| s.trim())
-                .or_else(|| {
-                    net_def_pins
-                        .get(&(pl.refdes.as_str(), pin_name))
-                        .copied()
-                        .map(str::trim)
-                })
-                .filter(|s| !s.is_empty());
-            let intentional_nc = raw_net.is_some_and(is_unconnected_net);
-            let net = raw_net.filter(|_| !intentional_nc);
+                .map(String::as_str)
+                .or_else(|| net_def_pins.get(&(pl.refdes.as_str(), pin_name)).copied())
+                .filter(|s| !s.trim().is_empty());
 
             // Count DNP pads physically (avoiding false single-pin nets) but skip them in electrical checks.
             if let Some(net_name) = net {
@@ -172,25 +159,11 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
             if pin_type.is_some() {
                 typed_pins += 1;
             }
-            // KiCad unconnected-(...) nets mark intentional no-connects regardless of PinType.
-            if intentional_nc {
-                continue;
-            }
 
             match net {
                 Some(net_name) => {
                     let pos_nm = transform_pad_local_pt(Pt::new(0, 0), pad, pl);
                     let label = format!("{refdes}.{pin_name}");
-                    if pin_type == Some(PinType::Nc) {
-                        violations.push(ErcViolation {
-                            kind: ErcViolationKind::ConnectedNcPin,
-                            severity: Severity::Error,
-                            net: net_name.to_string(),
-                            pins: vec![label.clone()],
-                            pos_nm,
-                            message: format!("nc pin {label} is connected to net '{net_name}'"),
-                        });
-                    }
                     net_pins.entry(net_name).or_default().push(LogicalPin {
                         label,
                         pin_type,
@@ -218,8 +191,19 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
         }
     }
 
-    let checked_nets = net_pins.len();
+    let mut checked_nets = 0usize;
     for (net_name, pins) in &net_pins {
+        let power_driven = board.nets.get(*net_name).is_some_and(|nd| nd.power_driven);
+        // Only treat single-pin, copper-free, non-power_driven unconnected-(...) nets as intentional nc.
+        if is_unconnected_net(net_name)
+            && physical_net_pins.get(net_name).copied().unwrap_or(0) <= 1
+            && !copper_nets.contains(net_name)
+            && !power_driven
+        {
+            continue;
+        }
+        checked_nets += 1;
+
         if pins.len() == 1
             && physical_net_pins.get(net_name).copied().unwrap_or(0) == 1
             && !copper_nets.contains(net_name)
@@ -242,7 +226,7 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
         let mut open_collectors = Vec::new();
         let mut ins = Vec::new();
         let mut power_ins = Vec::new();
-        let mut has_signal_driver = false;
+        let mut has_signal_driver = power_driven;
         let mut has_untyped = false;
 
         for p in pins {
@@ -268,13 +252,19 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
                 }
                 Some(PinType::In) => ins.push(p),
                 Some(PinType::PowerIn) => power_ins.push(p),
-                Some(PinType::Nc) => {}
+                Some(PinType::Nc) => {
+                    violations.push(ErcViolation {
+                        kind: ErcViolationKind::ConnectedNcPin,
+                        severity: Severity::Error,
+                        net: (*net_name).to_string(),
+                        pins: vec![p.label.clone()],
+                        pos_nm: p.pos_nm,
+                        message: format!("nc pin {} is connected to net '{net_name}'", p.label),
+                    });
+                }
                 None => has_untyped = true,
             }
         }
-
-        let power_driven = board.nets.get(*net_name).is_some_and(|nd| nd.power_driven);
-        has_signal_driver |= power_driven;
 
         if power_outs.len() >= 2 {
             push_group(
@@ -287,9 +277,18 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
             );
         }
 
-        if !power_outs.is_empty()
+        if (!power_outs.is_empty() || power_driven)
             && (!outs.is_empty() || !tris.is_empty() || !open_collectors.is_empty())
         {
+            let prefix = if power_outs.is_empty() {
+                format_args!(
+                    "driven output/tri-state/open-collector conflicts with power_driven rail '{net_name}'"
+                )
+            } else {
+                format_args!(
+                    "driven output/tri-state/open-collector conflicts with power_out on net '{net_name}'"
+                )
+            };
             push_group(
                 &mut violations,
                 ErcViolationKind::OutputConflict,
@@ -301,9 +300,7 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
                     .chain(&tris)
                     .chain(&open_collectors)
                     .copied(),
-                format_args!(
-                    "driven output/tri-state/open-collector conflicts with power_out on net '{net_name}'"
-                ),
+                prefix,
             );
         } else {
             // Push-pull out conflicts with open_collector (crowbar short when out drives high and open_collector sinks low).

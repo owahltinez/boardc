@@ -722,16 +722,13 @@ pub(crate) fn default_net_class() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NetDef {
-    #[serde(default)]
     pub name: String,
-    #[serde(default = "default_net_class")]
     pub class: String,
-    #[serde(default)]
     pub pins: Vec<(String, String)>,
-    #[serde(default)]
     pub ignore_route: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub power_driven: bool,
 }
 

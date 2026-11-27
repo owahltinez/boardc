@@ -180,9 +180,7 @@ fn continuous_nm_clearance_zero_slack_and_net_class() {
         NetDef {
             name: "A".into(),
             class: "HV".into(),
-            pins: Vec::new(),
-            ignore_route: false,
-            power_driven: false,
+            ..Default::default()
         },
     );
     let rep_hv = check_board_drc(&board);

@@ -512,10 +512,8 @@ fn footprint_lib_errors_precedence_and_path_traversal_guards() {
             "SPEC_NET".into(),
             NetDef {
                 name: "SPEC_NET".into(),
-                class: "Default".into(),
                 pins: vec![("R1".into(), "1".into())],
-                ignore_route: false,
-                power_driven: false,
+                ..Default::default()
             },
         )]),
         placements: vec![Placement {
@@ -985,10 +983,8 @@ fn roast_regressions_sexp_escapes_lib_isolation_net_sync_and_parity() {
             "OLD_SPEC_NET".into(),
             NetDef {
                 name: "OLD_SPEC_NET".into(),
-                class: "Default".into(),
                 pins: vec![("U1".into(), "1".into())],
-                ignore_route: false,
-                power_driven: false,
+                ..Default::default()
             },
         )]),
         placements: vec![

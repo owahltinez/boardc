@@ -189,7 +189,25 @@ pub(crate) fn validate_pin_types_for_footprint(
     Ok(())
 }
 
+pub(crate) fn validate_net_names(nets: &BTreeMap<String, NetDef>) -> Result<(), String> {
+    for (key, nd) in nets {
+        if !nd.name.trim().is_empty() && nd.name != *key {
+            return Err(format!("net '{key}' has mismatched name '{}'", nd.name));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn backfill_net_names(nets: &mut BTreeMap<String, NetDef>) {
+    for (key, nd) in nets {
+        if nd.name.trim().is_empty() {
+            nd.name = key.clone();
+        }
+    }
+}
+
 pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
+    validate_net_names(&ir.nets).map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     for (name, fp) in &ir.footprints {
         validate_pin_types_for_footprint("footprint", name, fp, &fp.pin_types)
             .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
@@ -304,6 +322,7 @@ impl BoardIr {
                 return Err(format!("duplicate placement refdes '{}'", p.refdes));
             }
         }
+        validate_net_names(&spec.nets)?;
         let mut nets = spec.nets.clone();
 
         if let Some(ref nl) = netlist {
@@ -448,8 +467,9 @@ pub fn save_board_json(board: &BoardIr, path: &Path) -> Result<(), String> {
 pub fn load_board_json(path: &Path) -> Result<BoardIr, String> {
     let text = fs::read_to_string(path)
         .map_err(|e| format!("failed to read board IR '{}': {e}", path.display()))?;
-    let ir: BoardIr = serde_json::from_str(&text)
+    let mut ir: BoardIr = serde_json::from_str(&text)
         .map_err(|e| format!("failed to parse board IR '{}': {e}", path.display()))?;
     validate_board_ir_pins(&ir, path)?;
+    backfill_net_names(&mut ir.nets);
     Ok(ir)
 }
