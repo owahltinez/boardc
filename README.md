@@ -24,7 +24,7 @@ For coding agents, run `boardc skill install` (or read [SKILL.md](SKILL.md) dire
 ## Architecture
 
 - **Canonical Coordinates & Units**: Integer nanometers (`Nm = i64`, `1 mm = 1_000_000 nm`) in a right-handed 2D frame (`+X` right, `+Y` up, CCW rotation positive). Bottom-side placements flip across local `X` (`ly' = -ly`) before rotating CCW by `rot_deg` and remapping `Top <-> Bottom` layers. KiCad Y-down conversion is isolated strictly at the import (`src/kicad_io.rs`) and export (`src/kicad_export.rs`) file boundaries.
-- **Core IR & Parametric Footprints** (`src/ir.rs`, `src/spec.rs`, `src/footprints.rs`, `src/geom.rs`, `src/shapes.rs`, `src/poly_index.rs`): JSON/TOML `BoardSpec` and canonical `BoardIr`, IPC-7351 parametric footprints (`0201`/`0402`/`0603`/`0805`, `BGA`, `QFN`, `SOT23`, `PinHeader`), and exact continuous 2D shape distance primitives with flat-grid polygon indexing.
+- **Core IR & Parametric Footprints** (`src/ir.rs`, `src/spec.rs`, `src/footprints.rs`, `src/geom.rs`, `src/shapes.rs`, `src/poly_index.rs`): JSON/TOML `BoardSpec` and canonical `BoardIr`, IPC-7351 parametric footprints (`0201`/`0402`/`0603`/`0805`, `BGA`, `QFN`, `SOT23`, `PinHeader`), custom footprints with 3D `models`, `.kicad_mod` library overlays (`pin_types`/`courtyard`), and exact continuous 2D shape distance primitives with flat-grid polygon indexing.
 - **Placement & Power Vias** (`src/place.rs`): Deterministic placement legalizer (courtyards, keepouts, edge clearance, BGA shadow rules, decoupling-capacitor proximity) and power-via / thermal-array solver landing into inner planes without sealing BGA channels or pinching pours.
 - **Zone Filler & Choke Analysis** (`src/zones.rs`): Priority-ordered Clipper2 copper pours with edge/keepout/antipad clearances, thermal reliefs, dead-island and sliver pruning, plus copper-graph split-pour and narrow-neck choke detection.
 - **Continuous DRC & Hotspot Clusterer** (`src/drc.rs`): Continuous `Nm` DRC across clearances, hole-to-hole, drill-to-copper, edge clearance, annular ring, keepouts, courtyards, connectivity across tracks/vias/filled pours, and length/match/proximity constraints, grouped into spatial and shared-object hotspots (plus `kicad-cli` JSON hotspot clustering).
@@ -87,6 +87,7 @@ value = "100nF"
 pos = { x = 10000000, y = 10000000 }
 rot_deg = 90.0
 side = "top"
+# allow_edge_overhang = true # skip courtyard-to-edge DRC for edge-mating connectors (pads still checked)
 pin_nets = { "1" = "VCC", "2" = "GND" }
 
 [[pours]]

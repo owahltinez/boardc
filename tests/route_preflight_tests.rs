@@ -522,6 +522,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -760,6 +761,7 @@ fn preflight_catches_edge_keepout_blocked_net_and_fixed_violation() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -873,6 +875,7 @@ fn regression_ignore_and_reroute_preserve_unlocked_copper_and_copper_keepout_all
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );

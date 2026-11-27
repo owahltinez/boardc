@@ -45,6 +45,7 @@ fn single_pad_fp(
         courtyard: Vec::new(),
         graphics: Vec::new(),
         keepouts: Vec::new(),
+        models: Vec::new(),
         pin_types: Default::default(),
     }
 }
@@ -942,6 +943,7 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
             courtyard: rect_pts(-1.0, -1.0, 1.0, 1.0),
             graphics: vec![],
             keepouts: vec![],
+            models: vec![],
             pin_types: Default::default(),
         },
     );
@@ -1082,6 +1084,7 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
             courtyard: rect_pts(-0.5, -0.5, 0.5, 0.5),
             graphics: vec![],
             keepouts: vec![],
+            models: vec![],
             pin_types: Default::default(),
         },
     );
@@ -1146,4 +1149,139 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
     assert_eq!(hs.len(), 1);
     assert_eq!(hs[0].violations[0].required_nm, mm(0.15));
     assert_eq!(hs[0].violations[0].measured_nm, mm(0.05));
+}
+
+#[test]
+fn allow_edge_overhang_skips_component_to_edge_but_enforces_pads_courtyard_and_keepout() {
+    // Connector with pad inside at local y=+2.0mm and courtyard overhanging bottom edge to y=-3.0mm.
+    let mut footprints = BTreeMap::new();
+    footprints.insert(
+        "EDGE_CONN".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Rect {
+                    width: mm(1.0),
+                    height: mm(1.0),
+                },
+                pos: Pt::new(0, mm(2.0)),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            }],
+            courtyard: rect_pts(-2.0, -3.0, 2.0, 3.0),
+            graphics: vec![],
+            keepouts: vec![],
+            models: vec![],
+            pin_types: Default::default(),
+        },
+    );
+    footprints.insert(
+        "SMD".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu"], None),
+    );
+
+    let mut base = BoardSpec {
+        name: "overhang_drc".into(),
+        outline: rect_pts(0.0, 0.0, 20.0, 20.0),
+        cutouts: vec![rect_pts(14.0, 14.0, 16.0, 16.0)],
+        layers: vec![LayerDef {
+            name: "F.Cu".into(),
+            kind: LayerKind::Signal,
+            side: Some(Side::Top),
+            thickness_nm: None,
+        }],
+        footprints,
+        placements: vec![Placement {
+            refdes: "J1".into(),
+            footprint: "EDGE_CONN".into(),
+            pos: Pt::new(mm(10.0), mm(0.0)), // courtyard y in [-3, +3], pad at y=+2.0 (edge clr 1.5mm >= 0.3mm)
+            allow_edge_overhang: false,
+            pin_nets: BTreeMap::from([("1".into(), "SIG".into())]),
+            ..Default::default()
+        }],
+        rules: DesignRules {
+            edge_clearance_nm: mm(0.3),
+            courtyard_clearance_nm: mm(0.2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // 1. Default allow_edge_overhang = false raises ComponentToEdge.
+    let drc_default = check_board_drc(&BoardIr::from_spec(&base).unwrap());
+    assert!(
+        drc_default
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::ComponentToEdge && v.item_a == "J1"),
+        "expected ComponentToEdge when allow_edge_overhang=false: {:?}",
+        drc_default.violations
+    );
+
+    // 2. allow_edge_overhang = true passes cleanly when pads are inside edge_clearance_nm.
+    base.placements[0].allow_edge_overhang = true;
+    let drc_ok = check_board_drc(&BoardIr::from_spec(&base).unwrap());
+    assert!(
+        drc_ok.passed,
+        "expected clean DRC with allow_edge_overhang=true, got {:?}",
+        drc_ok.violations
+    );
+
+    // 3. Pad violating outer edge_clearance_nm still triggers EdgeClearance.
+    let mut bad_pad_edge = base.clone();
+    bad_pad_edge.placements[0].pos = Pt::new(mm(10.0), mm(-1.4)); // pad center y=0.6mm, bottom edge at 0.1mm < 0.3mm
+    let drc_edge = check_board_drc(&BoardIr::from_spec(&bad_pad_edge).unwrap());
+    assert!(
+        drc_edge
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::EdgeClearance && v.item_a.starts_with("J1.")),
+        "expected EdgeClearance on pad near outer edge: {:?}",
+        drc_edge.violations
+    );
+
+    // 4. Pad violating cutout edge_clearance_nm still triggers EdgeClearance.
+    let mut bad_pad_cut = base.clone();
+    bad_pad_cut.placements[0].pos = Pt::new(mm(15.0), mm(11.4)); // pad center at (15, 13.4), top at 13.9 -> 0.1mm from cutout y=14
+    let drc_cut = check_board_drc(&BoardIr::from_spec(&bad_pad_cut).unwrap());
+    assert!(
+        drc_cut
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::EdgeClearance && v.item_a.starts_with("J1.")),
+        "expected EdgeClearance on pad near cutout: {:?}",
+        drc_cut.violations
+    );
+
+    // 5. CourtyardOverlap with another component and placement Keepout still fail.
+    let mut bad_cy_ko = base;
+    bad_cy_ko
+        .placements
+        .push(place_pin1("U2", "SMD", 10.0, 2.9, Side::Top, "SIG"));
+    bad_cy_ko.keepouts.push(Keepout {
+        kind: KeepoutKind::Placement,
+        layers: vec!["F.Cu".into()],
+        poly: rect_pts(9.0, 0.5, 11.0, 1.5),
+    });
+    let drc_cy_ko = check_board_drc(&BoardIr::from_spec(&bad_cy_ko).unwrap());
+    assert!(
+        drc_cy_ko
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::CourtyardOverlap),
+        "expected CourtyardOverlap even with allow_edge_overhang=true: {:?}",
+        drc_cy_ko.violations
+    );
+    assert!(
+        drc_cy_ko
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::Keepout && v.item_a == "J1"),
+        "expected placement Keepout even with allow_edge_overhang=true: {:?}",
+        drc_cy_ko.violations
+    );
 }

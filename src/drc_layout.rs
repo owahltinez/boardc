@@ -216,7 +216,7 @@ pub(crate) fn check_courtyards_and_component_edges(
                 });
             }
         }
-        if board.outline.len() >= 3 {
+        if board.outline.len() >= 3 && !pla.allow_edge_overhang {
             let cy_shape = ResolvedShape::polygon(cya.clone());
             let (dist, off_board) = shape_edge_clearance(&cy_shape, &board.outline, &board.cutouts);
             if off_board || (cy_clr > 0 && dist < cy_clr as f64 - EPS_NM) {

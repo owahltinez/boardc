@@ -458,6 +458,8 @@ pub struct Placement {
     pub side: Side,
     #[serde(default)]
     pub locked: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_edge_overhang: bool,
     #[serde(default)]
     pub pin_nets: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

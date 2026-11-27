@@ -425,7 +425,7 @@ impl LegalizeCtx<'_> {
         let cy_bb = translate_bbox(tmpl.local_cy_bbox, pos);
         let cy_clr = self.board.rules.courtyard_clearance_nm;
 
-        if cya.len() >= 3 {
+        if !pl.allow_edge_overhang && cya.len() >= 3 {
             let cy_shape = ResolvedShape::Poly {
                 verts: cya.clone(),
                 bbox: cy_bb,

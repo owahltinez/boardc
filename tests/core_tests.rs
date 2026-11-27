@@ -101,6 +101,7 @@ fn pad_world_shape_and_courtyard_transform() {
         rot_deg: 90.0,
         side: Side::Bottom,
         locked: false,
+        allow_edge_overhang: false,
         pin_nets: BTreeMap::new(),
         pin_types: BTreeMap::new(),
         mpn: None,
@@ -273,6 +274,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             rot_deg: 0.0,
             side: Side::Top,
             locked: false,
+            allow_edge_overhang: false,
             pin_nets: r1_nets,
             pin_types: BTreeMap::new(),
             mpn: None,
@@ -494,4 +496,62 @@ fn cli_skill_install_show_and_uninstall() {
     assert!(!installed.exists());
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn custom_footprint_models_roundtrip_to_kicad_and_rejects_degenerate_courtyard() {
+    let toml_spec = r#"
+name = "custom_models"
+size_nm = [20000000, 20000000]
+
+[footprints.USB_C]
+kind = "custom"
+courtyard = [
+  { x = -2000000, y = -2000000 },
+  { x = 2000000, y = -2000000 },
+  { x = 2000000, y = 2000000 },
+  { x = -2000000, y = 2000000 },
+]
+[[footprints.USB_C.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "rect", width = 1000000, height = 1000000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu", "F.Mask"]
+
+[[footprints.USB_C.models]]
+path = "${KICAD8_3DMODEL_DIR}/Connector_USB.3dshapes/USB_C.step"
+offset_mm = [0.0, 0.0, 0.5]
+scale = [1.0, 1.0, 1.0]
+rotate_deg = [0.0, 0.0, 90.0]
+
+[[placements]]
+refdes = "J1"
+footprint = "USB_C"
+pos = { x = 10000000, y = 10000000 }
+allow_edge_overhang = true
+"#;
+    let spec: BoardSpec = toml::from_str(toml_spec).unwrap();
+    let ir = BoardIr::from_spec(&spec).unwrap();
+    assert!(ir.placements[0].allow_edge_overhang);
+    assert_eq!(ir.footprints["USB_C"].models.len(), 1);
+    assert_eq!(
+        ir.footprints["USB_C"].models[0].path,
+        "${KICAD8_3DMODEL_DIR}/Connector_USB.3dshapes/USB_C.step"
+    );
+    let kicad = boardc::kicad_export::render_kicad_pcb(&ir);
+    assert!(
+        kicad.contains("(model \"${KICAD8_3DMODEL_DIR}/Connector_USB.3dshapes/USB_C.step\""),
+        "expected exported .kicad_pcb to contain model:\n{kicad}"
+    );
+    assert!(kicad.contains("(offset (xyz 0.000000 0.000000 0.500000))"));
+    assert!(kicad.contains("(rotate (xyz 0.000000 0.000000 90.000000))"));
+
+    // Degenerate 2-vertex custom courtyard must be rejected.
+    let bad_cy = toml_spec.replace(
+        "  { x = 2000000, y = 2000000 },\n  { x = -2000000, y = 2000000 },\n",
+        "",
+    );
+    let bad_spec: BoardSpec = toml::from_str(&bad_cy).unwrap();
+    assert!(BoardIr::from_spec(&bad_spec).is_err());
 }
