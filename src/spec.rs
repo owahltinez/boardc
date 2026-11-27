@@ -13,8 +13,9 @@ use crate::ir::{
 };
 use crate::kicad_io::load_kicad_net;
 use crate::spec_kicad::{
-    apply_netlist_components, bare_footprint_name, resolve_footprint_from_libs,
-    resolve_footprint_libs, resolve_spec_path, sync_spec_and_netlist_nets,
+    apply_netlist_components, apply_netlist_pin_types, bare_footprint_name,
+    resolve_footprint_from_libs, resolve_footprint_libs, resolve_spec_path,
+    sync_spec_and_netlist_nets,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -412,7 +413,7 @@ impl BoardIr {
             apply_netlist_components(&mut placements, nl)?;
         }
 
-        for p in &placements {
+        for p in &mut placements {
             if p.footprint.trim().is_empty() {
                 return Err(format!("placement '{}' has no footprint", p.refdes));
             }
@@ -462,9 +463,14 @@ impl BoardIr {
                     ));
                 }
             }
+            let fp = &footprints[&p.footprint];
             if !p.pin_types.is_empty() {
-                let fp = &footprints[&p.footprint];
                 validate_pin_types_for_footprint("placement", &p.refdes, fp, &p.pin_types)?;
+            }
+            if let Some(comp) = netlist.as_ref().and_then(|nl| nl.components.get(&p.refdes))
+                && !comp.pin_types.is_empty()
+            {
+                apply_netlist_pin_types(p, fp, &comp.pin_types);
             }
         }
         for (name, fp_spec) in &spec.footprints {

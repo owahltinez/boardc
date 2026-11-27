@@ -787,8 +787,13 @@ pin_nets = { "1" = "VDD_1V8_IO", "2" = "GND", "3" = "VDD_1V8_IO" }
         rep_po.violations
     );
 
-    // power_driven = true MUST catch OutputConflict against out, tri, and open_collector.
-    for pt in [PinType::Out, PinType::Tri, PinType::OpenCollector] {
+    // power_driven = true MUST catch OutputConflict against out, tri, open_collector, and open_emitter.
+    for pt in [
+        PinType::Out,
+        PinType::Tri,
+        PinType::OpenCollector,
+        PinType::OpenEmitter,
+    ] {
         let mut conflict_ir = rt.clone();
         conflict_ir.placements[0].pin_types.insert("3".into(), pt);
         let rep_c = check_board_erc(&conflict_ir);
@@ -848,20 +853,32 @@ pin_nets = { "1" = "VDD_1V8_IO", "2" = "GND", "3" = "VDD_1V8_IO" }
 #[test]
 fn erc_open_collector_and_open_drain_alias_matrix() {
     assert_eq!(PinType::OpenCollector.as_str(), "open_collector");
-    let parsed_json: BTreeMap<String, PinType> =
-        serde_json::from_str(r#"{"a":"open_collector","b":"open_drain"}"#).unwrap();
+    assert_eq!(PinType::OpenEmitter.as_str(), "open_emitter");
+    assert_eq!(PinType::Free.as_str(), "free");
+    let parsed_json: BTreeMap<String, PinType> = serde_json::from_str(
+        r#"{"a":"open_collector","b":"open_drain","c":"open_emitter","d":"open_source","e":"free"}"#,
+    )
+    .unwrap();
     assert_eq!(parsed_json["a"], PinType::OpenCollector);
     assert_eq!(parsed_json["b"], PinType::OpenCollector);
+    assert_eq!(parsed_json["c"], PinType::OpenEmitter);
+    assert_eq!(parsed_json["d"], PinType::OpenEmitter);
+    assert_eq!(parsed_json["e"], PinType::Free);
 
-    // Clean wired-OR I2C/INT bus + bidir/tri/passive/in compatibility.
+    // Clean wired-OR I2C/INT + wired-AND open_emitter + unconnected free pin.
     let clean_toml = r#"
 name = "open_drain_clean"
 size_nm = [40000000, 30000000]
 
 [footprints.U_PMIC]
 kind = "sot23"
-pin_count = 5
-pin_types = { "1" = "open_collector", "2" = "open_drain", "3" = "in", "4" = "bidir", "5" = "tri" }
+pin_count = 6
+pin_types = { "1" = "open_collector", "2" = "open_drain", "3" = "in", "4" = "bidir", "5" = "tri", "6" = "free" }
+
+[footprints.U_OE]
+kind = "sot23"
+pin_count = 3
+pin_types = { "1" = "open_emitter", "2" = "open_source", "3" = "in" }
 
 [footprints.R_PU]
 kind = "chip2_pin"
@@ -881,6 +898,12 @@ pos = { x = 22000000, y = 15000000 }
 pin_nets = { "1" = "SCL", "2" = "INT_N", "3" = "SCL", "4" = "INT_N", "5" = "INT_N" }
 
 [[placements]]
+refdes = "U3"
+footprint = "U_OE"
+pos = { x = 30000000, y = 15000000 }
+pin_nets = { "1" = "OR_BUS", "2" = "OR_BUS", "3" = "OR_BUS" }
+
+[[placements]]
 refdes = "R1"
 footprint = "R_PU"
 pos = { x = 16000000, y = 22000000 }
@@ -894,14 +917,18 @@ pin_nets = { "1" = "SCL", "2" = "INT_N" }
         clean_rep.violations
     );
 
-    // Conflict matrix:
+    // Conflict + free matrix:
     // - N_OC_PO: open_collector + power_out -> OutputConflict (Error)
     // - N_OC_OUT: open_collector + out -> OutputConflict (Error)
     // - N_OC_2OUT: open_collector + 2x out -> single OutputConflict (Error)
     // - N_OC_PWR: open_collector + power_in -> UndrivenPowerInput (Error; open_collector does NOT drive power_in)
+    // - N_OC_OE: open_collector + open_emitter -> OutputConflict (Error; rail-to-rail crowbar)
+    // - N_OE_OUT: open_emitter + out -> OutputConflict (Error)
+    // - N_OE_PO: open_emitter + power_out -> OutputConflict (Error)
+    // - N_FREE_IN: free + in -> UndrivenInput (Error; free does NOT drive or suppress untyped check)
     let conflict_toml = r#"
 name = "open_drain_conflicts"
-size_nm = [50000000, 30000000]
+size_nm = [60000000, 30000000]
 
 [footprints.IC3]
 kind = "sot23"
@@ -927,22 +954,49 @@ footprint = "IC3"
 pos = { x = 28000000, y = 15000000 }
 pin_nets = { "1" = "N_OC_PWR", "2" = "N_OC_PWR", "3" = "N_OC_2OUT" }
 pin_types = { "1" = "open_collector", "2" = "power_in", "3" = "out" }
+
+[[placements]]
+refdes = "U4"
+footprint = "IC3"
+pos = { x = 38000000, y = 15000000 }
+pin_nets = { "1" = "N_OC_OE", "2" = "N_OE_OUT", "3" = "N_OE_PO" }
+pin_types = { "1" = "open_collector", "2" = "open_emitter", "3" = "open_source" }
+
+[[placements]]
+refdes = "U5"
+footprint = "IC3"
+pos = { x = 48000000, y = 15000000 }
+pin_nets = { "1" = "N_OC_OE", "2" = "N_OE_OUT", "3" = "N_OE_PO" }
+pin_types = { "1" = "open_emitter", "2" = "out", "3" = "power_out" }
+
+[[placements]]
+refdes = "U6"
+footprint = "IC3"
+pos = { x = 55000000, y = 15000000 }
+pin_nets = { "1" = "N_FREE_IN", "2" = "N_FREE_IN" }
+pin_types = { "1" = "free", "2" = "in", "3" = "free" }
 "#;
     let conf_rep =
         check_board_erc(&BoardIr::from_spec(&toml::from_str(conflict_toml).unwrap()).unwrap());
     assert!(!conf_rep.passed);
-    assert!(conf_rep.violations.iter().any(|v| {
-        v.kind == ErcViolationKind::OutputConflict
-            && v.severity == Severity::Error
-            && v.net == "N_OC_PO"
-            && v.pins == vec!["U1.1", "U2.1"]
-    }));
-    assert!(conf_rep.violations.iter().any(|v| {
-        v.kind == ErcViolationKind::OutputConflict
-            && v.severity == Severity::Error
-            && v.net == "N_OC_OUT"
-            && v.pins == vec!["U1.2", "U2.2"]
-    }));
+    for (net, pins) in [
+        ("N_OC_PO", vec!["U1.1", "U2.1"]),
+        ("N_OC_OUT", vec!["U1.2", "U2.2"]),
+        ("N_OC_OE", vec!["U4.1", "U5.1"]),
+        ("N_OE_OUT", vec!["U4.2", "U5.2"]),
+        ("N_OE_PO", vec!["U4.3", "U5.3"]),
+    ] {
+        assert!(
+            conf_rep.violations.iter().any(|v| {
+                v.kind == ErcViolationKind::OutputConflict
+                    && v.severity == Severity::Error
+                    && v.net == net
+                    && v.pins == pins
+            }),
+            "expected OutputConflict on {net} for {pins:?}, got: {:?}",
+            conf_rep.violations
+        );
+    }
     let two_out_errs: Vec<_> = conf_rep
         .violations
         .iter()
@@ -957,6 +1011,18 @@ pin_types = { "1" = "open_collector", "2" = "power_in", "3" = "out" }
             && v.net == "N_OC_PWR"
             && v.pins == vec!["U3.2"]
     }));
+    assert!(conf_rep.violations.iter().any(|v| {
+        v.kind == ErcViolationKind::UndrivenInput
+            && v.severity == Severity::Error
+            && v.net == "N_FREE_IN"
+            && v.pins == vec!["U6.2"]
+    }));
+    assert!(
+        !conf_rep
+            .violations
+            .iter()
+            .any(|v| v.pins.iter().any(|p| p == "U6.3" || p == "U6.1"))
+    );
 }
 
 #[test]
@@ -1254,6 +1320,331 @@ power_driven = true
     save_board_json(&backfill_ir, &backfill_path).unwrap();
     let loaded = load_board_json(&backfill_path).unwrap();
     assert_eq!(loaded.nets["v3v3"].name, "v3v3");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn kicad_mod(name: &str, pads: &[(&str, f64, f64)], npth_y: f64) -> String {
+    let mut s = format!("(footprint \"{name}\"\n  (version 20241229) (layer \"F.Cu\")\n");
+    for &(n, x, y) in pads {
+        s.push_str(&format!(
+            "  (pad \"{n}\" smd rect (at {x} {y}) (size 0.4 0.4) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\"))\n"
+        ));
+    }
+    s.push_str(&format!(
+        "  (pad \"MH1\" np_thru_hole circle (at 0 {npth_y}) (size 0.8 0.8) (drill 0.8) (layers \"*.Cu\" \"*.Mask\"))\n)"
+    ));
+    s
+}
+
+#[test]
+fn erc_imports_libparts_pin_types_with_overrides_and_extra_pad_safety() {
+    let dir = test_dir("libparts_erc");
+    let lib = dir.join("draco.pretty");
+    fs::create_dir_all(&lib).unwrap();
+    fs::write(
+        lib.join("SOT23_3.kicad_mod"),
+        kicad_mod(
+            "SOT23_3",
+            &[("1", -0.9, 0.0), ("2", 0.9, 0.0), ("3", 0.0, 1.0)],
+            -1.2,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        lib.join("IC_6.kicad_mod"),
+        kicad_mod(
+            "IC_6",
+            &[
+                ("1", -1.0, -0.5),
+                ("2", 0.0, -0.5),
+                ("3", 1.0, -0.5),
+                ("4", -1.0, 0.5),
+                ("5", 0.0, 0.5),
+                ("6", 1.0, 0.5),
+            ],
+            1.2,
+        ),
+    )
+    .unwrap();
+
+    // 1. Native ERC catches errors solely from .net (libparts) while ignoring virtual/NPTH/unspecified pins.
+    fs::write(
+        dir.join("errors.net"),
+        r#"(export (version "E")
+  (components
+    (comp (ref "U1") (value "DRV") (footprint "draco:IC_6") (libsource (lib "draco") (part "DRV_6")))
+    (comp (ref "U2") (value "LOAD") (footprint "draco:IC_6") (libsource (lib "draco") (part "LOAD_6")))
+  )
+  (libparts
+    (libpart (lib "draco") (part "DRV_6")
+      (pins
+        (pin (num "1") (name "OUT_A") (type "output"))
+        (pin (num "2") (name "UNDRIVEN_IN") (type "input"))
+        (pin (num "3") (name "UNDRIVEN_PWR") (type "power_in"))
+        (pin (num "4") (name "OPEN_SIG") (type "input"))
+        (pin (num "5") (name "NC_PIN") (type "no_connect"))
+        (pin (num "6") (name "FREE_PIN") (type "free"))
+        (pin (num "99") (name "VIRTUAL") (type "input"))
+        (pin (num "MH1") (name "MOUNT") (type "passive"))
+      ))
+    (libpart (lib "draco") (part "LOAD_6")
+      (pins
+        (pin (num "1") (name "OUT_B") (type "output"))
+        (pin (num "2") (name "IN_B") (type "input"))
+        (pin (num "3") (name "PWR_B") (type "power_in"))
+        (pin (num "4") (name "UNSPEC") (type "unspecified"))
+        (pin (num "5") (name "SIG_OUT") (type "output"))
+        (pin (num "6") (name "UNUSED_OUT") (type "output"))
+      ))
+  )
+  (nets
+    (net (code "1") (name "CONFLICT") (node (ref "U1") (pin "1")) (node (ref "U2") (pin "1")))
+    (net (code "2") (name "DEAD_IN") (node (ref "U1") (pin "2")) (node (ref "U2") (pin "2")))
+    (net (code "3") (name "DEAD_PWR") (node (ref "U1") (pin "3")) (node (ref "U2") (pin "3")))
+    (net (code "4") (name "PARTIAL") (node (ref "U1") (pin "6")) (node (ref "U2") (pin "4")))
+    (net (code "5") (name "NC_NET") (node (ref "U1") (pin "5")) (node (ref "U2") (pin "5")))
+  )
+)"#,
+    )
+    .unwrap();
+
+    let err_spec: BoardSpec = toml::from_str(
+        r#"
+name = "libparts_errors"
+size_nm = [40000000, 30000000]
+footprint_libs = ["draco.pretty"]
+netlist = "errors.net"
+
+[[placements]]
+refdes = "U1"
+pos = { x = 10000000, y = 15000000 }
+
+[[placements]]
+refdes = "U2"
+pos = { x = 25000000, y = 15000000 }
+"#,
+    )
+    .unwrap();
+    let err_ir = BoardIr::from_spec_with_base(&err_spec, Some(&dir))
+        .expect("extra/NPTH/unmapped libparts pins must not fail from_spec");
+    assert!(!err_ir.placements[0].pin_types.contains_key("99"));
+    assert!(!err_ir.placements[0].pin_types.contains_key("MH1"));
+    assert_eq!(
+        err_ir.placements[0].pin_types.get("6"),
+        Some(&PinType::Free)
+    );
+    assert!(!err_ir.placements[1].pin_types.contains_key("4"));
+    let ir_json = serde_json::to_string(&err_ir).unwrap();
+    assert!(serde_json::from_str::<BoardIr>(&ir_json).is_ok());
+
+    let rep = check_board_erc(&err_ir);
+    assert!(!rep.passed);
+    assert!(
+        rep.violations
+            .iter()
+            .any(|v| v.kind == ErcViolationKind::OutputConflict && v.net == "CONFLICT")
+    );
+    assert!(
+        rep.violations
+            .iter()
+            .any(|v| v.kind == ErcViolationKind::UndrivenInput && v.net == "DEAD_IN")
+    );
+    assert!(
+        rep.violations
+            .iter()
+            .any(|v| v.kind == ErcViolationKind::UndrivenPowerInput && v.net == "DEAD_PWR")
+    );
+    assert!(
+        rep.violations
+            .iter()
+            .any(|v| v.kind == ErcViolationKind::UnconnectedPin && v.pins == vec!["U1.4"])
+    );
+    assert!(
+        rep.violations
+            .iter()
+            .any(|v| v.kind == ErcViolationKind::UnconnectedPin && v.pins == vec!["U2.6"])
+    );
+    assert!(rep.violations.iter().any(|v| {
+        v.kind == ErcViolationKind::ConnectedNcPin && v.net == "NC_NET" && v.pins == vec!["U1.5"]
+    }));
+    assert!(rep.violations.iter().all(|v| v.net != "PARTIAL"));
+
+    // 2. All 3 override tiers (placement > footprint > libparts) verified via TOML + CLI.
+    let clean_net = dir.join("clean_override.net");
+    fs::write(
+        &clean_net,
+        r#"(export (version "E")
+  (components
+    (comp (ref "Q1") (value "AO3400A") (footprint "draco:SOT23_3") (libsource (lib "draco") (part "AO3400A")))
+    (comp (ref "U3") (value "REG") (footprint "draco:SOT23_3") (libsource (lib "draco") (part "LDO_3")))
+    (comp (ref "U4") (value "MCU") (footprint "draco:SOT23_3") (libsource (lib "draco") (part "MCU_BAD")))
+  )
+  (libparts
+    (libpart (lib "draco") (part "AO3400A")
+      (pins
+        (pin (num "1") (name "G") (type "input"))
+        (pin (num "2") (name "S") (type "passive"))
+        (pin (num "3") (name "D") (type "passive"))
+      ))
+    (libpart (lib "draco") (part "LDO_3")
+      (pins
+        (pin (num "1") (name "VIN") (type "power_in"))
+        (pin (num "2") (name "GND") (type "power_in"))
+        (pin (num "3") (name "VOUT") (type "power_out"))
+      ))
+    (libpart (lib "draco") (part "MCU_BAD")
+      (pins
+        (pin (num "1") (name "VCC") (type "power_out"))
+        (pin (num "2") (name "GND") (type "power_in"))
+        (pin (num "3") (name "GPIO") (type "output"))
+      ))
+  )
+  (nets
+    (net (code "1") (name "V3V3") (node (ref "U3") (pin "3")) (node (ref "U4") (pin "1")))
+    (net (code "2") (name "GND") (node (ref "Q1") (pin "2")) (node (ref "Q1") (pin "3")) (node (ref "U3") (pin "1")) (node (ref "U3") (pin "2")) (node (ref "U4") (pin "2")))
+    (net (code "3") (name "GATE") (node (ref "Q1") (pin "1")) (node (ref "U4") (pin "3")))
+  )
+)"#,
+    )
+    .unwrap();
+
+    let ov_toml = r#"
+name = "libparts_override"
+size_nm = [40000000, 30000000]
+footprint_libs = ["draco.pretty"]
+netlist = "clean_override.net"
+
+[footprints."draco:SOT23_3".pin_types]
+1 = "passive"
+2 = "passive"
+
+[[placements]]
+refdes = "Q1"
+pos = { x = 8000000, y = 15000000 }
+
+[[placements]]
+refdes = "U3"
+pos = { x = 18000000, y = 15000000 }
+
+[[placements]]
+refdes = "U4"
+pos = { x = 28000000, y = 15000000 }
+pin_types = { "1" = "power_in" }
+"#;
+    let ov_spec_path = dir.join("override.toml");
+    fs::write(&ov_spec_path, ov_toml).unwrap();
+    let ov_ir =
+        BoardIr::from_spec_with_base(&load_spec_file(&ov_spec_path).unwrap(), Some(&dir)).unwrap();
+    assert_eq!(
+        ov_ir.footprints["draco:SOT23_3"].pin_types,
+        BTreeMap::from([
+            ("1".into(), PinType::Passive),
+            ("2".into(), PinType::Passive),
+        ])
+    );
+    assert_eq!(
+        ov_ir.placements[0].pin_types,
+        BTreeMap::from([("3".into(), PinType::Passive)])
+    );
+    assert_eq!(
+        ov_ir.placements[1].pin_types,
+        BTreeMap::from([("3".into(), PinType::PowerOut)])
+    );
+    assert_eq!(
+        ov_ir.placements[2].pin_types,
+        BTreeMap::from([("1".into(), PinType::PowerIn), ("3".into(), PinType::Out)])
+    );
+
+    let cli_erc = run_cli(&["erc", ov_spec_path.to_str().unwrap(), "--json"]);
+    assert!(cli_erc.status.success());
+    let cli_rep: ErcReport = serde_json::from_slice(&cli_erc.stdout).unwrap();
+    assert!(
+        cli_rep.passed,
+        "expected clean ERC with overrides: {:?}",
+        cli_rep.violations
+    );
+
+    // 3. Changing .net (libparts) pin types invalidates run_preflight and compile_board caches.
+    let cache_net = dir.join("cache_net.net");
+    let make_cache_net = |u1_pin1: &str| {
+        format!(
+            r#"(export (version "E")
+  (components
+    (comp (ref "U1") (value "A") (footprint "draco:SOT23_3") (libsource (lib "draco") (part "PART_A")))
+    (comp (ref "U2") (value "B") (footprint "draco:SOT23_3") (libsource (lib "draco") (part "PART_B")))
+  )
+  (libparts
+    (libpart (lib "draco") (part "PART_A")
+      (pins
+        (pin (num "1") (name "SIG") (type "{u1_pin1}"))
+        (pin (num "2") (name "GND") (type "passive"))
+        (pin (num "3") (name "NC") (type "no_connect"))
+      ))
+    (libpart (lib "draco") (part "PART_B")
+      (pins
+        (pin (num "1") (name "SIG") (type "output"))
+        (pin (num "2") (name "GND") (type "passive"))
+        (pin (num "3") (name "NC") (type "no_connect"))
+      ))
+  )
+  (nets
+    (net (code "1") (name "SIG") (node (ref "U1") (pin "1")) (node (ref "U2") (pin "1")))
+    (net (code "2") (name "GND") (node (ref "U1") (pin "2")) (node (ref "U2") (pin "2")))
+  )
+)"#
+        )
+    };
+    let cache_spec: BoardSpec = toml::from_str(
+        r#"
+name = "libparts_cache"
+size_nm = [30000000, 20000000]
+footprint_libs = ["draco.pretty"]
+netlist = "cache_net.net"
+
+[[placements]]
+refdes = "U1"
+pos = { x = 8000000, y = 10000000 }
+locked = true
+
+[[placements]]
+refdes = "U2"
+pos = { x = 20000000, y = 10000000 }
+locked = true
+"#,
+    )
+    .unwrap();
+    fs::write(&cache_net, make_cache_net("input")).unwrap();
+    let ir_v1 = BoardIr::from_spec_with_base(&cache_spec, Some(&dir)).unwrap();
+    assert!(run_preflight(&ir_v1, &HashSet::new()).unwrap().ok);
+    let cfg = BuildOptions {
+        cache_dir: dir.join("cache"),
+        use_cache: true,
+        emit_outputs: false,
+        ..Default::default()
+    };
+    let r1 = compile_board(ir_v1, &cfg).unwrap();
+    assert!(r1.ok);
+    assert!(!r1.stage_hit(StageKind::Preflight));
+
+    fs::write(&cache_net, make_cache_net("output")).unwrap();
+    let ir_v2 = BoardIr::from_spec_with_base(&cache_spec, Some(&dir)).unwrap();
+    let pf2 = run_preflight(&ir_v2, &HashSet::new()).unwrap();
+    assert!(!pf2.ok);
+    assert!(
+        pf2.erc_violations
+            .iter()
+            .any(|v| v.kind == ErcViolationKind::OutputConflict && v.net == "SIG")
+    );
+    let r2 = compile_board(ir_v2, &cfg).unwrap();
+    assert!(!r2.ok);
+    assert!(!r2.stage_hit(StageKind::Preflight));
+    assert!(
+        r2.preflight
+            .erc_violations
+            .iter()
+            .any(|v| v.kind == ErcViolationKind::OutputConflict && v.net == "SIG")
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

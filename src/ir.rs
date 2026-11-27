@@ -480,9 +480,12 @@ pub enum PinType {
     Tri,
     #[serde(alias = "open_drain")]
     OpenCollector,
+    #[serde(alias = "open_source")]
+    OpenEmitter,
     PowerIn,
     PowerOut,
     Passive,
+    Free,
     Nc,
 }
 
@@ -494,9 +497,11 @@ impl PinType {
             Self::Bidir => "bidir",
             Self::Tri => "tri",
             Self::OpenCollector => "open_collector",
+            Self::OpenEmitter => "open_emitter",
             Self::PowerIn => "power_in",
             Self::PowerOut => "power_out",
             Self::Passive => "passive",
+            Self::Free => "free",
             Self::Nc => "nc",
         }
     }

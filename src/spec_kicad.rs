@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::ir::{FootprintDef, NetDef, Placement};
+use crate::ir::{FootprintDef, NetDef, PadKind, PinType, Placement};
 use crate::kicad_io::{KicadNetlist, load_kicad_mod};
 
 pub(crate) fn resolve_spec_path(
@@ -287,6 +287,24 @@ pub(crate) fn apply_netlist_components(
         p.schematic = (!sch.is_empty()).then_some(sch);
     }
     Ok(())
+}
+
+pub(crate) fn apply_netlist_pin_types(
+    placement: &mut Placement,
+    fp: &FootprintDef,
+    netlist_pin_types: &BTreeMap<String, PinType>,
+) {
+    for pad in &fp.pads {
+        // Explicit footprint.pin_types and placement.pin_types both override netlist (libparts).
+        if pad.kind != PadKind::Npth
+            && !pad.name.is_empty()
+            && !fp.pin_types.contains_key(&pad.name)
+            && !placement.pin_types.contains_key(&pad.name)
+            && let Some(&pt) = netlist_pin_types.get(&pad.name)
+        {
+            placement.pin_types.insert(pad.name.clone(), pt);
+        }
+    }
 }
 
 pub(crate) fn sync_spec_and_netlist_nets(
