@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize, Serializer};
 use viahop::geometry::Point;
@@ -8,7 +8,11 @@ use viahop::{
 };
 
 use crate::drc_constraints::count_length_violations;
-use crate::ir::{BoardIr, Pt, Track, Via, nm_to_um, um};
+use crate::drc_dangling::CopperContext;
+use crate::drc_scene::{PourItem, collect_pads, collect_pours, collect_tracks, collect_vias};
+use crate::geom::EPS_NM;
+use crate::ir::{BoardIr, Nm, PourPoly, Pt, Track, Via, nm_to_um, um};
+use crate::poly_index::IndexedPour;
 pub use crate::route_bridge::to_viahop_board;
 use crate::route_bridge::{pt_from_viahop, pt_to_viahop, via_spanned_indices};
 use crate::tune::{TuneOptions, tune_match_groups};
@@ -153,20 +157,36 @@ fn build_initial_routes(board: &BoardIr, vboard: &ViahopBoard) -> Vec<NetRoute> 
     routes
 }
 
+fn is_net_ignored(vboard: &ViahopBoard, net: &str) -> bool {
+    vboard
+        .net_name_to_id
+        .get(net)
+        .is_some_and(|&nid| vboard.nets[nid].ignored)
+}
+
+fn is_target_routable_net(
+    vboard: &ViahopBoard,
+    targets: Option<&HashSet<String>>,
+    net: &str,
+) -> bool {
+    let Some(&nid) = vboard.net_name_to_id.get(net) else {
+        return false;
+    };
+    let info = &vboard.nets[nid];
+    if info.ignored {
+        return false;
+    }
+    targets.is_none_or(|t| t.contains(net) || t.contains(info.class_name.as_str()))
+}
+
 fn write_routes_to_board(board: &mut BoardIr, vboard: &ViahopBoard, routes: &[NetRoute]) {
-    let ignored_names: HashSet<&str> = vboard
-        .nets
-        .iter()
-        .filter(|n| n.ignored)
-        .map(|n| n.name.as_str())
-        .collect();
     // Always preserve locked, no-net, and ignored-net copper (passed as fixed obstacles to viahop).
     board
         .tracks
-        .retain(|t| t.locked || t.net.is_empty() || ignored_names.contains(t.net.as_str()));
+        .retain(|t| t.locked || t.net.is_empty() || is_net_ignored(vboard, &t.net));
     board
         .vias
-        .retain(|v| v.locked || v.net.is_empty() || ignored_names.contains(v.net.as_str()));
+        .retain(|v| v.locked || v.net.is_empty() || is_net_ignored(vboard, &v.net));
 
     for nr in routes {
         let net_name = &vboard.nets[nr.net_id].name;
@@ -222,6 +242,181 @@ fn write_routes_to_board(board: &mut BoardIr, vboard: &ViahopBoard, routes: &[Ne
     }
 }
 
+const MAX_STUB_LEN_NM: Nm = 80_000;
+
+fn prune_dead_end_stubs(
+    board: &mut BoardIr,
+    vboard: &ViahopBoard,
+    cfg: &RouteOptions,
+) -> (usize, f64, usize) {
+    let targets = cfg.reroute_nets.as_ref();
+    let eligible_tracks: Vec<usize> = board
+        .tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            (!t.locked
+                && !t.net.is_empty()
+                && is_target_routable_net(vboard, targets, &t.net)
+                && t.a.dist(t.b) <= MAX_STUB_LEN_NM as f64 + EPS_NM)
+                .then_some(i)
+        })
+        .collect();
+    let eligible_vias: Vec<usize> = board
+        .vias
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            (!v.locked && !v.net.is_empty() && is_target_routable_net(vboard, targets, &v.net))
+                .then_some(i)
+        })
+        .collect();
+    if eligible_tracks.is_empty() && eligible_vias.is_empty() {
+        return (0, 0.0, 0);
+    }
+
+    let (alive_tracks, alive_vias) = {
+        let cu_layers = board.copper_layer_names();
+        let pads = collect_pads(board, &cu_layers);
+        let vias = collect_vias(board);
+        let unfilled_polys: Vec<(&str, &str, PourPoly)> = if board.filled_pours.is_empty() {
+            board
+                .pours
+                .iter()
+                .filter(|p| p.outline.len() >= 3)
+                .map(|p| {
+                    (
+                        p.net.as_str(),
+                        p.layer.as_str(),
+                        PourPoly {
+                            outer: p.outline.clone(),
+                            holes: Vec::new(),
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let pours: Vec<PourItem<'_>> = if board.filled_pours.is_empty() {
+            unfilled_polys
+                .iter()
+                .enumerate()
+                .map(|(id, (net, layer, poly))| {
+                    let indexed = IndexedPour::new(poly);
+                    let bbox = indexed.outer.bbox;
+                    PourItem {
+                        label: format!("unfilled_pour#{id}"),
+                        net,
+                        layer,
+                        poly,
+                        bbox,
+                        indexed,
+                        clearance_override: None,
+                    }
+                })
+                .collect()
+        } else {
+            collect_pours(board)
+        };
+        let tracks = collect_tracks(board);
+        let mut ctx = CopperContext::new(board, &cu_layers, &pads, &vias, &pours, &tracks);
+        let mut pruned_at: HashMap<(&str, &str, Pt), f64> = HashMap::new();
+
+        loop {
+            loop {
+                let mut changed = false;
+                for &i in &eligible_tracks {
+                    if !ctx.alive_tracks[i] {
+                        continue;
+                    }
+                    let tr = &tracks[i];
+                    let a_anch = ctx.is_track_endpoint_anchored(i, tr.a);
+                    let b_anch = ctx.is_track_endpoint_anchored(i, tr.b);
+                    if a_anch && b_anch {
+                        continue;
+                    }
+                    let anchor = a_anch.then_some(tr.a).or_else(|| b_anch.then_some(tr.b));
+                    let prior = match (a_anch, b_anch) {
+                        (true, false) => pruned_at
+                            .get(&(tr.layer, tr.net, tr.b))
+                            .copied()
+                            .unwrap_or(0.0),
+                        (false, true) => pruned_at
+                            .get(&(tr.layer, tr.net, tr.a))
+                            .copied()
+                            .unwrap_or(0.0),
+                        _ => {
+                            pruned_at
+                                .get(&(tr.layer, tr.net, tr.a))
+                                .copied()
+                                .unwrap_or(0.0)
+                                + pruned_at
+                                    .get(&(tr.layer, tr.net, tr.b))
+                                    .copied()
+                                    .unwrap_or(0.0)
+                        }
+                    };
+                    let total_chain_len = prior + tr.a.dist(tr.b);
+                    if total_chain_len > MAX_STUB_LEN_NM as f64 + EPS_NM {
+                        continue;
+                    }
+                    if ctx.track_has_external_touch(i, anchor) {
+                        continue;
+                    }
+                    ctx.alive_tracks[i] = false;
+                    if let Some(anc) = anchor {
+                        *pruned_at.entry((tr.layer, tr.net, anc)).or_insert(0.0) += total_chain_len;
+                    }
+                    changed = true;
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            let mut via_pruned = false;
+            if !eligible_vias.is_empty() {
+                let via_counts = ctx.compute_via_connected_counts();
+                for &vi in &eligible_vias {
+                    if ctx.alive_vias[vi] && via_counts[vi] < 2 {
+                        ctx.alive_vias[vi] = false;
+                        via_pruned = true;
+                    }
+                }
+            }
+            if !via_pruned {
+                break;
+            }
+        }
+        (ctx.alive_tracks, ctx.alive_vias)
+    };
+
+    let mut pruned_tracks = 0usize;
+    let mut pruned_len_nm = 0.0_f64;
+    let mut idx = 0usize;
+    board.tracks.retain(|t| {
+        let keep = alive_tracks[idx];
+        idx += 1;
+        if !keep {
+            pruned_tracks += 1;
+            pruned_len_nm += t.a.dist(t.b);
+        }
+        keep
+    });
+    let mut pruned_vias = 0usize;
+    let mut vidx = 0usize;
+    board.vias.retain(|_| {
+        let keep = alive_vias[vidx];
+        vidx += 1;
+        if !keep {
+            pruned_vias += 1;
+        }
+        keep
+    });
+    (pruned_tracks, pruned_len_nm, pruned_vias)
+}
+
 /// Routes all non-ignored (or `--reroute-nets` targeted) nets in memory using `viahop`.
 pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSummary, String> {
     if let Some(pad_mm) = cfg.reroute_pad_mm
@@ -268,10 +463,12 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
 
     let result = route_board(&vboard, &rcfg);
     write_routes_to_board(board, &vboard, &result.routes);
+    let (pruned_tracks, pruned_len_nm, pruned_vias) = prune_dead_end_stubs(board, &vboard, cfg);
 
     let s = result.stats;
-    let mut total_segments = s.total_segments;
-    let mut total_wirelength_um = s.total_wirelength_um;
+    let mut total_segments = s.total_segments.saturating_sub(pruned_tracks);
+    let total_vias = s.total_vias.saturating_sub(pruned_vias);
+    let mut total_wirelength_um = (s.total_wirelength_um - pruned_len_nm / 1000.0).max(0.0);
     let mut length_violations = s.length_violations;
     let mut elapsed_ms = s.elapsed_ms;
     if cfg.tune_match_groups && !board.constraints.match_groups.is_empty() {
@@ -298,7 +495,7 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
         routed_nets: s.routed_nets,
         unconnected_pairs: s.unconnected_pairs,
         total_segments,
-        total_vias: s.total_vias,
+        total_vias,
         total_wirelength_um,
         passes_run: s.passes_run,
         starts_run: s.starts_run,

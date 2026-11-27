@@ -206,6 +206,11 @@ fn route_2layer_board_ir_clean_drc() {
 
     let drc = check_board_drc(&board);
     assert!(drc.passed, "expected clean DRC, got {:?}", drc.violations);
+    assert_eq!(
+        drc.warning_count, 0,
+        "routed 2-layer board must have no dangling tracks/vias: {:?}",
+        drc.violations
+    );
 }
 
 #[test]
@@ -318,6 +323,24 @@ fn route_4layer_board_ir_with_inner_planes_clean_drc() {
 #[test]
 fn reroute_nets_preserves_frozen_nets_and_locked_items() {
     let mut board = build_2layer_board();
+    board.footprints.insert(
+        "PAD_AUX".into(),
+        term_fp(mm(0.6), &["F.Cu"]).resolve("PAD_AUX").unwrap(),
+    );
+    board.placements.push(place_1pin(
+        "AUX1",
+        "PAD_AUX",
+        (2.0, 2.0),
+        Side::Top,
+        "LOCKED_AUX",
+    ));
+    board.placements.push(place_1pin(
+        "AUX2",
+        "PAD_AUX",
+        (4.0, 2.0),
+        Side::Top,
+        "LOCKED_AUX",
+    ));
     board.tracks.push(Track {
         net: "LOCKED_AUX".into(),
         layer: "F.Cu".into(),
@@ -1302,8 +1325,11 @@ fn route_mask_guards_cover_untented_via_npth_rect_and_per_pad_margin() {
     assert_eq!(summary.unconnected_pairs, 0);
     let drc = check_board_drc(&board);
     assert!(
-        drc.passed,
-        "expected clean DRC across untented via, NPTH mask, and rect override, got {:?}",
+        drc.violations
+            .iter()
+            .all(|v| v.kind == ViolationKind::ViaDangling
+                && (v.item_a == "via#0" || v.item_a == "via#1")),
+        "expected no non-dangling DRC errors across untented via, NPTH mask, and rect override, got {:?}",
         drc.violations
     );
 }
@@ -1628,5 +1654,304 @@ fn route_mask_solder_mask_defined_zero_m2c_roundrect_and_poly() {
         drc_zero.passed,
         "expected clean DRC with m2c=Some(0): {:?}",
         drc_zero.violations
+    );
+}
+
+#[test]
+fn route_prunes_dead_end_grid_snap_stubs_and_respects_guards() {
+    let mk_tr = |net: &str, layer: &str, ax: f64, ay: f64, bx: f64, by: f64, locked: bool| Track {
+        net: net.into(),
+        layer: layer.into(),
+        a: Pt::new(mm(ax), mm(ay)),
+        b: Pt::new(mm(bx), mm(by)),
+        width: um(200.0),
+        locked,
+    };
+    let mk_via = |net: &str, x: f64, y: f64| Via {
+        net: net.into(),
+        pos: Pt::new(mm(x), mm(y)),
+        diameter: um(400.0),
+        drill: um(200.0),
+        layers: ("F.Cu".into(), "B.Cu".into()),
+        locked: false,
+        tented: true,
+    };
+
+    let mut footprints = BTreeMap::new();
+    footprints.insert("PAD".into(), term_fp(mm(0.6), &["F.Cu", "F.Mask"]));
+    footprints.insert("PAD_B".into(), term_fp(mm(0.6), &["B.Cu", "B.Mask"]));
+
+    let mut net_classes = BTreeMap::new();
+    net_classes.insert(
+        "FAST".into(),
+        NetClass {
+            name: "FAST".into(),
+            track_width_nm: um(200.0),
+            clearance_nm: um(150.0),
+            via_dia_nm: um(400.0),
+            via_drill_nm: um(200.0),
+            diff_pair_width_nm: None,
+            diff_pair_gap_nm: None,
+        },
+    );
+    let mut nets = BTreeMap::new();
+    nets.insert(
+        "SIG_IGN".into(),
+        NetDef {
+            name: "SIG_IGN".into(),
+            ignore_route: true,
+            ..Default::default()
+        },
+    );
+    nets.insert(
+        "SIG_FAST".into(),
+        NetDef {
+            name: "SIG_FAST".into(),
+            class: "FAST".into(),
+            ..Default::default()
+        },
+    );
+
+    let spec = BoardSpec {
+        name: "stub_prune".into(),
+        size_nm: Some([mm(26.0), mm(20.0)]),
+        layers: vec![
+            layer_sig("F.Cu", Some(Side::Top)),
+            layer_sig("B.Cu", Some(Side::Bottom)),
+        ],
+        footprints,
+        placements: vec![
+            place_1pin("P_A1", "PAD", (4.0, 12.0), Side::Top, "SIG_A"),
+            place_1pin("P_A2", "PAD", (14.0, 12.0), Side::Top, "SIG_A"),
+            // SIG_VIA via at (4.05, 6.0) is > 0.3mm pad radius outside P_A3 at (3.0, 6.0).
+            place_1pin("P_A3", "PAD", (3.0, 6.0), Side::Top, "SIG_VIA"),
+            place_1pin("P_A4", "PAD_B", (10.0, 6.0), Side::Top, "SIG_VIA"),
+            // SIG_TJ T-junction at (16.03, 6.0) is > 0.3mm pad radius outside P_A5 at (15.0, 6.0).
+            place_1pin("P_A5", "PAD", (15.0, 6.0), Side::Top, "SIG_TJ"),
+            place_1pin("P_A6", "PAD", (16.03, 3.0), Side::Top, "SIG_TJ"),
+            place_1pin("P_B1", "PAD", (4.0, 15.0), Side::Top, "SIG_B"),
+            place_1pin("P_B2", "PAD", (14.0, 15.0), Side::Top, "SIG_B"),
+            // Copper-width bridges (anchor == None and anchor == Some).
+            place_1pin("P_BR1", "PAD", (2.0, 9.0), Side::Top, "SIG_BR"),
+            place_1pin("P_BR2", "PAD_B", (6.0, 9.0), Side::Top, "SIG_BR"),
+            place_1pin("P_BA1", "PAD", (2.0, 7.5), Side::Top, "SIG_BA"),
+            place_1pin("P_BA2", "PAD_B", (6.0, 7.5), Side::Top, "SIG_BA"),
+            // Via whose B.Cu branch is only a 40um stub -> via pruned too.
+            place_1pin("P_VP1", "PAD", (12.0, 2.0), Side::Top, "SIG_VP"),
+            place_1pin("P_VP2", "PAD", (15.0, 2.0), Side::Top, "SIG_VP"),
+            // Net-class reroute target.
+            place_1pin("P_F1", "PAD", (4.0, 17.5), Side::Top, "SIG_FAST"),
+            place_1pin("P_F2", "PAD", (14.0, 17.5), Side::Top, "SIG_FAST"),
+        ],
+        tracks: vec![
+            mk_tr("SIG_A", "F.Cu", 4.0, 12.0, 14.0, 12.0, false),
+            // Cascading 40um + 40um (= 80um) -> both pruned.
+            mk_tr("SIG_A", "F.Cu", 10.0, 12.0, 10.0, 12.04, false),
+            mk_tr("SIG_A", "F.Cu", 10.0, 12.04, 10.04, 12.04, false),
+            // Cascading 45um + 45um (= 90um) -> tip pruned, base preserved.
+            mk_tr("SIG_A", "F.Cu", 5.0, 12.0, 5.0, 12.045, false),
+            mk_tr("SIG_A", "F.Cu", 5.0, 12.045, 5.045, 12.045, false),
+            // Exact 80um stub -> pruned.
+            mk_tr("SIG_A", "F.Cu", 8.0, 12.0, 8.0, 12.08, false),
+            // 90um (> 80um) dead-end -> preserved.
+            mk_tr("SIG_A", "F.Cu", 6.0, 12.0, 6.0, 12.09, false),
+            // Locked 40um stub -> preserved.
+            mk_tr("SIG_A", "F.Cu", 12.0, 12.0, 12.0, 11.96, true),
+            // Ignored-net 40um stub -> preserved.
+            mk_tr("SIG_IGN", "F.Cu", 2.0, 2.0, 2.04, 2.0, false),
+            // SIG_VIA: trunk + 50um segment to via outside pad radius + B.Cu trunk -> preserved.
+            mk_tr("SIG_VIA", "F.Cu", 3.0, 6.0, 4.0, 6.0, false),
+            mk_tr("SIG_VIA", "F.Cu", 4.0, 6.0, 4.05, 6.0, false),
+            mk_tr("SIG_VIA", "B.Cu", 4.05, 6.0, 10.0, 6.0, false),
+            // SIG_TJ: trunk + 60um segment with locked T-junction outside pad radius -> preserved via track_has_external_touch(Some(anc)).
+            mk_tr("SIG_TJ", "F.Cu", 15.0, 6.0, 16.0, 6.0, false),
+            mk_tr("SIG_TJ", "F.Cu", 16.0, 6.0, 16.06, 6.0, false),
+            mk_tr("SIG_TJ", "F.Cu", 16.03, 6.0, 16.03, 3.0, true),
+            // SIG_BR: isolated 40um copper bridge (anchor == None) between P_BR1 (edge 2.30) and via (edge 2.36).
+            mk_tr("SIG_BR", "F.Cu", 2.31, 9.0, 2.35, 9.0, false),
+            mk_tr("SIG_BR", "B.Cu", 2.56, 9.0, 6.0, 9.0, false),
+            // SIG_BA: anchored 40um copper bridge (anchor = (2.31, 7.5)) to via (edge 2.36).
+            mk_tr("SIG_BA", "F.Cu", 2.0, 7.5, 2.31, 7.5, false),
+            mk_tr("SIG_BA", "F.Cu", 2.31, 7.5, 2.35, 7.5, false),
+            mk_tr("SIG_BA", "B.Cu", 2.56, 7.5, 6.0, 7.5, false),
+            // SIG_VP: F.Cu trunk + via with 60um B.Cu dead-end stub exiting via rim -> stub & via pruned.
+            mk_tr("SIG_VP", "F.Cu", 12.0, 2.0, 15.0, 2.0, false),
+            mk_tr("SIG_VP", "B.Cu", 13.5, 2.18, 13.5, 2.24, false),
+            // SIG_B & SIG_FAST trunks + 40um stubs.
+            mk_tr("SIG_B", "F.Cu", 4.0, 15.0, 14.0, 15.0, false),
+            mk_tr("SIG_B", "F.Cu", 9.0, 15.0, 9.0, 15.04, false),
+            mk_tr("SIG_FAST", "F.Cu", 4.0, 17.5, 14.0, 17.5, false),
+            mk_tr("SIG_FAST", "F.Cu", 9.0, 17.5, 9.0, 17.54, false),
+        ],
+        vias: vec![
+            mk_via("SIG_VIA", 4.05, 6.0),
+            mk_via("SIG_BR", 2.56, 9.0),
+            mk_via("SIG_BA", 2.56, 7.5),
+            mk_via("SIG_VP", 13.5, 2.0),
+        ],
+        net_classes,
+        nets,
+        rules: DesignRules {
+            track_width_nm: um(150.0),
+            clearance_nm: um(150.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // 1. Rerouting by net class ("FAST") prunes SIG_FAST's stub while leaving SIG_B's stub untouched.
+    let mut reroute_board = BoardIr::from_spec(&spec).unwrap();
+    let sig_b_stub = mk_tr("SIG_B", "F.Cu", 9.0, 15.0, 9.0, 15.04, false);
+    let sig_fast_stub = mk_tr("SIG_FAST", "F.Cu", 9.0, 17.5, 9.0, 17.54, false);
+    let rr_sum = route_board_ir(
+        &mut reroute_board,
+        &RouteOptions {
+            reroute_nets: Some(HashSet::from(["FAST".into()])),
+            max_passes: 0,
+            multi_start: 1,
+            optimize: false,
+            tune_match_groups: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(rr_sum.unconnected_pairs, 0);
+    assert!(
+        reroute_board.tracks.contains(&sig_b_stub),
+        "non-target SIG_B stub must stay untouched during --reroute-nets FAST"
+    );
+    assert!(
+        !reroute_board.tracks.contains(&sig_fast_stub),
+        "target net class FAST stub must be pruned"
+    );
+
+    // 2. Resume mode (0 passes) prunes dead-end stubs + newly-dangling via and updates RouteSummary.
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    let sum = route_board_ir(
+        &mut board,
+        &RouteOptions {
+            resume: true,
+            max_passes: 0,
+            multi_start: 1,
+            optimize: false,
+            tune_match_groups: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let unlocked_routed_after: Vec<&Track> = board
+        .tracks
+        .iter()
+        .filter(|t| !t.locked && t.net != "SIG_IGN")
+        .collect();
+    let actual_len_um: f64 = unlocked_routed_after
+        .iter()
+        .map(|t| t.a.dist(t.b) / 1000.0)
+        .sum();
+    assert_eq!(sum.total_segments, unlocked_routed_after.len());
+    assert_eq!(sum.total_vias, board.vias.len());
+    assert_eq!(board.vias.len(), 3, "dangling SIG_VP via must be pruned");
+    assert!(
+        (sum.total_wirelength_um - actual_len_um).abs() < 1e-3,
+        "expected summary wirelength {actual_len_um}, got {}",
+        sum.total_wirelength_um
+    );
+
+    let has_seg = |ax: f64, ay: f64, bx: f64, by: f64| {
+        board
+            .tracks
+            .iter()
+            .any(|t| t.a == Pt::new(mm(ax), mm(ay)) && t.b == Pt::new(mm(bx), mm(by)))
+    };
+    // Pruned: 40+40um, tip of 45+45um, 80um, SIG_B stub, SIG_FAST stub, SIG_VP B.Cu stub.
+    assert!(!has_seg(10.0, 12.0, 10.0, 12.04));
+    assert!(!has_seg(10.0, 12.04, 10.04, 12.04));
+    assert!(!has_seg(5.0, 12.045, 5.045, 12.045));
+    assert!(!has_seg(8.0, 12.0, 8.0, 12.08));
+    assert!(!has_seg(13.5, 2.18, 13.5, 2.24));
+    assert!(!board.tracks.contains(&sig_b_stub));
+    assert!(!board.tracks.contains(&sig_fast_stub));
+    // Preserved: base of 45+45um, 90um, locked, ignored, SIG_VIA, SIG_TJ, and both copper bridges.
+    assert!(
+        has_seg(5.0, 12.0, 5.0, 12.045),
+        "45+45um cap must preserve base"
+    );
+    assert!(has_seg(6.0, 12.0, 6.0, 12.09));
+    assert!(has_seg(12.0, 12.0, 12.0, 11.96));
+    assert!(board.tracks.iter().any(|t| t.net == "SIG_IGN"));
+    assert!(
+        has_seg(4.0, 6.0, 4.05, 6.0),
+        "pad-to-via 50um segment must be preserved"
+    );
+    assert!(
+        has_seg(16.0, 6.0, 16.06, 6.0),
+        "SIG_TJ T-junction segment must be preserved"
+    );
+    assert!(
+        has_seg(2.31, 9.0, 2.35, 9.0),
+        "isolated copper-width bridge must be preserved"
+    );
+    assert!(
+        has_seg(2.31, 7.5, 2.35, 7.5),
+        "anchored copper-width bridge must be preserved"
+    );
+    assert!(
+        check_board_drc(&board)
+            .violations
+            .iter()
+            .all(|v| v.kind != ViolationKind::OpenNet && v.kind != ViolationKind::ViaDangling),
+        "stub pruning must never leave OpenNet or ViaDangling"
+    );
+
+    // 3. Unfilled board.pours stub protection during route_board_ir (before fill_zones).
+    let mut pour_fps = BTreeMap::new();
+    pour_fps.insert("PAD".into(), term_fp(mm(0.6), &["F.Cu", "F.Mask"]));
+    let pour_spec = BoardSpec {
+        name: "unfilled_pour_stub".into(),
+        size_nm: Some([mm(16.0), mm(10.0)]),
+        layers: vec![
+            layer_sig("F.Cu", Some(Side::Top)),
+            layer_sig("B.Cu", Some(Side::Bottom)),
+        ],
+        footprints: pour_fps,
+        placements: vec![
+            place_1pin("P1", "PAD", (3.0, 5.0), Side::Top, "SIG_P"),
+            place_1pin("P2", "PAD", (10.0, 5.0), Side::Top, "SIG_P"),
+        ],
+        pours: vec![PourSpec {
+            name: "P_POUR".into(),
+            net: "SIG_P".into(),
+            layer: "F.Cu".into(),
+            outline: rect_pts(6.0, 3.0, 12.0, 7.0),
+            ..Default::default()
+        }],
+        tracks: vec![
+            mk_tr("SIG_P", "F.Cu", 3.0, 5.0, 5.95, 5.0, false),
+            // 40um segment ending 10um shy of pour edge at x=6.0; copper half-width bridges into unfilled pour.
+            mk_tr("SIG_P", "F.Cu", 5.95, 5.0, 5.99, 5.0, false),
+        ],
+        ..Default::default()
+    };
+    let mut pour_board = BoardIr::from_spec(&pour_spec).unwrap();
+    assert!(pour_board.filled_pours.is_empty());
+    route_board_ir(
+        &mut pour_board,
+        &RouteOptions {
+            resume: true,
+            max_passes: 0,
+            multi_start: 1,
+            optimize: false,
+            tune_match_groups: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        pour_board
+            .tracks
+            .iter()
+            .any(|t| t.a == Pt::new(mm(5.95), mm(5.0)) && t.b == Pt::new(mm(5.99), mm(5.0))),
+        "40um bridge into unfilled board.pours must be preserved"
     );
 }

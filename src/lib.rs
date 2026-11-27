@@ -5,6 +5,7 @@ mod drc_cluster;
 mod drc_connect;
 mod drc_constraints;
 mod drc_copper;
+mod drc_dangling;
 mod drc_layout;
 mod drc_mask;
 mod drc_rules;

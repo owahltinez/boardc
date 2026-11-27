@@ -7,6 +7,7 @@ use crate::drc_copper::{
     check_pad_to_pad_clearances, check_pour_clearances, check_track_rules_and_clearances,
     check_via_to_via_and_pad,
 };
+use crate::drc_dangling;
 use crate::drc_layout::{check_courtyards_and_component_edges, check_keepouts};
 use crate::drc_mask::check_mask_to_copper;
 use crate::drc_rules::{check_drill_rules, check_edge_clearances};
@@ -38,6 +39,8 @@ pub enum ViolationKind {
     CapProximity,
     MinVias,
     BgaShadow,
+    TrackDangling,
+    ViaDangling,
     Other,
 }
 
@@ -128,7 +131,12 @@ pub fn check_board_drc(board: &BoardIr) -> DrcReport {
             v
         });
         let h_conn = s.spawn(|| {
-            drc_connect::check_connectivity(board, &cu_layers, &tracks, &pads, &vias, &pours)
+            let mut v =
+                drc_connect::check_connectivity(board, &cu_layers, &tracks, &pads, &vias, &pours);
+            v.extend(drc_dangling::check_dangling(
+                board, &cu_layers, &tracks, &pads, &vias, &pours,
+            ));
+            v
         });
 
         let mut all = Vec::new();
