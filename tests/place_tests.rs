@@ -74,6 +74,7 @@ fn overlapping_decoupling_caps_legalized_with_cap_proximity_and_zero_overlaps() 
         "C_0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -83,6 +84,7 @@ fn overlapping_decoupling_caps_legalized_with_cap_proximity_and_zero_overlaps() 
             pitch_nm: mm(0.5),
             body_nm: mm(3.0),
             ep_nm: mm(1.6),
+            pin_types: Default::default(),
         },
     );
 
@@ -209,6 +211,7 @@ fn movable_cap_pushed_out_of_bga_shadow_and_keepout() {
         "C_0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -218,6 +221,7 @@ fn movable_cap_pushed_out_of_bga_shadow_and_keepout() {
             cols: 4,
             pitch_nm: mm(0.8),
             ball_dia_nm: mm(0.4),
+            pin_types: Default::default(),
         },
     );
 
@@ -324,6 +328,7 @@ fn power_via_solver_thermal_array_and_plane_drops_clean_drc_and_no_chokes() {
         "C_0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -333,6 +338,7 @@ fn power_via_solver_thermal_array_and_plane_drops_clean_drc_and_no_chokes() {
             pitch_nm: mm(0.65),
             body_nm: mm(4.0),
             ep_nm: mm(2.0),
+            pin_types: Default::default(),
         },
     );
 
@@ -485,6 +491,7 @@ fn power_via_solver_does_not_seal_adjacent_bga_pads_and_cli_place_works() {
         "C_0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -494,6 +501,7 @@ fn power_via_solver_does_not_seal_adjacent_bga_pads_and_cli_place_works() {
             cols: 4,
             pitch_nm: mm(0.8),
             ball_dia_nm: mm(0.4),
+            pin_types: Default::default(),
         },
     );
 

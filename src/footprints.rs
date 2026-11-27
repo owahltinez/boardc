@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::ir::{BBoxNm, FootprintDef, Graphic, MM, Nm, PadDef, PadKind, PadShape, Pt};
 
 const BGA_ROW_LETTERS: &[u8] = b"ABCDEFGHJKLMNPRTUVWY";
@@ -99,6 +101,7 @@ pub fn chip_2pin(package: &str) -> Result<FootprintDef, String> {
         graphics,
         keepouts: Vec::new(),
         models: Vec::new(),
+        pin_types: BTreeMap::new(),
     })
 }
 
@@ -168,6 +171,7 @@ pub fn bga(
         graphics,
         keepouts: Vec::new(),
         models: Vec::new(),
+        pin_types: BTreeMap::new(),
     })
 }
 
@@ -267,6 +271,7 @@ pub fn qfn(
         graphics,
         keepouts: Vec::new(),
         models: Vec::new(),
+        pin_types: BTreeMap::new(),
     })
 }
 
@@ -341,6 +346,7 @@ pub fn sot23(pin_count: usize) -> Result<FootprintDef, String> {
         graphics,
         keepouts: Vec::new(),
         models: Vec::new(),
+        pin_types: BTreeMap::new(),
     })
 }
 
@@ -408,5 +414,6 @@ pub fn pin_header(pins: usize, pitch_nm: Nm) -> Result<FootprintDef, String> {
         graphics,
         keepouts: Vec::new(),
         models: Vec::new(),
+        pin_types: BTreeMap::new(),
     })
 }

@@ -4,13 +4,14 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use viahop::run_preflight as viahop_run_preflight;
 
-use crate::drc::Violation;
+use crate::drc::{Severity, Violation};
 use crate::drc_constraints::check_cap_proximity;
 use crate::drc_layout::{check_courtyards_and_component_edges, check_keepouts};
 use crate::drc_rules::check_edge_clearances;
 use crate::drc_scene::{
     collect_keepouts, collect_pads, collect_pours, collect_tracks, collect_vias,
 };
+use crate::erc::{ErcViolation, check_board_erc};
 use crate::ir::{BoardIr, Pt};
 use crate::route::{point_from_viahop as pt_from_viahop, to_viahop_board};
 use crate::zones::{ZoneChoke, analyze_zone_chokes, fill_zones};
@@ -77,6 +78,8 @@ pub struct PreflightSummary {
     pub sealed_pads: Vec<PreflightSealedPad>,
     pub blocked_nets: Vec<PreflightBlockedNet>,
     pub fixed_violations: Vec<PreflightFixedViolation>,
+    #[serde(default)]
+    pub erc_violations: Vec<ErcViolation>,
     pub elapsed_ms: u128,
 }
 
@@ -181,12 +184,16 @@ pub fn run_preflight(
         })
         .collect();
 
+    let erc_violations = check_board_erc(board).violations;
+    let has_erc_errors = erc_violations.iter().any(|v| v.severity == Severity::Error);
+
     let ok = !vreport.stopped_early
         && layout_violations.is_empty()
         && zone_chokes.is_empty()
         && sealed_pads.is_empty()
         && blocked_nets.is_empty()
-        && fixed_violations.is_empty();
+        && fixed_violations.is_empty()
+        && !has_erc_errors;
 
     Ok(PreflightSummary {
         ok,
@@ -201,6 +208,7 @@ pub fn run_preflight(
         sealed_pads,
         blocked_nets,
         fixed_violations,
+        erc_violations,
         elapsed_ms: start.elapsed().as_millis(),
     })
 }

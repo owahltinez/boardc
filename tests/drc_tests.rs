@@ -45,6 +45,7 @@ fn single_pad_fp(
         courtyard: Vec::new(),
         graphics: Vec::new(),
         keepouts: Vec::new(),
+        pin_types: Default::default(),
     }
 }
 
@@ -521,6 +522,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
         "C0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -530,6 +532,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
             cols: 4,
             pitch_nm: mm(0.8),
             ball_dia_nm: mm(0.4),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -539,6 +542,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
             pitch_nm: mm(0.5),
             body_nm: mm(2.0),
             ep_nm: 0,
+            pin_types: Default::default(),
         },
     );
 
@@ -938,6 +942,7 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
             courtyard: rect_pts(-1.0, -1.0, 1.0, 1.0),
             graphics: vec![],
             keepouts: vec![],
+            pin_types: Default::default(),
         },
     );
 
@@ -1077,6 +1082,7 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
             courtyard: rect_pts(-0.5, -0.5, 0.5, 0.5),
             graphics: vec![],
             keepouts: vec![],
+            pin_types: Default::default(),
         },
     );
     let flush_spec = BoardSpec {

@@ -6,7 +6,8 @@ use std::process;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use boardc::drc::{check_board_drc, cluster_kicad_drc_json};
+use boardc::drc::{Severity, check_board_drc, cluster_kicad_drc_json};
+use boardc::erc::check_board_erc;
 use boardc::fab::{FabOptions, export_fab};
 use boardc::ir::{
     BoardIr, BoardSpec, Constraints, FootprintSpec, LayerDef, LayerKind, MaxLengthRule, Placement,
@@ -148,6 +149,12 @@ enum Command {
         #[arg(long)]
         report: Option<PathBuf>,
     },
+    /// Run electrical rules check (single-pin nets, driver conflicts, undriven/unconnected pins).
+    Erc {
+        input: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Run continuous DRC engine and spatial hotspot clusterer.
     Drc {
         input: PathBuf,
@@ -237,6 +244,7 @@ fn sample_spec() -> BoardSpec {
             "C_0402".into(),
             FootprintSpec::Chip2Pin {
                 package: "0402".into(),
+                pin_types: BTreeMap::new(),
             },
         ),
         (
@@ -246,6 +254,7 @@ fn sample_spec() -> BoardSpec {
                 pitch_nm: mm(0.5),
                 body_nm: mm(3.0),
                 ep_nm: mm(1.6),
+                pin_types: BTreeMap::new(),
             },
         ),
     ]);
@@ -469,7 +478,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 print_json(&summary, "PreflightSummary")?;
             } else {
                 println!(
-                    "Preflight {}: {}/{} routable nets, {} layout violations, {} zone chokes, {} sealed pads, {} blocked nets, {} fixed violations, grid={:.1}um ({}ms)",
+                    "Preflight {}: {}/{} routable nets, {} layout violations, {} zone chokes, {} sealed pads, {} blocked nets, {} fixed violations, {} ERC violations, grid={:.1}um ({}ms)",
                     if summary.ok { "PASSED" } else { "FAILED" },
                     summary.routable_nets,
                     summary.total_nets,
@@ -478,6 +487,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     summary.sealed_pads.len(),
                     summary.blocked_nets.len(),
                     summary.fixed_violations.len(),
+                    summary.erc_violations.len(),
                     summary.grid_step_um,
                     summary.elapsed_ms,
                 );
@@ -584,6 +594,30 @@ fn run(cli: Cli) -> Result<(), String> {
                 save_board_json(&ir, &out_path)?;
             } else {
                 print_json(&ir, "BoardIr")?;
+            }
+            Ok(())
+        }
+        Command::Erc { input, json } => {
+            let ir = load_board_input(&input)?;
+            let report = check_board_erc(&ir);
+            if json {
+                print_json(&report, "ErcReport")?;
+            } else {
+                println!(
+                    "ERC {}: {} errors, {} warnings ({} nets, {} typed pins)",
+                    if report.passed { "PASSED" } else { "FAILED" },
+                    report.error_count,
+                    report.warning_count,
+                    report.checked_nets,
+                    report.typed_pins
+                );
+                for (i, v) in report.violations.iter().enumerate() {
+                    let sev = match v.severity {
+                        Severity::Error => "ERROR",
+                        Severity::Warning => "WARN",
+                    };
+                    println!("  [{}] {sev} {:?}: {}", i + 1, v.kind, v.message);
+                }
             }
             Ok(())
         }

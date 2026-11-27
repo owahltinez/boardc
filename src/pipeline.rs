@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::drc::{DrcReport, check_board_drc};
+use crate::erc::ErcViolation;
 use crate::fab::{FabOptions, export_fab};
 use crate::geom::point_in_polygon;
 use crate::ir::{
@@ -28,7 +29,7 @@ use crate::shapes::transform_pad_local_pt;
 use crate::svg::write_board_svgs;
 use crate::zones::{ZoneChoke, ZoneReport, fill_zones};
 
-const CACHE_SCHEMA: &str = "v2";
+const CACHE_SCHEMA: &str = "v3";
 static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Pipeline stage identifier in execution order.
@@ -119,6 +120,7 @@ struct PreflightBlockers<'a> {
     sealed_pads: &'a [PreflightSealedPad],
     blocked_nets: &'a [PreflightBlockedNet],
     fixed_violations: &'a [PreflightFixedViolation],
+    erc_violations: &'a [ErcViolation],
 }
 
 fn normalize_neg_zero(val: &mut serde_json::Value) {
@@ -518,6 +520,7 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
             sealed_pads: &preflight.sealed_pads,
             blocked_nets: &preflight.blocked_nets,
             fixed_violations: &preflight.fixed_violations,
+            erc_violations: &preflight.erc_violations,
         };
         let json = serde_json::to_string_pretty(&blockers)
             .map_err(|e| format!("failed to serialize preflight blockers: {e}"))?;

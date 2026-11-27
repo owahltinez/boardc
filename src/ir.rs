@@ -364,6 +364,35 @@ pub struct Model3d {
     pub rotate_deg: [f64; 3],
 }
 
+/// Electrical pin type used by native ERC checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinType {
+    In,
+    Out,
+    Bidir,
+    Tri,
+    PowerIn,
+    PowerOut,
+    Passive,
+    Nc,
+}
+
+impl PinType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+            Self::Bidir => "bidir",
+            Self::Tri => "tri",
+            Self::PowerIn => "power_in",
+            Self::PowerOut => "power_out",
+            Self::Passive => "passive",
+            Self::Nc => "nc",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FootprintDef {
     pub name: String,
@@ -376,6 +405,8 @@ pub struct FootprintDef {
     pub keepouts: Vec<Keepout>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<Model3d>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pin_types: BTreeMap<String, PinType>,
 }
 
 /// KiCad schematic parity metadata preserved across `.kicad_net`/`.kicad_pcb` and `export-kicad`.
@@ -429,6 +460,8 @@ pub struct Placement {
     pub locked: bool,
     #[serde(default)]
     pub pin_nets: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pin_types: BTreeMap<String, PinType>,
     #[serde(default)]
     pub mpn: Option<String>,
     #[serde(default)]

@@ -8,6 +8,7 @@ mod drc_copper;
 mod drc_layout;
 mod drc_rules;
 mod drc_scene;
+pub mod erc;
 pub mod fab;
 mod fab_assembly;
 mod fab_drills;

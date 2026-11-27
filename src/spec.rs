@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::footprints;
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FootprintDef, Graphic, Keepout, LayerDef, NetClass, NetDef,
-    Nm, PadDef, Placement, PourSpec, Pt, Stackup, Track, Via, default_two_layer_stackup,
+    Nm, PadDef, PinType, Placement, PourSpec, Pt, Stackup, Track, Via, default_two_layer_stackup,
 };
 use crate::kicad_io::load_kicad_net;
 use crate::spec_kicad::{
@@ -20,12 +20,16 @@ use crate::spec_kicad::{
 pub enum FootprintSpec {
     Chip2Pin {
         package: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pin_types: BTreeMap<String, PinType>,
     },
     Bga {
         rows: usize,
         cols: usize,
         pitch_nm: Nm,
         ball_dia_nm: Nm,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pin_types: BTreeMap<String, PinType>,
     },
     Qfn {
         pins_per_side: usize,
@@ -33,13 +37,19 @@ pub enum FootprintSpec {
         body_nm: Nm,
         #[serde(default)]
         ep_nm: Nm,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pin_types: BTreeMap<String, PinType>,
     },
     Sot23 {
         pin_count: usize,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pin_types: BTreeMap<String, PinType>,
     },
     PinHeader {
         pins: usize,
         pitch_nm: Nm,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pin_types: BTreeMap<String, PinType>,
     },
     Custom {
         pads: Vec<PadDef>,
@@ -49,44 +59,125 @@ pub enum FootprintSpec {
         graphics: Vec<Graphic>,
         #[serde(default)]
         keepouts: Vec<Keepout>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pin_types: BTreeMap<String, PinType>,
     },
+    /// Pin-type overlay for a `.kicad_mod` footprint loaded from `footprint_libs`.
+    Lib {
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pin_types: BTreeMap<String, PinType>,
+    },
+}
+
+fn deserialize_footprints<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<BTreeMap<String, FootprintSpec>, D::Error> {
+    let raw = BTreeMap::<String, serde_json::Value>::deserialize(de)?;
+    let mut out = BTreeMap::new();
+    for (name, mut val) in raw {
+        if let Some(map) = val.as_object_mut()
+            && !map.contains_key("kind")
+            && map.contains_key("pin_types")
+        {
+            if map.len() > 1 {
+                return Err(serde::de::Error::custom(format!(
+                    "footprint '{name}' missing 'kind' field"
+                )));
+            }
+            map.insert("kind".into(), serde_json::Value::String("lib".into()));
+        }
+        let fp: FootprintSpec = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
+        out.insert(name, fp);
+    }
+    Ok(out)
 }
 
 impl FootprintSpec {
     pub fn resolve(&self, name: &str) -> Result<FootprintDef, String> {
-        let mut fp = match self {
-            Self::Chip2Pin { package } => footprints::chip_2pin(package)?,
+        let (mut fp, pin_types) = match self {
+            Self::Chip2Pin { package, pin_types } => (footprints::chip_2pin(package)?, pin_types),
             Self::Bga {
                 rows,
                 cols,
                 pitch_nm,
                 ball_dia_nm,
-            } => footprints::bga(*rows, *cols, *pitch_nm, *ball_dia_nm)?,
+                pin_types,
+            } => (
+                footprints::bga(*rows, *cols, *pitch_nm, *ball_dia_nm)?,
+                pin_types,
+            ),
             Self::Qfn {
                 pins_per_side,
                 pitch_nm,
                 body_nm,
                 ep_nm,
-            } => footprints::qfn(*pins_per_side, *pitch_nm, *body_nm, *ep_nm)?,
-            Self::Sot23 { pin_count } => footprints::sot23(*pin_count)?,
-            Self::PinHeader { pins, pitch_nm } => footprints::pin_header(*pins, *pitch_nm)?,
+                pin_types,
+            } => (
+                footprints::qfn(*pins_per_side, *pitch_nm, *body_nm, *ep_nm)?,
+                pin_types,
+            ),
+            Self::Sot23 {
+                pin_count,
+                pin_types,
+            } => (footprints::sot23(*pin_count)?, pin_types),
+            Self::PinHeader {
+                pins,
+                pitch_nm,
+                pin_types,
+            } => (footprints::pin_header(*pins, *pitch_nm)?, pin_types),
             Self::Custom {
                 pads,
                 courtyard,
                 graphics,
                 keepouts,
-            } => FootprintDef {
-                name: name.to_string(),
-                pads: pads.clone(),
-                courtyard: courtyard.clone(),
-                graphics: graphics.clone(),
-                keepouts: keepouts.clone(),
-                models: Vec::new(),
-            },
+                pin_types,
+            } => (
+                FootprintDef {
+                    name: name.to_string(),
+                    pads: pads.clone(),
+                    courtyard: courtyard.clone(),
+                    graphics: graphics.clone(),
+                    keepouts: keepouts.clone(),
+                    models: Vec::new(),
+                    pin_types: BTreeMap::new(),
+                },
+                pin_types,
+            ),
+            Self::Lib { .. } => {
+                return Err(format!(
+                    "footprint '{name}' is a library pin_types overlay and requires footprint_libs"
+                ));
+            }
         };
         fp.name = name.to_string();
+        fp.pin_types = pin_types.clone();
         Ok(fp)
     }
+}
+
+fn validate_pin_types_for_footprint(
+    owner: &str,
+    fp: &FootprintDef,
+    pin_types: &BTreeMap<String, PinType>,
+) -> Result<(), String> {
+    if pin_types.is_empty() || fp.pads.is_empty() {
+        return Ok(());
+    }
+    let known: HashSet<&str> = fp
+        .pads
+        .iter()
+        .map(|p| p.name.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for pin in pin_types.keys() {
+        if !known.contains(pin.trim()) {
+            return Err(format!(
+                "{owner} pin_types references unknown pin '{pin}' on footprint '{}'",
+                fp.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -104,7 +195,7 @@ pub struct BoardSpec {
     pub footprint_libs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub netlist: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_footprints")]
     pub footprints: BTreeMap<String, FootprintSpec>,
     #[serde(default)]
     pub placements: Vec<Placement>,
@@ -165,8 +256,19 @@ impl BoardIr {
         };
 
         let mut footprints = BTreeMap::new();
+        let mut lib_pin_overlays: HashMap<&str, &BTreeMap<String, PinType>> = HashMap::new();
         for (name, fp_spec) in &spec.footprints {
-            footprints.insert(name.clone(), fp_spec.resolve(name)?);
+            if let FootprintSpec::Lib { pin_types } = fp_spec {
+                lib_pin_overlays.insert(name.as_str(), pin_types);
+            } else {
+                let fp = fp_spec.resolve(name)?;
+                validate_pin_types_for_footprint(
+                    &format!("footprint '{name}'"),
+                    &fp,
+                    &fp.pin_types,
+                )?;
+                footprints.insert(name.clone(), fp);
+            }
         }
         let mut placements = spec.placements.clone();
         let mut seen_refs = HashSet::with_capacity(placements.len());
@@ -192,9 +294,20 @@ impl BoardIr {
                     .as_ref()
                     .and_then(|s| s.footprint.as_deref())
                     .filter(|sf| bare_footprint_name(sf) == p.footprint);
-                if let Some(fp) =
+                if let Some(mut fp) =
                     resolve_footprint_from_libs(&p.footprint, qual_fallback, &resolved_libs)?
                 {
+                    if let Some(&overlay) = lib_pin_overlays
+                        .get(p.footprint.as_str())
+                        .or_else(|| lib_pin_overlays.get(bare_footprint_name(&p.footprint)))
+                    {
+                        fp.pin_types = overlay.clone();
+                        validate_pin_types_for_footprint(
+                            &format!("footprint '{}'", p.footprint),
+                            &fp,
+                            &fp.pin_types,
+                        )?;
+                    }
                     footprints.insert(p.footprint.clone(), fp);
                 } else {
                     return Err(format!(
@@ -202,6 +315,14 @@ impl BoardIr {
                         p.refdes, p.footprint
                     ));
                 }
+            }
+            if !p.pin_types.is_empty() {
+                let fp = &footprints[&p.footprint];
+                validate_pin_types_for_footprint(
+                    &format!("placement '{}'", p.refdes),
+                    fp,
+                    &p.pin_types,
+                )?;
             }
         }
 

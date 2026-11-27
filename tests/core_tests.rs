@@ -102,6 +102,7 @@ fn pad_world_shape_and_courtyard_transform() {
         side: Side::Bottom,
         locked: false,
         pin_nets: BTreeMap::new(),
+        pin_types: BTreeMap::new(),
         mpn: None,
         lcsc: None,
         dnp: false,
@@ -167,6 +168,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
         "R_0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -176,6 +178,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             cols: 3,
             pitch_nm: mm(0.8),
             ball_dia_nm: mm(0.4),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -185,14 +188,22 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             pitch_nm: mm(0.5),
             body_nm: mm(3.0),
             ep_nm: mm(1.5),
+            pin_types: Default::default(),
         },
     );
-    footprints.insert("U_SOT".into(), FootprintSpec::Sot23 { pin_count: 5 });
+    footprints.insert(
+        "U_SOT".into(),
+        FootprintSpec::Sot23 {
+            pin_count: 5,
+            pin_types: Default::default(),
+        },
+    );
     footprints.insert(
         "J_HDR".into(),
         FootprintSpec::PinHeader {
             pins: 3,
             pitch_nm: mm(2.54),
+            pin_types: Default::default(),
         },
     );
     let mut net_classes = BTreeMap::new();
@@ -263,6 +274,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             side: Side::Top,
             locked: false,
             pin_nets: r1_nets,
+            pin_types: BTreeMap::new(),
             mpn: None,
             lcsc: None,
             dnp: false,

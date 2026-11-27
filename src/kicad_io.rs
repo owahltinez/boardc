@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::f64::consts::TAU;
 use std::fs;
 use std::path::Path;
@@ -139,6 +139,7 @@ pub(crate) fn parse_footprint_node(
             graphics,
             keepouts,
             models,
+            pin_types: BTreeMap::new(),
         },
         pad_nets,
     ))

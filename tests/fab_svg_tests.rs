@@ -36,6 +36,7 @@ fn make_4layer_board() -> BoardIr {
         "C_0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -45,6 +46,7 @@ fn make_4layer_board() -> BoardIr {
             pitch_nm: mm(0.5),
             body_nm: mm(3.0),
             ep_nm: mm(1.4),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -52,6 +54,7 @@ fn make_4layer_board() -> BoardIr {
         FootprintSpec::PinHeader {
             pins: 2,
             pitch_nm: mm(2.54),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -71,6 +74,7 @@ fn make_4layer_board() -> BoardIr {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
 
@@ -568,6 +572,7 @@ fn regression_cw_poly_mask_expands_and_blind_via_splits_drill_file() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
 
@@ -1257,6 +1262,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -1276,6 +1282,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -1298,6 +1305,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
 
