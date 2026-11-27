@@ -413,7 +413,10 @@ pub(crate) fn parse_graphic_node(
                 if atom_at(node, 1) != Some("user") {
                     return Vec::new();
                 }
-                atom_at(node, 2).filter(|t| !t.contains("${"))
+                let val_idx = node
+                    .as_list()
+                    .map_or(2, crate::kicad_raw_fp::fp_text_val_idx);
+                atom_at(node, val_idx).filter(|t| !t.contains("${"))
             } else {
                 atom_at(node, 1)
             };

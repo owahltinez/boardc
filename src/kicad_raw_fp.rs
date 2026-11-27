@@ -4,7 +4,9 @@ use std::fmt::Write as _;
 use viahop::sexp::SExp;
 
 use crate::geom::sin_cos_deg;
-use crate::ir::{BoardIr, FootprintDef, PadKind, Placement, SchematicMeta, Side, nm_to_mm};
+use crate::ir::{
+    AutoRefdes, BoardIr, FootprintDef, PadKind, Placement, SchematicMeta, Side, nm_to_mm,
+};
 use crate::kicad_export_items::{UuidGen, esc, remap_kicad_layer, write_footprint_body};
 use crate::kicad_geom::{atom_at, f64_at, is_exportable_kicad_field, parse_kicad_sexp};
 use crate::kicad_io::parse_footprint_node;
@@ -130,6 +132,51 @@ fn mirror_effects(node: &mut SExp) {
     }
 }
 
+pub(crate) fn fp_text_val_idx(items: &[SExp]) -> usize {
+    if items.first().and_then(SExp::as_atom) == Some("fp_text")
+        && items.get(2).and_then(SExp::as_atom) == Some("locked")
+        && items.len() > 3
+    {
+        3
+    } else {
+        2
+    }
+}
+
+fn is_hide(node: &SExp) -> bool {
+    node.as_atom() == Some("hide") || node.tag() == Some("hide")
+}
+
+fn hide_text_item(node: &mut SExp) {
+    let SExp::List(items) = node else { return };
+    let prefix = (fp_text_val_idx(items) + 1).min(items.len());
+    let mut idx = 0usize;
+    items.retain_mut(|item| {
+        let i = idx;
+        idx += 1;
+        if i < prefix {
+            return true;
+        }
+        if is_hide(item) {
+            return false;
+        }
+        if item.tag() == Some("effects")
+            && let SExp::List(eff) = item
+        {
+            eff.retain(|it| !is_hide(it));
+        }
+        true
+    });
+    let pos = items[prefix..]
+        .iter()
+        .position(|it| matches!(it.tag(), Some("uuid") | Some("effects")))
+        .map_or(items.len(), |p| prefix + p);
+    items.insert(
+        pos,
+        SExp::List(vec![SExp::Atom("hide".into()), SExp::Atom("yes".into())]),
+    );
+}
+
 fn transform_generic(node: &mut SExp, ctx: &mut RawCtx<'_>) {
     let SExp::List(items) = node else { return };
     let Some(tag) = items.first().and_then(SExp::as_atom) else {
@@ -207,8 +254,9 @@ fn transform_generic(node: &mut SExp, ctx: &mut RawCtx<'_>) {
 
 fn transform_text_item(node: &mut SExp, val_override: Option<&str>, ctx: &mut RawCtx<'_>) {
     let SExp::List(items) = node else { return };
+    let val_idx = fp_text_val_idx(items);
     if let Some(v) = val_override
-        && let Some(slot) = items.get_mut(2)
+        && let Some(slot) = items.get_mut(val_idx)
     {
         *slot = SExp::Atom(v.to_string());
     }
@@ -280,11 +328,12 @@ fn transform_pad(
     ctx.ensure_uuid(node);
 }
 
-fn is_quoted_arg(parent_tag: &str, parent_len: usize, idx: usize) -> bool {
+fn is_quoted_arg(parent: &[SExp], parent_tag: &str, idx: usize) -> bool {
     match parent_tag {
         // Footprint `(property "Key" "Val" ...)` has >= 3 items; pad `(property pad_prop_*)` has 2 unquoted items.
-        "property" => parent_len >= 3 && (idx == 1 || idx == 2),
-        "fp_text" | "net" => idx == 2,
+        "property" => parent.len() >= 3 && (idx == 1 || idx == 2),
+        "fp_text" => idx == fp_text_val_idx(parent),
+        "net" => idx == 2,
         "layers" | "members" | "private_layers" | "net_tie_pad_groups" => idx >= 1,
         "gr_text" | "fp_text_box" | "override_value" | "face" | "layer" | "uuid" | "descr"
         | "tags" | "model" | "pad" | "name" | "net_name" | "group" | "pinfunction" | "pintype"
@@ -306,18 +355,17 @@ fn write_atom(out: &mut String, s: &str, force_quote: bool) {
     }
 }
 
-fn write_sexp_inline(out: &mut String, node: &SExp, ptag: &str, plen: usize, idx: usize) {
+fn write_sexp_inline(out: &mut String, node: &SExp, force_quote: bool) {
     match node {
-        SExp::Atom(s) => write_atom(out, s, idx > 0 && is_quoted_arg(ptag, plen, idx)),
+        SExp::Atom(s) => write_atom(out, s, force_quote),
         SExp::List(items) => {
             out.push('(');
             let tag = node.tag().unwrap_or("");
-            let len = items.len();
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     out.push(' ');
                 }
-                write_sexp_inline(out, item, tag, len, i);
+                write_sexp_inline(out, item, i > 0 && is_quoted_arg(items, tag, i));
             }
             out.push(')');
         }
@@ -327,28 +375,28 @@ fn write_sexp_inline(out: &mut String, node: &SExp, ptag: &str, plen: usize, idx
 fn write_top_child(out: &mut String, node: &SExp) {
     let Some(items) = node.as_list() else { return };
     let tag = node.tag().unwrap_or("");
-    let len = items.len();
     if !matches!(tag, "pad" | "zone" | "model" | "fp_poly") {
         out.push_str("\t\t");
-        write_sexp_inline(out, node, "", 0, 0);
+        write_sexp_inline(out, node, false);
         out.push('\n');
         return;
     }
     let split = items
         .iter()
         .position(|it| matches!(it, SExp::List(_)))
-        .unwrap_or(len);
+        .unwrap_or(items.len());
     out.push_str("\t\t(");
     for (i, item) in items[..split].iter().enumerate() {
         if i > 0 {
             out.push(' ');
         }
-        write_sexp_inline(out, item, tag, len, i);
+        write_sexp_inline(out, item, i > 0 && is_quoted_arg(items, tag, i));
     }
     out.push('\n');
     for (i, item) in items[split..].iter().enumerate() {
         out.push_str("\t\t\t");
-        write_sexp_inline(out, item, tag, len, split + i);
+        let idx = split + i;
+        write_sexp_inline(out, item, idx > 0 && is_quoted_arg(items, tag, idx));
         out.push('\n');
     }
     out.push_str("\t\t)\n");
@@ -452,13 +500,16 @@ fn raw_matches_fp(root: &SExp, fp: &FootprintDef) -> bool {
 
 fn try_write_raw_footprint(
     out: &mut String,
-    raw: &str,
     fp_id: &str,
     pl: &Placement,
     fp: &FootprintDef,
+    hide_refdes: bool,
     net_ids: &BTreeMap<String, usize>,
     uuids: &mut UuidGen,
 ) -> bool {
+    let Some(raw) = &fp.kicad_raw else {
+        return false;
+    };
     let Ok(root) = parse_kicad_sexp(raw) else {
         return false;
     };
@@ -523,6 +574,9 @@ fn try_write_raw_footprint(
                     _ => sch_fields.remove(key.as_str()),
                 };
                 transform_text_item(&mut child, val_ov, &mut ctx);
+                if hide_refdes && key == "Reference" {
+                    hide_text_item(&mut child);
+                }
                 props.push(child);
             }
             "fp_text" => {
@@ -539,6 +593,9 @@ fn try_write_raw_footprint(
                     _ => None,
                 };
                 transform_text_item(&mut child, val_ov, &mut ctx);
+                if hide_refdes && kind == "reference" {
+                    hide_text_item(&mut child);
+                }
                 body.push(child);
             }
             "fp_text_box" => {
@@ -669,9 +726,15 @@ pub(crate) fn write_footprint(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(&fp.name);
-    if let Some(raw) = &fp.kicad_raw
-        && try_write_raw_footprint(out, raw, fp_id, pl, fp, net_ids, uuids)
-    {
+    if try_write_raw_footprint(
+        out,
+        fp_id,
+        pl,
+        fp,
+        board.fab.auto_refdes == AutoRefdes::Off,
+        net_ids,
+        uuids,
+    ) {
         return;
     }
     let bottom = pl.side == Side::Bottom;

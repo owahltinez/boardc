@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use boardc::ir::{
-    BoardIr, BoardSpec, FootprintSpec, NetDef, Placement, Pt, SchematicMeta, Side, load_board_json,
-    load_spec_file, mm,
+    AutoRefdes, BoardIr, BoardSpec, FabConfig, FootprintSpec, NetDef, Placement, Pt, SchematicMeta,
+    Side, load_board_json, load_spec_file, mm,
 };
 use boardc::kicad_export::{render_kicad_pcb, render_kicad_pro};
 use boardc::kicad_io::{parse_kicad_net, parse_kicad_pcb};
@@ -1792,6 +1792,410 @@ courtyard = [{ x = 0, y = 0 }, { x = 1000000, y = 0 }, { x = 0, y = 1000000 }]
 pads = []
 "#;
     assert!(toml::from_str::<BoardSpec>(bad_extra).is_err());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_kicad_auto_refdes_off_hides_raw_reference_and_preserves_other_modes() {
+    let dir = test_dir("auto_refdes_off_raw");
+    let lib_dir = dir.join("RefLib.pretty");
+    fs::create_dir_all(&lib_dir).unwrap();
+
+    let mk_mod = |name: &str, legacy: bool, ref_mid: &str, ref_extra: &str, eff_extra: &str| {
+        let (ver, ref_node, val_node, user_node) = if legacy {
+            (
+                20211014,
+                format!(
+                    "(fp_text reference{ref_mid} \"REF**\" (at 0 -1.5) (layer \"F.SilkS\"){ref_extra} (effects (font (size 1 1) (thickness 0.15)){eff_extra}))"
+                ),
+                format!(
+                    "(fp_text value \"{name}\" (at 0 1.5) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))"
+                ),
+                "",
+            )
+        } else {
+            (
+                20241229,
+                format!(
+                    "(property \"Reference\" \"REF**\" (at 0 -1.5 0) (layer \"F.SilkS\"){ref_extra} (effects (font (size 1 1) (thickness 0.15)){eff_extra}))"
+                ),
+                format!(
+                    "(property \"Value\" \"{name}\" (at 0 1.5 0) (layer \"F.Fab\") (effects (font (size 1 1) (thickness 0.15))))"
+                ),
+                "\n  (fp_text user \"${REFERENCE}\" (at 0 0 0) (layer \"F.Fab\") (effects (font (size 0.5 0.5) (thickness 0.1))))",
+            )
+        };
+        format!(
+            "(footprint \"{name}\"\n  (version {ver})\n  (layer \"F.Cu\")\n  {ref_node}\n  {val_node}{user_node}\n  (fp_rect (start -1.0 -0.8) (end 1.0 0.8) (stroke (width 0.05) (type solid)) (fill no) (layer \"F.CrtYd\"))\n  (pad \"1\" smd rect (at -0.5 0) (size 0.4 0.5) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\"))\n)"
+        )
+    };
+
+    for (name, legacy, ref_mid, ref_extra, eff_extra) in [
+        ("PropVis", false, "", "", ""),
+        ("PropHideNo", false, "", " (hide no)", ""),
+        ("PropHideYes", false, "", " (hide yes)", ""),
+        ("PropEffHide", false, "", "", " (hide)"),
+        ("PropEffBareHide", false, "", "", " hide"),
+        ("FpTextVis", true, "", "", ""),
+        ("FpTextBareHide", true, "", " hide", ""),
+        ("FpTextEffHideNo", true, "", "", " (hide no)"),
+        ("FpTextLocked", true, " locked", "", ""),
+    ] {
+        fs::write(
+            lib_dir.join(format!("{name}.kicad_mod")),
+            mk_mod(name, legacy, ref_mid, ref_extra, eff_extra),
+        )
+        .unwrap();
+    }
+
+    struct RefCase<'a> {
+        refdes: &'a str,
+        fp: &'a str,
+        side: Side,
+        has: &'a [&'a str],
+        lacks: &'a [&'a str],
+    }
+    let cases = [
+        RefCase {
+            refdes: "U_PVIS",
+            fp: "RefLib:PropVis",
+            side: Side::Top,
+            has: &["\"U_PVIS\""],
+            lacks: &["hide"],
+        },
+        RefCase {
+            refdes: "hide",
+            fp: "RefLib:PropVis",
+            side: Side::Bottom,
+            has: &["\"hide\"", "(layer \"B.SilkS\")", "(justify mirror)"],
+            lacks: &["(hide", " hide ", " hide)"],
+        },
+        RefCase {
+            refdes: "U_PHN",
+            fp: "RefLib:PropHideNo",
+            side: Side::Top,
+            has: &["(hide no)"],
+            lacks: &[],
+        },
+        RefCase {
+            refdes: "U_PHY",
+            fp: "RefLib:PropHideYes",
+            side: Side::Top,
+            has: &["(hide yes)"],
+            lacks: &[],
+        },
+        RefCase {
+            refdes: "U_PEH",
+            fp: "RefLib:PropEffHide",
+            side: Side::Top,
+            has: &["(hide)"],
+            lacks: &[],
+        },
+        RefCase {
+            refdes: "U_PEBH",
+            fp: "RefLib:PropEffBareHide",
+            side: Side::Top,
+            has: &[" hide)"],
+            lacks: &[],
+        },
+        RefCase {
+            refdes: "U_FTV",
+            fp: "RefLib:FpTextVis",
+            side: Side::Top,
+            has: &["(fp_text reference \"U_FTV\""],
+            lacks: &["hide"],
+        },
+        RefCase {
+            refdes: "U_FTB",
+            fp: "RefLib:FpTextBareHide",
+            side: Side::Top,
+            has: &[" hide "],
+            lacks: &[],
+        },
+        RefCase {
+            refdes: "U_FTEN",
+            fp: "RefLib:FpTextEffHideNo",
+            side: Side::Top,
+            has: &["(hide no)"],
+            lacks: &[],
+        },
+        RefCase {
+            refdes: "U_FTL",
+            fp: "RefLib:FpTextLocked",
+            side: Side::Top,
+            has: &["(fp_text reference locked \"U_FTL\""],
+            lacks: &["hide", "\"locked\""],
+        },
+        RefCase {
+            refdes: "R_FALLBACK",
+            fp: "C_0402",
+            side: Side::Top,
+            has: &["(hide yes)"],
+            lacks: &[],
+        },
+    ];
+
+    let placements = cases
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Placement {
+            refdes: c.refdes.into(),
+            footprint: c.fp.into(),
+            pos: Pt::new(mm(10.0 + i as f64 * 5.0), mm(10.0)),
+            side: c.side,
+            ..Default::default()
+        })
+        .collect();
+
+    let spec = BoardSpec {
+        name: "auto_refdes_raw".into(),
+        size_nm: Some([mm(70.0), mm(20.0)]),
+        footprint_libs: vec!["RefLib.pretty".into()],
+        footprints: BTreeMap::from([(
+            "C_0402".into(),
+            FootprintSpec::Chip2Pin {
+                package: "0402".into(),
+                pin_types: BTreeMap::new(),
+            },
+        )]),
+        placements,
+        fab: FabConfig {
+            auto_refdes: AutoRefdes::Off,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut board = BoardIr::from_spec_with_base(&spec, Some(&dir)).unwrap();
+
+    fn fp_block<'a>(pcb: &'a str, refdes: &str) -> &'a str {
+        let needle = format!("\"{refdes}\"");
+        pcb.split("\t(footprint ")
+            .skip(1)
+            .find(|chunk| chunk.contains(&needle))
+            .unwrap_or_else(|| panic!("missing footprint block for {refdes} in:\n{pcb}"))
+    }
+    fn ref_line(block: &str) -> &str {
+        block
+            .lines()
+            .find(|l| l.contains("(property \"Reference\"") || l.contains("(fp_text reference "))
+            .unwrap_or_else(|| panic!("missing Reference line in:\n{block}"))
+    }
+
+    let off_pcb = render_kicad_pcb(&board);
+    for c in &cases {
+        let rline = ref_line(fp_block(&off_pcb, c.refdes));
+        assert_eq!(
+            rline.matches("(hide yes)").count(),
+            1,
+            "{}: {rline}",
+            c.refdes
+        );
+        for bad in ["(hide no)", "(hide)", " hide ", " hide)"] {
+            assert!(
+                !rline.contains(bad),
+                "{} still has {bad}: {rline}",
+                c.refdes
+            );
+        }
+    }
+    let bot_rline = ref_line(fp_block(&off_pcb, "hide"));
+    assert!(
+        bot_rline.contains("(property \"Reference\" \"hide\"")
+            && bot_rline.contains("(layer \"B.SilkS\")")
+            && bot_rline.contains("(justify mirror)"),
+        "bottom placement lost layer/mirror: {bot_rline}"
+    );
+    let ftl_rline = ref_line(fp_block(&off_pcb, "U_FTL"));
+    assert!(
+        ftl_rline.contains("(fp_text reference locked \"U_FTL\"")
+            && !ftl_rline.contains("\"locked\""),
+        "legacy locked fp_text failed in off mode: {ftl_rline}"
+    );
+    let user_ref_line = fp_block(&off_pcb, "U_PVIS")
+        .lines()
+        .find(|l| l.contains("(fp_text user \"${REFERENCE}\""))
+        .unwrap();
+    assert!(
+        !user_ref_line.contains("hide"),
+        "F.Fab ${{REFERENCE}} must stay visible: {user_ref_line}"
+    );
+    let parsed_refs: Vec<String> = parse_kicad_pcb(&off_pcb, None)
+        .unwrap()
+        .placements
+        .into_iter()
+        .map(|p| p.refdes)
+        .collect();
+    let expected_refs: Vec<&str> = cases.iter().map(|c| c.refdes).collect();
+    assert_eq!(parsed_refs, expected_refs);
+
+    for mode in [AutoRefdes::Rotate, AutoRefdes::Upright] {
+        board.fab.auto_refdes = mode;
+        let pcb = render_kicad_pcb(&board);
+        for c in &cases {
+            let rline = ref_line(fp_block(&pcb, c.refdes));
+            for needle in c.has {
+                assert!(
+                    rline.contains(needle),
+                    "{mode:?} {} missing {needle}: {rline}",
+                    c.refdes
+                );
+            }
+            for bad in c.lacks {
+                assert!(
+                    !rline.contains(bad),
+                    "{mode:?} {} unexpected {bad}: {rline}",
+                    c.refdes
+                );
+            }
+            if c.refdes == "U_PHY" {
+                assert_eq!(rline.matches("(hide yes)").count(), 1, "{mode:?}: {rline}");
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn opportunistic_kicad_cli_auto_refdes_off_zero_mismatch_and_zero_silk_drc() {
+    let sys_libs = std::path::Path::new("/usr/share/kicad/footprints");
+    if !sys_libs
+        .join("Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod")
+        .is_file()
+        || Command::new("kicad-cli").arg("--version").output().is_err()
+    {
+        return;
+    }
+    let dir = test_dir("kicad_cli_auto_refdes_off");
+    let local_pretty = dir.join("Local6.pretty");
+    fs::create_dir_all(&local_pretty).unwrap();
+    fs::write(
+        local_pretty.join("LegChip.kicad_mod"),
+        r#"(footprint "LegChip"
+  (version 20211014)
+  (layer "F.Cu")
+  (fp_text reference "REF**" (at 0 -1.17) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text value "LegChip" (at 0 1.17) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_rect (start -0.93 -0.47) (end 0.93 0.47) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))
+  (pad "1" smd rect (at -0.5 0) (size 0.5 0.6) (layers "F.Cu" "F.Mask" "F.Paste"))
+  (pad "2" smd rect (at 0.5 0) (size 0.5 0.6) (layers "F.Cu" "F.Mask" "F.Paste"))
+)"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("fp-lib-table"),
+        format!(
+            "(fp_lib_table (version 7)\n  (lib (name \"Resistor_SMD\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Resistor_SMD.pretty\")(options \"\")(descr \"\"))\n  (lib (name \"Local6\")(type \"KiCad\")(uri \"{}\")(options \"\")(descr \"\"))\n)\n",
+            local_pretty.display()
+        ),
+    )
+    .unwrap();
+
+    // Place footprints near board edges (Top at y=18.8, Bottom at y=1.2 on 20 mm board) so visible refdes clips Edge.Cuts.
+    let spec = BoardSpec {
+        name: "cli_refdes".into(),
+        size_nm: Some([mm(32.0), mm(20.0)]),
+        footprint_libs: vec![
+            sys_libs.to_string_lossy().into_owned(),
+            local_pretty.to_string_lossy().into_owned(),
+        ],
+        placements: vec![
+            Placement {
+                refdes: "R1".into(),
+                footprint: "Resistor_SMD:R_0402_1005Metric".into(),
+                value: "10k".into(),
+                pos: Pt::new(mm(8.0), mm(18.8)),
+                ..Default::default()
+            },
+            Placement {
+                refdes: "R2".into(),
+                footprint: "Local6:LegChip".into(),
+                value: "10k".into(),
+                pos: Pt::new(mm(18.0), mm(18.8)),
+                ..Default::default()
+            },
+            Placement {
+                refdes: "R3".into(),
+                footprint: "Resistor_SMD:R_0402_1005Metric".into(),
+                value: "10k".into(),
+                pos: Pt::new(mm(24.0), mm(1.2)),
+                side: Side::Bottom,
+                ..Default::default()
+            },
+        ],
+        fab: FabConfig {
+            auto_refdes: AutoRefdes::Rotate,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+
+    let run_cli = |board: &BoardIr, tag: &str| -> Vec<serde_json::Value> {
+        let pcb_path = dir.join(format!("{tag}.kicad_pcb"));
+        let drc_path = dir.join(format!("{tag}.json"));
+        fs::write(&pcb_path, render_kicad_pcb(board)).unwrap();
+        let status = Command::new("kicad-cli")
+            .args([
+                "pcb",
+                "drc",
+                "--severity-all",
+                "--format",
+                "json",
+                "-o",
+                drc_path.to_str().unwrap(),
+                pcb_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "kicad-cli pcb drc failed");
+        let rep: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&drc_path).unwrap()).unwrap();
+        rep["violations"].as_array().unwrap().clone()
+    };
+
+    let rot_violations = run_cli(&board, "rotate");
+    assert!(
+        !rot_violations.iter().any(|v| matches!(
+            v["type"].as_str(),
+            Some("lib_footprint_mismatch" | "lib_footprint_issues")
+        )),
+        "unexpected lib footprint violation in rotate: {rot_violations:#?}"
+    );
+    let silk_items: Vec<String> = rot_violations
+        .iter()
+        .filter(|v| v["type"].as_str() == Some("silk_edge_clearance"))
+        .flat_map(|v| v["items"].as_array().into_iter().flatten())
+        .filter_map(|it| it["description"].as_str().map(str::to_string))
+        .collect();
+    for expected in [
+        "Reference field of R1",
+        "Reference field of R2",
+        "Reference field of R3",
+    ] {
+        assert!(
+            silk_items.iter().any(|d| d.contains(expected)),
+            "expected silk_edge_clearance for {expected} in rotate: {rot_violations:#?}"
+        );
+    }
+
+    board.fab.auto_refdes = AutoRefdes::Off;
+    let off_violations = run_cli(&board, "off");
+    assert!(
+        !off_violations.iter().any(|v| matches!(
+            v["type"].as_str(),
+            Some("lib_footprint_mismatch" | "lib_footprint_issues")
+        )),
+        "unexpected lib footprint violation in off: {off_violations:#?}"
+    );
+    assert!(
+        !off_violations.iter().any(|v| matches!(
+            v["type"].as_str(),
+            Some("silk_edge_clearance" | "silk_over_copper" | "silk_overlap")
+        )),
+        "hidden Reference must not trigger silkscreen DRC in off: {off_violations:#?}"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

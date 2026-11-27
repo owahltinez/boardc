@@ -502,8 +502,10 @@ fn parse_footprint_prop(node: &SExp, key: &str, legacy_type: &str) -> Option<Str
         }
     }
     for txt in node.children_with_tag("fp_text") {
-        if atom_at(txt, 1) == Some(legacy_type) {
-            return atom_at(txt, 2).map(str::to_string);
+        if atom_at(txt, 1) == Some(legacy_type)
+            && let Some(items) = txt.as_list()
+        {
+            return atom_at(txt, crate::kicad_raw_fp::fp_text_val_idx(items)).map(str::to_string);
         }
     }
     None
