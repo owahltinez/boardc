@@ -308,33 +308,41 @@ pub(crate) struct SpatialGrid {
 }
 
 impl SpatialGrid {
+    pub(crate) fn from_bboxes(bboxes: impl IntoIterator<Item = BBoxNm>, cell_nm: Nm) -> Self {
+        let mut grid = Self {
+            cell_nm: cell_nm.max(250_000),
+            cells: HashMap::new(),
+            globals: Vec::new(),
+            seen: Vec::new(),
+            stamp: 0,
+        };
+        for b in bboxes {
+            grid.push(b);
+        }
+        grid
+    }
+
     pub(crate) fn new(bboxes: &[BBoxNm], cell_nm: Nm) -> Self {
-        let cell = cell_nm.max(250_000);
-        let mut cells: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-        let mut globals = Vec::new();
-        for (idx, b) in bboxes.iter().enumerate() {
-            let x0 = b.min_x.div_euclid(cell);
-            let x1 = b.max_x.div_euclid(cell);
-            let y0 = b.min_y.div_euclid(cell);
-            let y1 = b.max_y.div_euclid(cell);
-            let dx = x1.saturating_sub(x0).saturating_add(1);
-            let dy = y1.saturating_sub(y0).saturating_add(1);
-            if dx <= 0 || dy <= 0 || dx.saturating_mul(dy) > 256 {
-                globals.push(idx);
-            } else {
-                for gx in x0..=x1 {
-                    for gy in y0..=y1 {
-                        cells.entry((gx, gy)).or_default().push(idx);
-                    }
+        Self::from_bboxes(bboxes.iter().copied(), cell_nm)
+    }
+
+    pub(crate) fn push(&mut self, b: BBoxNm) {
+        let idx = self.seen.len();
+        self.seen.push(0);
+        let x0 = b.min_x.div_euclid(self.cell_nm);
+        let x1 = b.max_x.div_euclid(self.cell_nm);
+        let y0 = b.min_y.div_euclid(self.cell_nm);
+        let y1 = b.max_y.div_euclid(self.cell_nm);
+        let dx = x1.saturating_sub(x0).saturating_add(1);
+        let dy = y1.saturating_sub(y0).saturating_add(1);
+        if dx <= 0 || dy <= 0 || dx.saturating_mul(dy) > 256 {
+            self.globals.push(idx);
+        } else {
+            for gx in x0..=x1 {
+                for gy in y0..=y1 {
+                    self.cells.entry((gx, gy)).or_default().push(idx);
                 }
             }
-        }
-        Self {
-            cell_nm: cell,
-            cells,
-            globals,
-            seen: vec![0; bboxes.len()],
-            stamp: 0,
         }
     }
 

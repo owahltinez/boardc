@@ -3,13 +3,15 @@ use std::collections::{BTreeSet, HashSet};
 use serde::{Deserialize, Serialize, Serializer};
 use viahop::geometry::Point;
 use viahop::{
-    Board as ViahopBoard, LengthConstraints, MatchGroupConstraint, MaxLengthConstraint, NetRoute,
-    RoutedSegment, RoutedVia, RouterConfig, route_board, validate_reroute_nets,
+    Board as ViahopBoard, LengthConstraints, MaxLengthConstraint, NetRoute, RoutedSegment,
+    RoutedVia, RouterConfig, route_board, validate_reroute_nets,
 };
 
+use crate::drc_constraints::count_length_violations;
 use crate::ir::{BoardIr, Pt, Track, Via, nm_to_um, um};
 pub use crate::route_bridge::to_viahop_board;
 use crate::route_bridge::{pt_from_viahop, pt_to_viahop, via_spanned_indices};
+use crate::tune::{TuneOptions, tune_match_groups};
 
 fn serialize_sorted_set<S: Serializer>(set: &HashSet<String>, ser: S) -> Result<S::Ok, S::Error> {
     let sorted: BTreeSet<&String> = set.iter().collect();
@@ -39,6 +41,7 @@ pub struct RouteOptions {
     pub reroute_nets: Option<HashSet<String>>,
     pub reroute_pad_mm: Option<f64>,
     pub resume: bool,
+    pub tune_match_groups: bool,
 }
 
 impl Default for RouteOptions {
@@ -54,6 +57,7 @@ impl Default for RouteOptions {
             reroute_nets: None,
             reroute_pad_mm: None,
             resume: false,
+            tune_match_groups: true,
         }
     }
 }
@@ -94,17 +98,8 @@ fn build_length_constraints(board: &BoardIr) -> LengthConstraints {
                 max_um: nm_to_um(r.max_nm),
             })
             .collect(),
-        match_groups: board
-            .constraints
-            .match_groups
-            .iter()
-            .map(|r| MatchGroupConstraint {
-                name: r.name.clone(),
-                nets: r.nets.clone(),
-                tolerance_um: nm_to_um(r.tolerance_nm),
-                target_um: r.target_nm.map(nm_to_um),
-            })
-            .collect(),
+        // Match-group skew is closed cleanly by `tune_match_groups` without pre-fragmenting traces.
+        match_groups: Vec::new(),
     }
 }
 
@@ -240,6 +235,16 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
     }
     let length_constraints = build_length_constraints(board);
     length_constraints.validate(&vboard)?;
+    for rule in &board.constraints.match_groups {
+        for net in &rule.nets {
+            if !vboard.net_name_to_id.contains_key(net) {
+                return Err(format!(
+                    "match_group '{}' references unknown net '{net}'",
+                    rule.name
+                ));
+            }
+        }
+    }
 
     let use_initial = cfg.resume || cfg.reroute_nets.is_some();
     let initial_routes = use_initial.then(|| build_initial_routes(board, &vboard));
@@ -265,22 +270,44 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
     write_routes_to_board(board, &vboard, &result.routes);
 
     let s = result.stats;
+    let mut total_segments = s.total_segments;
+    let mut total_wirelength_um = s.total_wirelength_um;
+    let mut length_violations = s.length_violations;
+    let mut elapsed_ms = s.elapsed_ms;
+    if cfg.tune_match_groups && !board.constraints.match_groups.is_empty() {
+        let len_before: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
+        let tune = tune_match_groups(
+            board,
+            &TuneOptions {
+                only_nets: cfg.reroute_nets.clone(),
+                ignored_nets: cfg.ignored_nets.clone(),
+            },
+        );
+        let len_after: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
+        total_segments += tune.added_segments;
+        total_wirelength_um = (total_wirelength_um + (len_after - len_before) / 1000.0).max(0.0);
+        elapsed_ms += tune.elapsed_ms;
+    }
+    if !board.constraints.match_groups.is_empty() || !board.constraints.max_lengths.is_empty() {
+        length_violations = count_length_violations(board);
+    }
+
     Ok(RouteSummary {
         total_nets: s.total_nets,
         routable_nets: s.routable_nets,
         routed_nets: s.routed_nets,
         unconnected_pairs: s.unconnected_pairs,
-        total_segments: s.total_segments,
+        total_segments,
         total_vias: s.total_vias,
-        total_wirelength_um: s.total_wirelength_um,
+        total_wirelength_um,
         passes_run: s.passes_run,
         starts_run: s.starts_run,
         drc_violations: s.drc_violations,
-        length_violations: s.length_violations,
+        length_violations,
         dense_bga_pads: s.dense_bga_pads,
         pofv_capable_pads: s.pofv_capable_pads,
         grid_step_um: s.grid_step_um,
         stopped_early: s.stopped_early,
-        elapsed_ms: s.elapsed_ms,
+        elapsed_ms,
     })
 }

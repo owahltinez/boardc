@@ -23,6 +23,7 @@ use boardc::place::{
 use boardc::preflight::run_preflight;
 use boardc::route::{RouteOptions, route_board_ir};
 use boardc::svg::{SvgOptions, SvgView, render_board_svg, write_board_svgs};
+use boardc::tune::{TuneOptions, tune_match_groups, validate_tune_targets};
 use boardc::verify::{VerifyReport, verify_fab_outputs};
 use boardc::zones::fill_zones;
 
@@ -74,6 +75,9 @@ struct RouteArgs {
     timeout: Option<u64>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     via_at_smd: Option<bool>,
+    /// Skip automatic trombone length-matching for constraints.match_groups.
+    #[arg(long)]
+    no_tune: bool,
 }
 
 impl RouteArgs {
@@ -90,6 +94,7 @@ impl RouteArgs {
             reroute_nets: (!reroute_set.is_empty()).then_some(reroute_set),
             reroute_pad_mm: self.reroute_pad_mm,
             resume: false,
+            tune_match_groups: !self.no_tune,
         }
     }
 }
@@ -155,6 +160,18 @@ enum Command {
         out: Option<PathBuf>,
         #[command(flatten)]
         route: RouteArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Insert DRC-clean trombone meanders for constraints.match_groups.
+    Tune {
+        input: PathBuf,
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        ignore: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -620,6 +637,42 @@ fn run(cli: Cli) -> Result<(), String> {
                     summary.drc_violations,
                     summary.length_violations,
                     summary.elapsed_ms,
+                );
+            }
+            Ok(())
+        }
+        Command::Tune {
+            input,
+            out,
+            only,
+            ignore,
+            json,
+        } => {
+            let mut ir = load_board_input(&input)?;
+            let only_set = to_net_set(only);
+            validate_tune_targets(&ir, &only_set)?;
+            let report = tune_match_groups(
+                &mut ir,
+                &TuneOptions {
+                    only_nets: (!only_set.is_empty()).then_some(only_set),
+                    ignored_nets: to_net_set(ignore),
+                },
+            );
+            if let Some(out_path) = out {
+                save_board_json(&ir, &out_path)?;
+            }
+            if json {
+                print_json(&report, "TuneReport")?;
+            } else {
+                println!(
+                    "Tune {}: {} groups, {} nets tuned, {} meanders (+{} segs), {} unmet ({}ms)",
+                    if report.ok { "OK" } else { "INCOMPLETE" },
+                    report.groups.len(),
+                    report.tuned_nets,
+                    report.added_meanders,
+                    report.added_segments,
+                    report.unmet_nets.len(),
+                    report.elapsed_ms,
                 );
             }
             Ok(())
