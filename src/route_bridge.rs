@@ -199,13 +199,7 @@ pub fn to_viahop_board(
         net_name_to_id.insert(name.clone(), id);
     }
 
-    let is_net_ignored = |name: &str| -> bool {
-        let net_def = board.nets.get(name);
-        let class_name = net_def.map_or("Default", |d| d.class.as_str());
-        ignored_nets.contains(name)
-            || ignored_nets.contains(class_name)
-            || net_def.is_some_and(|d| d.ignore_route)
-    };
+    let is_net_ignored = |name: &str| board.is_net_ignored(name, ignored_nets);
 
     let mut pin_to_net: HashMap<(String, String), usize> = HashMap::new();
     for (net_name, net_def) in &board.nets {

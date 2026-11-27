@@ -11,7 +11,7 @@ use crate::geom::{
     point_in_polygon, point_to_polygon_edge_dist, point_to_segment_dist, shape_edge_clearance,
 };
 use crate::ir::{
-    BBoxNm, BoardIr, Nm, PadDef, PadKind, PadShape, Placement, PourPoly, Pt, Track, Via,
+    BBoxNm, BoardIr, LayerKind, Nm, PadDef, PadKind, PadShape, Placement, PourPoly, Pt, Track, Via,
     same_named_net,
 };
 use crate::place::{PowerViaOptions, PowerViaReport, SolvedViaDrop, UnresolvedPowerPad};
@@ -40,9 +40,9 @@ fn via_span_layers(cu_layers: &[String]) -> (String, String) {
     }
 }
 
-fn is_inner_layer(board: &BoardIr, layer: &str) -> bool {
+fn is_plane_or_inner_layer(board: &BoardIr, layer: &str) -> bool {
     if let Some(ld) = board.layers.iter().find(|l| l.name == layer) {
-        return ld.side.is_none();
+        return ld.kind == LayerKind::Plane || ld.side.is_none();
     }
     !matches!(layer, "F.Cu" | "B.Cu")
 }
@@ -76,7 +76,7 @@ fn identify_plane_nets(board: &BoardIr, cfg: &PowerViaOptions) -> BTreeSet<Strin
         if pour.net.is_empty() {
             continue;
         }
-        if is_inner_layer(board, &pour.layer)
+        if is_plane_or_inner_layer(board, &pour.layer)
             || pad_layers_by_net
                 .get(&pour.net)
                 .is_some_and(|ls| ls.iter().any(|l| l != &pour.layer))

@@ -16,6 +16,7 @@ use crate::ir::{
     Keepout, LayerDef, LayerKind, MatchGroupRule, MaxLengthRule, MinViasRule, NetClass, NetDef, Nm,
     PadKind, Placement, PourSpec, Pt, Track, Via, fnv1a_128, safe_slug, save_board_json,
 };
+use crate::pipeline_repair::route_with_repair;
 use crate::place::{
     PlaceOptions, PlaceReport, PowerViaOptions, PowerViaReport, legalize_placement,
     solve_power_vias,
@@ -24,12 +25,12 @@ use crate::preflight::{
     PreflightBlockedNet, PreflightFixedViolation, PreflightSealedPad, PreflightSummary,
     run_preflight,
 };
-use crate::route::{RouteOptions, RouteSummary, route_board_ir};
+use crate::route::{RouteOptions, RouteSummary};
 use crate::shapes::transform_pad_local_pt;
 use crate::svg::write_board_svgs;
 use crate::zones::{ZoneChoke, ZoneReport, fill_zones};
 
-const CACHE_SCHEMA: &str = "v5";
+const CACHE_SCHEMA: &str = "v6";
 static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Pipeline stage identifier in execution order.
@@ -60,6 +61,7 @@ pub struct BuildOptions {
     pub cache_dir: PathBuf,
     pub use_cache: bool,
     pub fail_on_preflight: bool,
+    pub repair_passes: usize,
     pub place: PlaceOptions,
     pub power_via: PowerViaOptions,
     pub route: RouteOptions,
@@ -73,6 +75,7 @@ impl Default for BuildOptions {
             cache_dir: PathBuf::from(".boardc-cache"),
             use_cache: true,
             fail_on_preflight: false,
+            repair_passes: 0,
             place: PlaceOptions::default(),
             power_via: PowerViaOptions::default(),
             route: RouteOptions::default(),
@@ -283,7 +286,9 @@ struct RouteBaseKeyInput<'a> {
     power_via_key: &'a str,
     max_lengths: &'a [MaxLengthRule],
     match_groups: &'a [MatchGroupRule],
+    filled_pours: &'a [FilledPour],
     cfg: &'a RouteOptions,
+    repair_passes: usize,
 }
 
 #[derive(Serialize)]
@@ -292,7 +297,9 @@ struct RouteKeyInput<'a> {
     power_via_key: &'a str,
     max_lengths: &'a [MaxLengthRule],
     match_groups: &'a [MatchGroupRule],
+    filled_pours: &'a [FilledPour],
     cfg: &'a RouteOptions,
+    repair_passes: usize,
     seed_hash: Option<&'a str>,
 }
 
@@ -533,20 +540,39 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
     let mut base_route_cfg = eff_route_cfg.clone();
     base_route_cfg.reroute_nets = None;
     base_route_cfg.reroute_pad_mm = None;
-    let base_route_key = content_hash_hex(&RouteBaseKeyInput {
-        schema: CACHE_SCHEMA,
-        power_via_key: &power_via_key,
-        max_lengths: &board.constraints.max_lengths,
-        match_groups: &board.constraints.match_groups,
-        cfg: &base_route_cfg,
-    })?;
+    // Clear stale filled_pours before repair when dynamic pours exist; keep pre-baked pours when board.pours is empty.
+    let route_filled_pours: &[FilledPour] = if board.pours.is_empty() {
+        &board.filled_pours
+    } else {
+        &[]
+    };
+    let base_route_key_for = |passes: usize| {
+        content_hash_hex(&RouteBaseKeyInput {
+            schema: CACHE_SCHEMA,
+            power_via_key: &power_via_key,
+            max_lengths: &board.constraints.max_lengths,
+            match_groups: &board.constraints.match_groups,
+            filled_pours: route_filled_pours,
+            cfg: &base_route_cfg,
+            repair_passes: passes,
+        })
+    };
+    let base_route_key = base_route_key_for(cfg.repair_passes)?;
     let seed_path = cfg
         .cache_dir
         .join(format!("route_seed_{base_route_key}.json"));
     let has_unlocked =
         board.tracks.iter().any(|t| !t.locked) || board.vias.iter().any(|v| !v.locked);
     let loaded_seed = if eff_route_cfg.reroute_nets.is_some() && cfg.use_cache && !has_unlocked {
-        load_cached::<RouteSeed>(&seed_path)
+        let fallback_0 = || {
+            (cfg.repair_passes > 0)
+                .then(|| base_route_key_for(0).ok())
+                .flatten()
+                .and_then(|k0| {
+                    load_cached::<RouteSeed>(&cfg.cache_dir.join(format!("route_seed_{k0}.json")))
+                })
+        };
+        load_cached::<RouteSeed>(&seed_path).or_else(fallback_0)
     } else {
         None
     };
@@ -556,7 +582,9 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
         power_via_key: &power_via_key,
         max_lengths: &board.constraints.max_lengths,
         match_groups: &board.constraints.match_groups,
+        filled_pours: route_filled_pours,
         cfg: &eff_route_cfg,
+        repair_passes: cfg.repair_passes,
         seed_hash: seed_hash.as_deref(),
     })?;
     let route_cache = run_cached_stage(
@@ -569,7 +597,10 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
                 board.tracks = seed.tracks;
                 board.vias = seed.vias;
             }
-            let summary = route_board_ir(&mut board, &eff_route_cfg)?;
+            if !board.pours.is_empty() && cfg.repair_passes > 0 {
+                board.filled_pours.clear();
+            }
+            let summary = route_with_repair(&mut board, &eff_route_cfg, cfg.repair_passes)?;
             if cfg.use_cache && eff_route_cfg.reroute_nets.is_none() {
                 save_cached(
                     &cfg.cache_dir,

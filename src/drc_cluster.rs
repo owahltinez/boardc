@@ -127,7 +127,7 @@ fn build_action_hint(
     }
 }
 
-fn routable_board_nets(board: &BoardIr) -> HashSet<&str> {
+pub(crate) fn routable_board_nets(board: &BoardIr) -> HashSet<&str> {
     let cu_layers = board.copper_layer_names();
     let net_def_pins = net_def_pin_index(board);
     let mut pad_counts: HashMap<&str, usize> = HashMap::new();
