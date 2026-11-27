@@ -347,7 +347,7 @@ impl GerberBuilder {
             FileAttribute::GenerationSoftware(GenerationSoftware::new(
                 "boardc",
                 "boardc",
-                Some("0.1.0"),
+                Some(env!("CARGO_PKG_VERSION")),
             ))
             .into(),
             FileAttribute::Part(Part::Single).into(),

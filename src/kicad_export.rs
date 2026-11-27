@@ -264,7 +264,11 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
     out.push_str("(kicad_pcb\n");
     let _ = writeln!(out, "\t(version {kicad_version})");
     out.push_str("\t(generator \"boardc\")\n");
-    out.push_str("\t(generator_version \"0.1.0\")\n");
+    out.push_str(concat!(
+        "\t(generator_version \"",
+        env!("CARGO_PKG_VERSION"),
+        "\")\n"
+    ));
     let _ = writeln!(
         out,
         "\t(general\n\t\t(thickness {})\n\t)",
