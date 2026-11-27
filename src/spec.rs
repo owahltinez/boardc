@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::footprints;
 use crate::geom::polygon_signed_area_2;
 use crate::ir::{
-    BoardIr, Constraints, DesignRules, FootprintDef, Graphic, Keepout, LayerDef, Model3d, NetClass,
-    NetDef, Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup, Track, Via,
-    default_two_layer_stackup,
+    BoardIr, Constraints, DesignRules, FabConfig, FootprintDef, Graphic, Keepout, LayerDef,
+    Model3d, NetClass, NetDef, Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup,
+    Track, Via, default_two_layer_stackup,
 };
 use crate::kicad_io::load_kicad_net;
 use crate::spec_kicad::{
@@ -223,6 +223,9 @@ pub(crate) fn validate_pin_types_for_footprint(
 }
 
 pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
+    ir.fab
+        .validate()
+        .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     for (name, fp) in &ir.footprints {
         let owner = format!("footprint '{name}'");
         if !fp.courtyard.is_empty() {
@@ -291,6 +294,8 @@ pub struct BoardSpec {
     pub graphics: Vec<Graphic>,
     #[serde(default)]
     pub stackup: Stackup,
+    #[serde(default, skip_serializing_if = "FabConfig::is_default")]
+    pub fab: FabConfig,
 }
 
 impl BoardIr {
@@ -451,6 +456,7 @@ impl BoardIr {
                 spec.stackup.dielectric_nm.len()
             ));
         }
+        spec.fab.validate()?;
         let mut rules = spec.rules.clone();
         let mut stackup = spec.stackup.clone();
         // Keep stackup POFV and via-in-pad DRC/routing flags consistent across the pipeline and fab exports.
@@ -476,6 +482,7 @@ impl BoardIr {
             constraints: spec.constraints.clone(),
             graphics: spec.graphics.clone(),
             stackup,
+            fab: spec.fab,
         })
     }
 }

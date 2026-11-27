@@ -324,6 +324,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
         },
         graphics: vec![],
         stackup: Default::default(),
+        fab: Default::default(),
     };
 
     let tmp_dir = std::env::temp_dir().join("boardc_test_spec");

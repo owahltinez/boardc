@@ -49,7 +49,7 @@ boardc route <INPUT> [-o <OUT_BOARD_JSON>] [--reroute-nets NET,...] [--via-at-sm
 boardc zones <INPUT> [-o <OUT_BOARD_JSON>] [--report <REPORT_JSON>]
 boardc erc <INPUT> [--json]
 boardc drc <INPUT> [--kicad-drc <KICAD_DRC_JSON>] [--json]
-boardc fab <INPUT> -o <FAB_DIR> [--no-clip-silk] [--json]
+boardc fab <INPUT> -o <FAB_DIR> [--no-clip-silk] [--no-auto-refdes] [--auto-refdes rotate|upright|off] [--refdes-stroke-nm <NM>] [--json]
 boardc svg <INPUT> -o <OUT_SVG_OR_DIR> [--view top|bottom] [--layer <LAYER>] [--no-hotspots]
 boardc verify <INPUT> --fab-dir <FAB_DIR> [--json]
 boardc import-kicad <KICAD_PCB> [--pro <KICAD_PRO>] [-o <OUT_BOARD_JSON>]
@@ -100,4 +100,8 @@ outline = [
   { x = 30000000, y = 20000000 },
   { x = 0, y = 20000000 },
 ]
+
+[fab]
+auto_refdes = "upright" # false / "off" suppresses auto refdes & pin-1 dots; "rotate" (default)
+refdes_stroke_nm = 150000 # >= 10000 nm (0.01 mm), default 120000
 ```
