@@ -100,16 +100,7 @@ fn pad_world_shape_and_courtyard_transform() {
         pos: Pt::new(mm(5.0), mm(8.0)),
         rot_deg: 90.0,
         side: Side::Bottom,
-        locked: false,
-        pin_nets: BTreeMap::new(),
-        pin_types: BTreeMap::new(),
-        mpn: None,
-        lcsc: None,
-        dnp: false,
-        exclude_from_bom: false,
-        exclude_from_pos: false,
-        cpl_rotation_offset_deg: 0.0,
-        schematic: None,
+        ..Default::default()
     };
     let p1 = pad_to_world_shape(&fp.pads[0], &pl, 8);
     let b = p1.bbox();
@@ -226,7 +217,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             name: "VCC".into(),
             class: "Power".into(),
             pins: vec![("R1".into(), "1".into())],
-            ignore_route: false,
+            ..Default::default()
         },
     );
     let mut r1_nets = BTreeMap::new();
@@ -234,6 +225,8 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
 
     let spec = BoardSpec {
         name: "roundtrip_board".into(),
+        title: None,
+        revision: None,
         outline: vec![
             Pt::new(0, 0),
             Pt::new(mm(40.0), 0),
@@ -270,18 +263,9 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             footprint: "R_0402".into(),
             value: "1k".into(),
             pos: Pt::new(mm(10.0), mm(10.0)),
-            rot_deg: 0.0,
             side: Side::Top,
-            locked: false,
             pin_nets: r1_nets,
-            pin_types: BTreeMap::new(),
-            mpn: None,
-            lcsc: None,
-            dnp: false,
-            exclude_from_bom: false,
-            exclude_from_pos: false,
-            cpl_rotation_offset_deg: 0.0,
-            schematic: None,
+            ..Default::default()
         }],
         keepouts: vec![],
         pours: vec![PourSpec {
@@ -342,6 +326,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
         },
         graphics: vec![],
         stackup: Default::default(),
+        fab: Default::default(),
     };
 
     let tmp_dir = std::env::temp_dir().join("boardc_test_spec");
@@ -494,4 +479,311 @@ fn cli_skill_install_show_and_uninstall() {
     assert!(!installed.exists());
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn board_metadata_and_graphic_text_parsing_and_validation() {
+    let draco_toml = r#"
+name = "draco"
+title = "Draco Rev A1"
+revision = "A1"
+size_nm = [60_000_000, 50_000_000]
+
+[[graphics]]
+kind = "text"
+layer = "F.SilkS"
+text = "DRACO\nREV A1"
+pos = { x = 30_600_000, y = 32_000_000 }
+height_nm = 650_000
+stroke_nm = 150_000
+
+[[graphics]]
+kind = "text"
+layer = "B.SilkS"
+text = "BOT"
+pos = { x = 10_000_000, y = 12_000_000 }
+"#;
+    let spec: BoardSpec = toml::from_str(draco_toml).expect("parse issue #16 toml");
+    let ir = BoardIr::from_spec(&spec).expect("from_spec draco");
+    assert_eq!(ir.name, "draco");
+    assert_eq!(ir.title.as_deref(), Some("Draco Rev A1"));
+    assert_eq!(ir.revision.as_deref(), Some("A1"));
+    assert_eq!(ir.effective_title(), "Draco Rev A1");
+    assert_eq!(ir.effective_revision(), "A1");
+    assert_eq!(ir.graphics.len(), 2);
+    assert_eq!(
+        ir.graphics[0],
+        boardc::ir::Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "DRACO\nREV A1".into(),
+            pos: Pt::new(30_600_000, 32_000_000),
+            height_nm: 650_000,
+            stroke_nm: 150_000,
+            rot_deg: 0.0,
+        }
+    );
+    assert_eq!(
+        ir.graphics[1],
+        boardc::ir::Graphic::Text {
+            layer: "B.SilkS".into(),
+            text: "BOT".into(),
+            pos: Pt::new(10_000_000, 12_000_000),
+            height_nm: 1_000_000,
+            stroke_nm: 150_000,
+            rot_deg: 0.0,
+        }
+    );
+
+    // JSON round-trip preserves metadata and Graphic::Text.
+    let tmp_dir = std::env::temp_dir().join(format!("boardc_meta_text_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let ir_path = tmp_dir.join("draco.board.json");
+    save_board_json(&ir, &ir_path).unwrap();
+    let reloaded = load_board_json(&ir_path).unwrap();
+    assert_eq!(reloaded, ir);
+
+    // Whitespace-only title/revision normalize to None and fall back to name / "1".
+    let ws_spec = BoardSpec {
+        name: "fallback_board".into(),
+        title: Some("  \t ".into()),
+        revision: Some(" ".into()),
+        size_nm: Some([mm(20.0), mm(20.0)]),
+        ..Default::default()
+    };
+    let ws_ir = BoardIr::from_spec(&ws_spec).unwrap();
+    assert_eq!(ws_ir.title, None);
+    assert_eq!(ws_ir.revision, None);
+    assert_eq!(ws_ir.effective_title(), "fallback_board");
+    assert_eq!(ws_ir.effective_revision(), "1");
+
+    // Validation rejects non-positive height_nm/stroke_nm and non-finite rot_deg on board and fp.graphics.
+    for bad in [
+        boardc::ir::Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "BAD".into(),
+            pos: Pt::new(0, 0),
+            height_nm: 0,
+            stroke_nm: 150_000,
+            rot_deg: 0.0,
+        },
+        boardc::ir::Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "BAD".into(),
+            pos: Pt::new(0, 0),
+            height_nm: 700_000,
+            stroke_nm: -10,
+            rot_deg: 0.0,
+        },
+        boardc::ir::Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "BAD".into(),
+            pos: Pt::new(0, 0),
+            height_nm: 700_000,
+            stroke_nm: 150_000,
+            rot_deg: f64::NAN,
+        },
+    ] {
+        let mut bad_spec = ws_spec.clone();
+        bad_spec.graphics = vec![bad.clone()];
+        assert!(BoardIr::from_spec(&bad_spec).is_err());
+
+        let mut bad_fp_spec = ws_spec.clone();
+        bad_fp_spec.footprints.insert(
+            "BAD_FP".into(),
+            FootprintSpec::Custom {
+                pads: Vec::new(),
+                courtyard: Vec::new(),
+                graphics: vec![bad.clone()],
+                keepouts: Vec::new(),
+                models: Vec::new(),
+                pin_types: BTreeMap::new(),
+            },
+        );
+        assert!(BoardIr::from_spec(&bad_fp_spec).is_err());
+
+        let mut bad_ir = ws_ir.clone();
+        bad_ir.graphics = vec![bad.clone()];
+        assert!(boardc::spec::validate_board_ir_pins(&bad_ir, &ir_path).is_err());
+        if !matches!(&bad, boardc::ir::Graphic::Text { rot_deg, .. } if !rot_deg.is_finite()) {
+            save_board_json(&bad_ir, &ir_path).unwrap();
+            assert!(load_board_json(&ir_path).is_err());
+        }
+
+        let mut bad_fp_ir = ws_ir.clone();
+        bad_fp_ir.footprints.insert(
+            "BAD_FP".into(),
+            boardc::ir::FootprintDef {
+                name: "BAD_FP".into(),
+                pads: Vec::new(),
+                courtyard: Vec::new(),
+                graphics: vec![bad],
+                keepouts: Vec::new(),
+                models: Vec::new(),
+                pin_types: BTreeMap::new(),
+            },
+        );
+        assert!(boardc::spec::validate_board_ir_pins(&bad_fp_ir, &ir_path).is_err());
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn custom_footprint_models_roundtrip_to_kicad_and_rejects_degenerate_courtyard() {
+    use boardc::ir::Model3d;
+    use boardc::kicad_io::parse_kicad_pcb;
+    use boardc::spec::validate_board_ir_pins;
+
+    let toml_spec = r#"
+name = "custom_models"
+size_nm = [20000000, 20000000]
+
+[footprints.USB_C]
+kind = "custom"
+courtyard = [
+  { x = -2000000, y = -2000000 },
+  { x = 2000000, y = -2000000 },
+  { x = 2000000, y = 2000000 },
+  { x = -2000000, y = 2000000 },
+]
+[[footprints.USB_C.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "rect", width = 1000000, height = 1000000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu", "F.Mask"]
+
+[[footprints.USB_C.models]]
+path = "${KICAD8_3DMODEL_DIR}/Connector_USB.3dshapes/USB_C.step"
+offset_mm = [0.0, 0.0, 0.5]
+scale = [1.0, 1.0, 1.0]
+rotate_deg = [0.0, 0.0, 90.0]
+
+[[footprints.USB_C.models]]
+path = "models/default_scale.step"
+offset_mm = [1.0, -2.0, 0.25]
+rotate_deg = [15.0, 0.0, 0.0]
+
+[[placements]]
+refdes = "J1"
+footprint = "USB_C"
+pos = { x = 10000000, y = 10000000 }
+allow_edge_overhang = true
+"#;
+    let spec: BoardSpec = toml::from_str(toml_spec).unwrap();
+    let ir = BoardIr::from_spec(&spec).unwrap();
+    assert!(ir.placements[0].allow_edge_overhang);
+    assert_eq!(ir.footprints["USB_C"].models.len(), 2);
+    assert_eq!(
+        ir.footprints["USB_C"].models[0].path,
+        "${KICAD8_3DMODEL_DIR}/Connector_USB.3dshapes/USB_C.step"
+    );
+    assert_eq!(ir.footprints["USB_C"].models[1].scale, [1.0, 1.0, 1.0]);
+
+    let kicad = boardc::kicad_export::render_kicad_pcb(&ir);
+    assert!(kicad.contains("(model \"${KICAD8_3DMODEL_DIR}/Connector_USB.3dshapes/USB_C.step\""));
+    assert!(kicad.contains("(offset (xyz 0.000000 0.000000 0.500000))"));
+    assert!(kicad.contains("(rotate (xyz 0.000000 0.000000 90.000000))"));
+
+    let rt = parse_kicad_pcb(&kicad, None).expect("round-trip exported pcb with models");
+    let rt_fp = &rt.footprints[&rt.placements[0].footprint];
+    assert_eq!(rt_fp.models.len(), 2);
+    assert_eq!(
+        rt_fp.models[0],
+        Model3d {
+            path: "${KICAD8_3DMODEL_DIR}/Connector_USB.3dshapes/USB_C.step".into(),
+            offset_mm: [0.0, 0.0, 0.5],
+            scale: [1.0, 1.0, 1.0],
+            rotate_deg: [0.0, 0.0, 90.0],
+        }
+    );
+    assert_eq!(
+        rt_fp.models[1],
+        Model3d {
+            path: "models/default_scale.step".into(),
+            offset_mm: [1.0, -2.0, 0.25],
+            scale: [1.0, 1.0, 1.0],
+            rotate_deg: [15.0, 0.0, 0.0],
+        }
+    );
+
+    // Reject <3 vertex, collinear/zero-area courtyards, empty model path, zero scale, and non-finite floats on BoardSpec.
+    let bad_cy = toml_spec.replace(
+        "  { x = 2000000, y = 2000000 },\n  { x = -2000000, y = 2000000 },\n",
+        "",
+    );
+    assert!(BoardIr::from_spec(&toml::from_str(&bad_cy).unwrap()).is_err());
+
+    let collinear_cy = toml_spec.replace(
+        "  { x = 2000000, y = 2000000 },\n  { x = -2000000, y = 2000000 },\n",
+        "  { x = 0, y = -2000000 },\n",
+    );
+    assert!(BoardIr::from_spec(&toml::from_str(&collinear_cy).unwrap()).is_err());
+
+    let empty_model = toml_spec.replace("path = \"models/default_scale.step\"", "path = \"   \"");
+    assert!(BoardIr::from_spec(&toml::from_str(&empty_model).unwrap()).is_err());
+
+    let zero_scale = toml_spec.replace("scale = [1.0, 1.0, 1.0]", "scale = [1.0, 0.0, 1.0]");
+    assert!(BoardIr::from_spec(&toml::from_str(&zero_scale).unwrap()).is_err());
+
+    let nan_offset =
+        toml_spec.replace("offset_mm = [0.0, 0.0, 0.5]", "offset_mm = [nan, 0.0, 0.5]");
+    assert!(toml::from_str::<BoardSpec>(&nan_offset).is_err());
+
+    for (idx, val) in [
+        (0usize, f64::NAN),
+        (1, f64::INFINITY),
+        (2, f64::NEG_INFINITY),
+    ] {
+        let mut bad_spec = spec.clone();
+        let FootprintSpec::Custom { models, .. } = bad_spec.footprints.get_mut("USB_C").unwrap()
+        else {
+            unreachable!()
+        };
+        match idx {
+            0 => models[0].offset_mm[0] = val,
+            1 => models[0].scale[1] = val,
+            _ => models[0].rotate_deg[2] = val,
+        }
+        assert!(BoardIr::from_spec(&bad_spec).is_err());
+    }
+
+    // Reject the same invalid courtyards and models when loaded from BoardIr JSON.
+    let tmp_dir = std::env::temp_dir().join(format!("boardc_ir_val_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let ir_path = tmp_dir.join("bad.board.json");
+
+    for mut bad_ir in [
+        {
+            let mut b = ir.clone();
+            b.footprints.get_mut("USB_C").unwrap().courtyard = vec![Pt::new(0, 0), Pt::new(1, 0)];
+            b
+        },
+        {
+            let mut b = ir.clone();
+            b.footprints.get_mut("USB_C").unwrap().courtyard =
+                vec![Pt::new(0, 0), Pt::new(1000, 0), Pt::new(2000, 0)];
+            b
+        },
+        {
+            let mut b = ir.clone();
+            b.footprints.get_mut("USB_C").unwrap().models[0].path = " \t ".into();
+            b
+        },
+        {
+            let mut b = ir.clone();
+            b.footprints.get_mut("USB_C").unwrap().models[0].scale = [1.0, 0.0, 1.0];
+            b
+        },
+    ] {
+        let _ = &mut bad_ir;
+        save_board_json(&bad_ir, &ir_path).unwrap();
+        assert!(load_board_json(&ir_path).is_err());
+    }
+
+    let mut inf_ir = ir;
+    inf_ir.footprints.get_mut("USB_C").unwrap().models[0].rotate_deg[0] = f64::INFINITY;
+    assert!(validate_board_ir_pins(&inf_ir, &ir_path).is_err());
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

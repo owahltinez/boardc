@@ -37,6 +37,7 @@ mod route_bridge;
 pub mod shapes;
 pub mod spec;
 mod spec_kicad;
+mod stroke_text;
 pub mod svg;
 pub mod verify;
 mod verify_excellon;

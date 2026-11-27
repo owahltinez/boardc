@@ -17,6 +17,7 @@ use crate::ir::{BBoxNm, Graphic, Nm, PadDef, PadShape, Placement, Pt, nm_to_mm, 
 use crate::shapes::{
     ResolvedShape, circle_poly, pad_to_world_shape, paths64_to_polys, pts_to_path64,
 };
+use crate::stroke_text::text_graphic_segments;
 
 pub(crate) fn gerber_coord_format() -> CoordinateFormat {
     CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 4, 6)
@@ -331,6 +332,13 @@ impl GerberBuilder {
                     self.fill_region(&pts, Polarity::Dark);
                 } else {
                     self.stroke_closed_poly(&pts, *width);
+                }
+            }
+            Graphic::Text { .. } => {
+                if let Some((segs, w)) = text_graphic_segments(g) {
+                    for (a, b) in segs {
+                        self.stroke_segment(map_pt(a), map_pt(b), w);
+                    }
                 }
             }
         }

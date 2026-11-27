@@ -32,7 +32,7 @@ pub(crate) fn emit_gbrjob(
         "ProjectId": {
             "Name": board.name,
             "GUID": project_guid(&board.name),
-            "Revision": "1",
+            "Revision": board.effective_revision(),
         },
         "Size": {
             "X": nm_to_mm(bbox.width()),
@@ -185,6 +185,13 @@ pub(crate) fn verify_gbrjob(
     {
         return Err(format!(
             "Gerber job '{}' BoardThickness mismatch (expected {exp_thick})",
+            job_path.display()
+        ));
+    }
+    let exp_rev = board.effective_revision();
+    if specs["ProjectId"]["Revision"].as_str() != Some(exp_rev) {
+        return Err(format!(
+            "Gerber job '{}' ProjectId.Revision mismatch (expected '{exp_rev}')",
             job_path.display()
         ));
     }
