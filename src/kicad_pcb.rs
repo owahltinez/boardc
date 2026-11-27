@@ -237,6 +237,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
         constraints: Constraints::default(),
         graphics,
         stackup,
+        fab: Default::default(),
     })
 }
 
