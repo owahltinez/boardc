@@ -81,14 +81,10 @@ pub fn validate_tune_targets(board: &BoardIr, targets: &HashSet<String>) -> Resu
 }
 
 fn net_allowed(board: &BoardIr, net: &str, cfg: &TuneOptions) -> bool {
-    let nd = board.nets.get(net);
-    if nd.is_some_and(|n| n.ignore_route) {
+    if board.is_net_ignored(net, &cfg.ignored_nets) {
         return false;
     }
-    let class_name = nd.map_or("Default", |n| n.class.as_str());
-    if cfg.ignored_nets.contains(net) || cfg.ignored_nets.contains(class_name) {
-        return false;
-    }
+    let class_name = board.nets.get(net).map_or("Default", |n| n.class.as_str());
     cfg.only_nets
         .as_ref()
         .is_none_or(|only| only.contains(net) || only.contains(class_name))

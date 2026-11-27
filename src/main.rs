@@ -130,6 +130,9 @@ enum Command {
         no_cache: bool,
         #[arg(long)]
         fail_on_preflight: bool,
+        /// Bounded post-route hotspot auto-repair passes before final zone fill and length tuning.
+        #[arg(long, default_value_t = 0)]
+        repair_passes: usize,
         #[command(flatten)]
         route: RouteArgs,
         #[arg(long)]
@@ -481,6 +484,7 @@ fn run(cli: Cli) -> Result<(), String> {
             cache_dir,
             no_cache,
             fail_on_preflight,
+            repair_passes,
             route,
             json,
         } => {
@@ -490,6 +494,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 cache_dir,
                 use_cache: !no_cache,
                 fail_on_preflight,
+                repair_passes,
                 route: route.into_options(),
                 ..Default::default()
             };

@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use boardc::drc::ViolationKind;
-use boardc::ir::{BoardIr, MaxLengthRule, load_spec_file};
+use boardc::ir::{
+    BoardIr, BoardSpec, FilledPour, MatchGroupRule, MaxLengthRule, PourPoly, Pt, Track, Via,
+    load_spec_file, mm,
+};
 use boardc::pipeline::{BuildOptions, StageKind, compile_board, content_hash_hex};
 
 fn four_layer_bga_toml() -> &'static str {
@@ -469,4 +472,1131 @@ fn regression_cache_keys_invalidate_place_preflight_and_isolate_route_seeds() {
     );
 
     let _ = fs::remove_dir_all(&tmp);
+}
+
+fn boxed_crossing_board_toml(with_plane_and_sig_b: bool) -> String {
+    let mut toml = String::from(
+        r#"
+name = "boxed_repair"
+size_nm = [30000000, 26000000]
+
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+
+[footprints.PAD1]
+kind = "custom"
+[[footprints.PAD1.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+
+[[placements]]
+refdes = "P_A1"
+footprint = "PAD1"
+pos = { x = 10000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "P_A2"
+footprint = "PAD1"
+pos = { x = 16000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "P_N1"
+footprint = "PAD1"
+pos = { x = 14000000, y = 14500000 }
+locked = true
+pin_nets = { "1" = "SIG_N1" }
+
+[[placements]]
+refdes = "P_N2"
+footprint = "PAD1"
+pos = { x = 14000000, y = 11500000 }
+locked = true
+pin_nets = { "1" = "SIG_N1" }
+
+[[placements]]
+refdes = "P_M1"
+footprint = "PAD1"
+pos = { x = 13300000, y = 17000000 }
+locked = true
+pin_nets = { "1" = "SIG_N2" }
+
+[[placements]]
+refdes = "P_M2"
+footprint = "PAD1"
+pos = { x = 13300000, y = 9000000 }
+locked = true
+pin_nets = { "1" = "SIG_N2" }
+
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+edge_clearance_nm = 300000
+"#,
+    );
+    if with_plane_and_sig_b {
+        toml.push_str(
+            r#"
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+
+[[layers]]
+name = "B.Cu"
+kind = "plane"
+side = "bottom"
+
+[footprints.THT1]
+kind = "custom"
+[[footprints.THT1.pads]]
+name = "1"
+kind = "tht"
+shape = { shape = "circle", diameter = 1000000 }
+drill_nm = 500000
+pos = { x = 0, y = 0 }
+layers = ["F.Cu", "B.Cu"]
+
+[[placements]]
+refdes = "P_B1"
+footprint = "PAD1"
+pos = { x = 5000000, y = 4000000 }
+locked = true
+pin_nets = { "1" = "SIG_B" }
+
+[[placements]]
+refdes = "P_B2"
+footprint = "PAD1"
+pos = { x = 13000000, y = 4000000 }
+locked = true
+pin_nets = { "1" = "SIG_B" }
+
+[[placements]]
+refdes = "G1"
+footprint = "THT1"
+pos = { x = 4000000, y = 22000000 }
+locked = true
+pin_nets = { "1" = "GND" }
+
+[[placements]]
+refdes = "G2"
+footprint = "THT1"
+pos = { x = 26000000, y = 22000000 }
+locked = true
+pin_nets = { "1" = "GND" }
+
+[[pours]]
+name = "GND_PLANE"
+net = "GND"
+layer = "B.Cu"
+outline = [
+  { x = 500000, y = 500000 },
+  { x = 29500000, y = 500000 },
+  { x = 29500000, y = 25500000 },
+  { x = 500000, y = 25500000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+"#,
+        );
+    }
+    toml
+}
+
+fn boxed_cfg(repair_passes: usize, reroute_sig_a: bool) -> BuildOptions {
+    let mut cfg = BuildOptions {
+        use_cache: false,
+        emit_outputs: false,
+        repair_passes,
+        ..Default::default()
+    };
+    cfg.route.max_passes = 20;
+    cfg.route.multi_start = 1;
+    if reroute_sig_a {
+        cfg.route.reroute_nets = Some(HashSet::from(["SIG_A".to_string()]));
+        cfg.route.reroute_pad_mm = Some(0.5);
+    }
+    cfg
+}
+
+fn add_cage_tracks(board: &mut BoardIr, locked: bool) {
+    let w = mm(0.2);
+    for (a, b, net) in [
+        (
+            Pt::new(mm(14.0), mm(14.5)),
+            Pt::new(mm(18.0), mm(14.5)),
+            "SIG_N1",
+        ),
+        (
+            Pt::new(mm(18.0), mm(14.5)),
+            Pt::new(mm(18.0), mm(11.5)),
+            "SIG_N1",
+        ),
+        (
+            Pt::new(mm(18.0), mm(11.5)),
+            Pt::new(mm(14.0), mm(11.5)),
+            "SIG_N1",
+        ),
+        (
+            Pt::new(mm(13.3), mm(17.0)),
+            Pt::new(mm(13.3), mm(9.0)),
+            "SIG_N2",
+        ),
+    ] {
+        board.tracks.push(Track {
+            net: net.into(),
+            layer: "F.Cu".into(),
+            a,
+            b,
+            width: w,
+            locked,
+        });
+    }
+}
+
+#[test]
+fn repair_passes_widens_boxed_cluster_to_neighbors_and_caches_cleanly() {
+    let tmp = fresh_tmp_dir("repair_widening");
+    let cache_dir = tmp.join("cache");
+    let board_path = tmp.join("boxed.board.json");
+
+    let spec: BoardSpec = toml::from_str(&boxed_crossing_board_toml(false)).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    add_cage_tracks(&mut board, false);
+    boardc::ir::save_board_json(&board, &board_path).unwrap();
+
+    let mut base_cfg = boxed_cfg(0, true);
+    base_cfg.cache_dir = cache_dir.clone();
+    base_cfg.use_cache = true;
+
+    // 0 repair passes preserves existing behavior and fails with OpenNet on boxed-in SIG_A.
+    let r0 = compile_board(board.clone(), &base_cfg).unwrap();
+    assert!(!r0.ok);
+    assert_eq!(r0.route.repair_passes_run, 0);
+    assert_eq!(r0.route.unconnected_pairs, 1);
+
+    // 1 repair pass only retries affected_nets (SIG_A), still deadlocks, and stays bounded.
+    let mut cfg1 = base_cfg.clone();
+    cfg1.repair_passes = 1;
+    let r1 = compile_board(board.clone(), &cfg1).unwrap();
+    assert!(!r1.ok);
+    assert_eq!(r1.route.repair_passes_run, 1);
+    assert_eq!(r1.route.unconnected_pairs, 1);
+    assert!(r1.stage_hit(StageKind::Place));
+    assert!(!r1.stage_hit(StageKind::Route));
+
+    // 3 repair passes widens on pass 2 to unlocked neighbor SIG_N1 + wider pad and resolves DRC.
+    let mut cfg3 = base_cfg.clone();
+    cfg3.repair_passes = 3;
+    let r3 = compile_board(board.clone(), &cfg3).unwrap();
+    assert!(r3.ok, "expected repair_passes=3 to succeed: {:?}", r3.drc);
+    assert_eq!(r3.route.repair_passes_run, 2);
+    assert_eq!(r3.route.unconnected_pairs, 0);
+    assert!(r3.drc.passed);
+
+    // Warm cache hit for repair_passes=3 and no collision with repair_passes=0.
+    let r3_warm = compile_board(board.clone(), &cfg3).unwrap();
+    assert!(r3_warm.stages.iter().all(|s| s.cache_hit));
+    assert_eq!(r3_warm.route.repair_passes_run, 2);
+    assert_eq!(r3_warm.board.tracks, r3.board.tracks);
+
+    let r0_warm = compile_board(board, &base_cfg).unwrap();
+    assert!(!r0_warm.ok);
+    assert!(r0_warm.stage_hit(StageKind::Route));
+    assert_eq!(r0_warm.route.repair_passes_run, 0);
+
+    // Verify CLI `--repair-passes 3` parses and hits the populated route cache.
+    let out_dir = tmp.join("cli_out");
+    let cli_out = Command::new(env!("CARGO_BIN_EXE_boardc"))
+        .args([
+            "build",
+            board_path.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--cache-dir",
+            cache_dir.to_str().unwrap(),
+            "--reroute-nets",
+            "SIG_A",
+            "--reroute-pad-mm",
+            "0.5",
+            "--max-passes",
+            "20",
+            "--multi-start",
+            "1",
+            "--repair-passes",
+            "3",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cli_out.status.success(),
+        "cli build failed: {}",
+        String::from_utf8_lossy(&cli_out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&cli_out.stdout).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["route"]["repair_passes_run"], 2);
+    assert_eq!(json["drc"]["error_count"], 0);
+    let stages = json["stages"].as_array().unwrap();
+    assert!(stages.iter().all(|s| s["cache_hit"] == true));
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn repair_defers_match_group_tuning_ignores_plane_opens_and_stops_bounded() {
+    let tmp = fresh_tmp_dir("repair_mg_bounded");
+
+    // 1. Boxed-in board with B.Cu GND plane pour + match_group deferred until after repair.
+    let spec: BoardSpec = toml::from_str(&boxed_crossing_board_toml(true)).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    board.constraints.match_groups = vec![MatchGroupRule {
+        name: "MG_AB".into(),
+        nets: vec!["SIG_A".into(), "SIG_B".into()],
+        tolerance_nm: mm(0.5),
+        target_nm: None,
+    }];
+    add_cage_tracks(&mut board, false);
+    board.tracks.push(Track {
+        net: "SIG_B".into(),
+        layer: "F.Cu".into(),
+        a: Pt::new(mm(5.0), mm(4.0)),
+        b: Pt::new(mm(13.0), mm(4.0)),
+        width: mm(0.2),
+        locked: false,
+    });
+
+    let cfg = boxed_cfg(3, true);
+    let rep = compile_board(board, &cfg).unwrap();
+    assert!(
+        rep.ok,
+        "expected clean tuned+zoned build: pv={:?} pf_ok={} route={:?} zones={:?} drc={:?}",
+        rep.power_via, rep.preflight.ok, rep.route, rep.zones, rep.drc
+    );
+    assert!(
+        (2..=3).contains(&rep.route.repair_passes_run),
+        "expected 2..=3 repair passes, got {}",
+        rep.route.repair_passes_run
+    );
+    assert_eq!(rep.route.length_violations, 0);
+    assert!(!rep.board.filled_pours.is_empty());
+    assert!(rep.drc.passed);
+
+    // 2. Clean initial route stops early with 0 repair passes executed.
+    let clean_spec: BoardSpec = toml::from_str(&boxed_crossing_board_toml(false)).unwrap();
+    let clean_board = BoardIr::from_spec(&clean_spec).unwrap();
+    let clean_rep = compile_board(clean_board, &boxed_cfg(5, false)).unwrap();
+    assert!(clean_rep.ok);
+    assert_eq!(clean_rep.route.repair_passes_run, 0);
+
+    // 3. Non-improving widening candidate (rips up pre-routed SIG_N1 through locked gap) rolls back tracks/vias exactly.
+    let mut unfixable = BoardIr::from_spec(&clean_spec).unwrap();
+    for (a, b, net, locked) in [
+        (
+            Pt::new(mm(15.2), mm(13.8)),
+            Pt::new(mm(16.8), mm(13.8)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(16.8), mm(13.8)),
+            Pt::new(mm(16.8), mm(12.2)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(16.8), mm(12.2)),
+            Pt::new(mm(15.2), mm(12.2)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(15.2), mm(12.2)),
+            Pt::new(mm(15.2), mm(13.8)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(13.3), mm(15.2)),
+            Pt::new(mm(14.7), mm(15.2)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(14.7), mm(15.2)),
+            Pt::new(mm(14.7), mm(10.8)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(14.7), mm(10.8)),
+            Pt::new(mm(13.3), mm(10.8)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(13.3), mm(10.8)),
+            Pt::new(mm(13.3), mm(15.2)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(13.3), mm(17.0)),
+            Pt::new(mm(13.2), mm(16.9)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(13.2), mm(16.9)),
+            Pt::new(mm(13.2), mm(9.1)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(13.2), mm(9.1)),
+            Pt::new(mm(13.3), mm(9.0)),
+            "SIG_N2",
+            true,
+        ),
+        (
+            Pt::new(mm(14.0), mm(14.5)),
+            Pt::new(mm(14.0), mm(11.5)),
+            "SIG_N1",
+            false,
+        ),
+    ] {
+        unfixable.tracks.push(Track {
+            net: net.into(),
+            layer: "F.Cu".into(),
+            a,
+            b,
+            width: mm(0.2),
+            locked,
+        });
+    }
+    let expected_tracks = unfixable.tracks.clone();
+    let expected_vias = unfixable.vias.clone();
+    let mut bounded_cfg = boxed_cfg(2, true);
+    bounded_cfg.route.resume = true;
+    let unfix_rep = compile_board(unfixable, &bounded_cfg).unwrap();
+    assert!(!unfix_rep.ok);
+    assert_eq!(unfix_rep.route.repair_passes_run, 2);
+    assert_eq!(unfix_rep.board.tracks, expected_tracks);
+    assert_eq!(unfix_rep.board.vias, expected_vias);
+
+    // 4. Route seeds stay isolated between repair_passes=0 and repair_passes>0, and --reroute-nets reuses base seed=0.
+    let seed_cache = tmp.join("seed_cache");
+    let light_board = BoardIr::from_spec(&clean_spec).unwrap();
+    let mut s0 = boxed_cfg(0, false);
+    s0.use_cache = true;
+    s0.cache_dir = seed_cache.clone();
+    let mut s3 = s0.clone();
+    s3.repair_passes = 3;
+    let r_s0 = compile_board(light_board.clone(), &s0).unwrap();
+    assert!(r_s0.ok);
+    assert!(compile_board(light_board.clone(), &s3).unwrap().ok);
+    let seed_count = fs::read_dir(&seed_cache)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("route_seed_"))
+        })
+        .count();
+    assert_eq!(seed_count, 2);
+
+    // Cross-mode fallback: --reroute-nets SIG_A --repair-passes 2 reuses the repair_passes=0 seed in a fresh cache with only s0.
+    let cross_cache = tmp.join("cross_cache");
+    let mut c0 = boxed_cfg(0, false);
+    c0.use_cache = true;
+    c0.cache_dir = cross_cache.clone();
+    let rc0 = compile_board(light_board.clone(), &c0).unwrap();
+    assert!(rc0.ok);
+    let sig_n1_s0: Vec<_> = rc0
+        .board
+        .tracks
+        .iter()
+        .filter(|t| t.net == "SIG_N1")
+        .collect();
+    let mut c2_reroute = boxed_cfg(2, true);
+    c2_reroute.use_cache = true;
+    c2_reroute.cache_dir = cross_cache;
+    let rc2 = compile_board(light_board, &c2_reroute).unwrap();
+    assert!(
+        rc2.ok,
+        "expected cross-mode seed fallback to preserve SIG_N1/SIG_N2: {:?}",
+        rc2.drc
+    );
+    let sig_n1_c2: Vec<_> = rc2
+        .board
+        .tracks
+        .iter()
+        .filter(|t| t.net == "SIG_N1")
+        .collect();
+    assert_eq!(sig_n1_s0, sig_n1_c2);
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn repair_full_board_without_reroute_nets_fixes_boxed_cluster() {
+    let spec: BoardSpec = toml::from_str(&boxed_crossing_board_toml(false)).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    add_cage_tracks(&mut board, false);
+    // With resume=true and max_passes=0, initial full-board routing keeps the cage and leaves SIG_A open;
+    // repair_passes=3 widens without pre-specified --reroute-nets and resolves it.
+    let mut cfg = boxed_cfg(3, false);
+    cfg.route.resume = true;
+    cfg.route.max_passes = 0;
+    let mut c0 = cfg.clone();
+    c0.repair_passes = 0;
+    assert!(!compile_board(board.clone(), &c0).unwrap().ok);
+    let rep = compile_board(board, &cfg).unwrap();
+    assert!(
+        rep.ok,
+        "expected full-board repair to succeed: {:?}",
+        rep.drc
+    );
+    assert!((1..=3).contains(&rep.route.repair_passes_run));
+    assert_eq!(rep.route.unconnected_pairs, 0);
+    assert!(rep.drc.passed);
+}
+
+#[test]
+fn repair_ignores_stale_filled_pours_and_skips_signal_pour_dangling_opens() {
+    // 1. Stale filled_pours overlapping SIG_A must be cleared before repair when board.pours is non-empty.
+    let spec: BoardSpec = toml::from_str(&boxed_crossing_board_toml(true)).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    add_cage_tracks(&mut board, false);
+    board.tracks.push(Track {
+        net: "SIG_B".into(),
+        layer: "F.Cu".into(),
+        a: Pt::new(mm(5.0), mm(4.0)),
+        b: Pt::new(mm(13.0), mm(4.0)),
+        width: mm(0.2),
+        locked: false,
+    });
+    board.filled_pours.push(FilledPour {
+        net: "GND".into(),
+        layer: "F.Cu".into(),
+        priority: 0,
+        polys: vec![PourPoly {
+            outer: vec![
+                Pt::new(mm(1.0), mm(1.0)),
+                Pt::new(mm(29.0), mm(1.0)),
+                Pt::new(mm(29.0), mm(25.0)),
+                Pt::new(mm(1.0), mm(25.0)),
+            ],
+            holes: Vec::new(),
+        }],
+    });
+    let rep = compile_board(board, &boxed_cfg(3, true)).unwrap();
+    assert!(
+        rep.ok,
+        "stale filled_pours must not cause phantom errors: {:?}",
+        rep.drc
+    );
+    assert!(rep.drc.passed);
+
+    // 2. Signal-layer pour net (LayerKind::Signal + PourSpec + power/thermal vias) must not trigger bogus repair passes.
+    let sig_pour_toml = r#"
+name = "signal_pour_2layer"
+size_nm = [24000000, 20000000]
+
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+
+[footprints.PAD1]
+kind = "custom"
+[[footprints.PAD1.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+
+[[placements]]
+refdes = "G1"
+footprint = "PAD1"
+pos = { x = 5000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "GND" }
+
+[[placements]]
+refdes = "G2"
+footprint = "PAD1"
+pos = { x = 19000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "GND" }
+
+[[placements]]
+refdes = "S1"
+footprint = "PAD1"
+pos = { x = 8000000, y = 5000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "S2"
+footprint = "PAD1"
+pos = { x = 16000000, y = 5000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[pours]]
+name = "GND_BOT"
+net = "GND"
+layer = "B.Cu"
+outline = [
+  { x = 500000, y = 500000 },
+  { x = 23500000, y = 500000 },
+  { x = 23500000, y = 19500000 },
+  { x = 500000, y = 19500000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+edge_clearance_nm = 300000
+via_at_smd = true
+"#;
+    let sp_spec: BoardSpec = toml::from_str(sig_pour_toml).unwrap();
+    let mut sp_board = BoardIr::from_spec(&sp_spec).unwrap();
+    // Pre-drop thermal vias on GND SMD pads to B.Cu pour; pre-zone DRC sees ViaDangling/OpenNet on GND.
+    for x in [mm(5.0), mm(19.0)] {
+        sp_board.vias.push(Via {
+            net: "GND".into(),
+            pos: Pt::new(x, mm(10.0)),
+            diameter: mm(0.45),
+            drill: mm(0.2),
+            layers: ("F.Cu".into(), "B.Cu".into()),
+            locked: false,
+            tented: true,
+        });
+    }
+    let mut sp_cfg = boxed_cfg(3, false);
+    sp_cfg.route.ignored_nets.insert("GND".into());
+    sp_cfg.route.resume = true;
+    // Also test without ignored_nets so GND is literally a non-ignored signal-layer pour net.
+    sp_cfg.route.ignored_nets.clear();
+    let sp_rep = compile_board(sp_board, &sp_cfg).unwrap();
+    assert!(
+        sp_rep.ok,
+        "expected signal-layer pour board to pass: {:?}",
+        sp_rep.drc
+    );
+    assert_eq!(sp_rep.route.repair_passes_run, 0);
+}
+
+#[test]
+fn repair_scopes_reroute_nets_and_tunes_match_group_partners() {
+    let toml = r#"
+name = "scope_and_mg_partners"
+size_nm = [30000000, 26000000]
+
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+
+[footprints.PAD1]
+kind = "custom"
+[[footprints.PAD1.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+
+[[placements]]
+refdes = "P_A1"
+footprint = "PAD1"
+pos = { x = 10000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "P_A2"
+footprint = "PAD1"
+pos = { x = 16000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "P_N1"
+footprint = "PAD1"
+pos = { x = 14000000, y = 14500000 }
+locked = true
+pin_nets = { "1" = "SIG_N1" }
+
+[[placements]]
+refdes = "P_N2"
+footprint = "PAD1"
+pos = { x = 14000000, y = 11500000 }
+locked = true
+pin_nets = { "1" = "SIG_N1" }
+
+[[placements]]
+refdes = "P_M1"
+footprint = "PAD1"
+pos = { x = 13300000, y = 17000000 }
+locked = true
+pin_nets = { "1" = "SIG_N2" }
+
+[[placements]]
+refdes = "P_M2"
+footprint = "PAD1"
+pos = { x = 13300000, y = 9000000 }
+locked = true
+pin_nets = { "1" = "SIG_N2" }
+
+[[placements]]
+refdes = "P_P1"
+footprint = "PAD1"
+pos = { x = 5000000, y = 21000000 }
+locked = true
+pin_nets = { "1" = "SIG_P" }
+
+[[placements]]
+refdes = "P_P2"
+footprint = "PAD1"
+pos = { x = 10000000, y = 21000000 }
+locked = true
+pin_nets = { "1" = "SIG_P" }
+
+[[placements]]
+refdes = "P_B1"
+footprint = "PAD1"
+pos = { x = 4000000, y = 3000000 }
+locked = true
+pin_nets = { "1" = "NET_B" }
+
+[[placements]]
+refdes = "P_B2"
+footprint = "PAD1"
+pos = { x = 10000000, y = 3000000 }
+locked = true
+pin_nets = { "1" = "NET_B" }
+
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+edge_clearance_nm = 300000
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    add_cage_tracks(&mut board, false);
+    // Partner SIG_P is shorter (5 mm) than widened SIG_N1 (>= 8 mm); widening SIG_N1 requires tuning SIG_P.
+    board.constraints.match_groups = vec![MatchGroupRule {
+        name: "MG_N1_P".into(),
+        nets: vec!["SIG_N1".into(), "SIG_P".into()],
+        tolerance_nm: mm(0.5),
+        target_nm: None,
+    }];
+    board.tracks.push(Track {
+        net: "SIG_P".into(),
+        layer: "F.Cu".into(),
+        a: Pt::new(mm(5.0), mm(21.0)),
+        b: Pt::new(mm(10.0), mm(21.0)),
+        width: mm(0.2),
+        locked: false,
+    });
+    // Unrelated violation on NET_B (connected with a dangling stub near edge) outside SIG_A scope must remain untouched.
+    let net_b_tracks = vec![
+        Track {
+            net: "NET_B".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(4.0), mm(3.0)),
+            b: Pt::new(mm(10.0), mm(3.0)),
+            width: mm(0.2),
+            locked: false,
+        },
+        Track {
+            net: "NET_B".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(4.0), mm(3.0)),
+            b: Pt::new(mm(4.0), mm(0.15)),
+            width: mm(0.2),
+            locked: false,
+        },
+    ];
+    board.tracks.extend(net_b_tracks.clone());
+
+    let rep = compile_board(board, &boxed_cfg(2, true)).unwrap();
+    assert_eq!(rep.route.unconnected_pairs, 0);
+    assert!((1..=3).contains(&rep.route.repair_passes_run));
+    assert_eq!(
+        rep.route.length_violations, 0,
+        "expected SIG_P partner to be tuned: tracks={:?} drc={:?}",
+        rep.board.tracks, rep.drc
+    );
+    let actual_net_b: Vec<_> = rep
+        .board
+        .tracks
+        .iter()
+        .filter(|t| t.net == "NET_B")
+        .cloned()
+        .collect();
+    assert_eq!(actual_net_b, net_b_tracks);
+    // Only NET_B's untouched violations remain.
+    assert!(
+        rep.drc
+            .violations
+            .iter()
+            .all(|v| v.net_a == "NET_B" || v.net_b == "NET_B"),
+        "expected only untouched NET_B violations, got {:?}",
+        rep.drc.violations
+    );
+}
+
+#[test]
+fn repair_ignores_fixed_pad_and_locked_copper_violations() {
+    let toml = r#"
+name = "fixed_violations_ignored"
+size_nm = [24000000, 20000000]
+
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+
+[footprints.PAD1]
+kind = "custom"
+[[footprints.PAD1.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+
+[[placements]]
+refdes = "F1"
+footprint = "PAD1"
+pos = { x = 5000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "FIX1" }
+
+[[placements]]
+refdes = "F2"
+footprint = "PAD1"
+pos = { x = 5650000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "FIX2" }
+
+[[placements]]
+refdes = "A1"
+footprint = "PAD1"
+pos = { x = 12000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "A2"
+footprint = "PAD1"
+pos = { x = 18000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+edge_clearance_nm = 300000
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    // Add a locked dangling track too.
+    board.tracks.push(Track {
+        net: "FIX1".into(),
+        layer: "F.Cu".into(),
+        a: Pt::new(mm(5.0), mm(10.0)),
+        b: Pt::new(mm(5.0), mm(12.0)),
+        width: mm(0.2),
+        locked: true,
+    });
+    let mut cfg = boxed_cfg(3, false);
+    cfg.route.ignored_nets.insert("FIX1".into());
+    cfg.route.ignored_nets.insert("FIX2".into());
+    // Clear ignored_nets so F1/F2 pad-to-pad clearance is actually evaluated by DRC.
+    cfg.route.ignored_nets.clear();
+    let rep = compile_board(board, &cfg).unwrap();
+    assert_eq!(rep.route.unconnected_pairs, 0);
+    assert_eq!(rep.route.repair_passes_run, 0);
+}
+
+#[test]
+fn repair_long_open_net_finds_pad_local_cage_neighbors() {
+    let toml = r#"
+name = "long_net_pad_cage"
+size_nm = [32000000, 26000000]
+
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+
+[footprints.PAD1]
+kind = "custom"
+[[footprints.PAD1.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+
+[[placements]]
+refdes = "P_A1"
+footprint = "PAD1"
+pos = { x = 4000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "P_A2"
+footprint = "PAD1"
+pos = { x = 24000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "P_N1"
+footprint = "PAD1"
+pos = { x = 22500000, y = 14500000 }
+locked = true
+pin_nets = { "1" = "SIG_N1" }
+
+[[placements]]
+refdes = "P_N2"
+footprint = "PAD1"
+pos = { x = 22500000, y = 11500000 }
+locked = true
+pin_nets = { "1" = "SIG_N1" }
+
+[[placements]]
+refdes = "P_M1"
+footprint = "PAD1"
+pos = { x = 21800000, y = 17000000 }
+locked = true
+pin_nets = { "1" = "SIG_N2" }
+
+[[placements]]
+refdes = "P_M2"
+footprint = "PAD1"
+pos = { x = 21800000, y = 9000000 }
+locked = true
+pin_nets = { "1" = "SIG_N2" }
+
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+edge_clearance_nm = 300000
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    // Box P_A2 (x=24 mm) while OpenNet midpoint is at x=14 mm (10 mm away from the cage).
+    for (a, b, net) in [
+        (
+            Pt::new(mm(22.5), mm(14.5)),
+            Pt::new(mm(25.5), mm(14.5)),
+            "SIG_N1",
+        ),
+        (
+            Pt::new(mm(25.5), mm(14.5)),
+            Pt::new(mm(25.5), mm(11.5)),
+            "SIG_N1",
+        ),
+        (
+            Pt::new(mm(25.5), mm(11.5)),
+            Pt::new(mm(22.5), mm(11.5)),
+            "SIG_N1",
+        ),
+        (
+            Pt::new(mm(21.8), mm(17.0)),
+            Pt::new(mm(21.8), mm(9.0)),
+            "SIG_N2",
+        ),
+    ] {
+        board.tracks.push(Track {
+            net: net.into(),
+            layer: "F.Cu".into(),
+            a,
+            b,
+            width: mm(0.2),
+            locked: false,
+        });
+    }
+    let rep = compile_board(board, &boxed_cfg(3, true)).unwrap();
+    assert!(
+        rep.ok,
+        "expected pad-centered widening to repair 20mm net: {:?}",
+        rep.drc
+    );
+    assert!((1..=3).contains(&rep.route.repair_passes_run));
+    assert!(rep.drc.passed);
+}
+
+#[test]
+fn repair_prior_cluster_widening_does_not_contaminate_distant_hotspot() {
+    let toml = r#"
+name = "prior_cluster_isolation"
+size_nm = [32000000, 26000000]
+
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+
+[footprints.PAD1]
+kind = "custom"
+[[footprints.PAD1.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+
+[[placements]]
+refdes = "A1"
+footprint = "PAD1"
+pos = { x = 4000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "A2"
+footprint = "PAD1"
+pos = { x = 8000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+
+[[placements]]
+refdes = "B1"
+footprint = "PAD1"
+pos = { x = 6000000, y = 15000000 }
+locked = true
+pin_nets = { "1" = "NET_B" }
+
+[[placements]]
+refdes = "B2"
+footprint = "PAD1"
+pos = { x = 6000000, y = 11000000 }
+locked = true
+pin_nets = { "1" = "NET_B" }
+
+[[placements]]
+refdes = "C1"
+footprint = "PAD1"
+pos = { x = 22000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_C" }
+
+[[placements]]
+refdes = "C2"
+footprint = "PAD1"
+pos = { x = 26000000, y = 13000000 }
+locked = true
+pin_nets = { "1" = "SIG_C" }
+
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+edge_clearance_nm = 300000
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    // Hotspot 1 at (6, 13): locked cage around A1 so SIG_A cannot solve, plus unlocked NET_B track nearby.
+    for (a, b, net, locked) in [
+        (
+            Pt::new(mm(3.0), mm(14.0)),
+            Pt::new(mm(5.0), mm(14.0)),
+            "SIG_LOCK",
+            true,
+        ),
+        (
+            Pt::new(mm(5.0), mm(14.0)),
+            Pt::new(mm(5.0), mm(12.0)),
+            "SIG_LOCK",
+            true,
+        ),
+        (
+            Pt::new(mm(5.0), mm(12.0)),
+            Pt::new(mm(3.0), mm(12.0)),
+            "SIG_LOCK",
+            true,
+        ),
+        (
+            Pt::new(mm(3.0), mm(12.0)),
+            Pt::new(mm(3.0), mm(14.0)),
+            "SIG_LOCK",
+            true,
+        ),
+        (
+            Pt::new(mm(6.0), mm(15.0)),
+            Pt::new(mm(6.0), mm(11.0)),
+            "NET_B",
+            false,
+        ),
+        // Hotspot 2 at (24, 13): locked NET_B bar colliding with pre-routed unlocked SIG_C track.
+        (
+            Pt::new(mm(24.0), mm(15.0)),
+            Pt::new(mm(24.0), mm(11.0)),
+            "NET_B",
+            true,
+        ),
+        (
+            Pt::new(mm(22.0), mm(13.0)),
+            Pt::new(mm(26.0), mm(13.0)),
+            "SIG_C",
+            false,
+        ),
+    ] {
+        board.tracks.push(Track {
+            net: net.into(),
+            layer: "F.Cu".into(),
+            a,
+            b,
+            width: mm(0.2),
+            locked,
+        });
+    }
+    let mut cfg = boxed_cfg(3, false);
+    cfg.route.resume = true;
+    cfg.route.reroute_pad_mm = Some(0.5);
+    let rep = compile_board(board, &cfg).unwrap();
+    assert_eq!(rep.route.repair_passes_run, 3);
+    assert_eq!(rep.route.unconnected_pairs, 1);
+    assert!(
+        !rep.drc
+            .violations
+            .iter()
+            .any(|v| v.net_a == "SIG_C" || v.net_b == "SIG_C"),
+        "expected distant hotspot 2 (SIG_C) to be selected and repaired on pass 3: {:?}",
+        rep.drc.violations
+    );
 }

@@ -29,6 +29,7 @@ mod kicad_pcb;
 mod kicad_pro;
 mod kicad_raw_fp;
 pub mod pipeline;
+mod pipeline_repair;
 pub mod place;
 mod place_legalize;
 mod place_vias;

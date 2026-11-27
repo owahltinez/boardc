@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -1143,6 +1143,15 @@ impl BoardIr {
         } else {
             base.max(self.net_clearance(other_net))
         }
+    }
+
+    pub(crate) fn is_net_ignored(&self, net: &str, ignored: &HashSet<String>) -> bool {
+        if net.is_empty() {
+            return false;
+        }
+        let nd = self.nets.get(net);
+        let class_name = nd.map_or("Default", |d| d.class.as_str());
+        ignored.contains(net) || ignored.contains(class_name) || nd.is_some_and(|d| d.ignore_route)
     }
 
     pub fn all_net_names(&self) -> Vec<String> {

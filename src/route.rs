@@ -85,6 +85,8 @@ pub struct RouteSummary {
     pub grid_step_um: f64,
     pub stopped_early: bool,
     pub elapsed_ms: u128,
+    #[serde(default)]
+    pub repair_passes_run: usize,
 }
 
 pub(crate) fn point_from_viahop(p: Point) -> Pt {
@@ -417,6 +419,32 @@ fn prune_dead_end_stubs(
     (pruned_tracks, pruned_len_nm, pruned_vias)
 }
 
+pub(crate) fn apply_match_group_tuning(
+    board: &mut BoardIr,
+    summary: &mut RouteSummary,
+    only_nets: Option<HashSet<String>>,
+    ignored_nets: &HashSet<String>,
+) {
+    if !board.constraints.match_groups.is_empty() {
+        let len_before: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
+        let tune = tune_match_groups(
+            board,
+            &TuneOptions {
+                only_nets,
+                ignored_nets: ignored_nets.clone(),
+            },
+        );
+        let len_after: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
+        summary.total_segments += tune.added_segments;
+        summary.total_wirelength_um =
+            (summary.total_wirelength_um + (len_after - len_before) / 1000.0).max(0.0);
+        summary.elapsed_ms += tune.elapsed_ms;
+    }
+    if !board.constraints.match_groups.is_empty() || !board.constraints.max_lengths.is_empty() {
+        summary.length_violations = count_length_violations(board);
+    }
+}
+
 /// Routes all non-ignored (or `--reroute-nets` targeted) nets in memory using `viahop`.
 pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSummary, String> {
     if let Some(pad_mm) = cfg.reroute_pad_mm
@@ -466,45 +494,36 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
     let (pruned_tracks, pruned_len_nm, pruned_vias) = prune_dead_end_stubs(board, &vboard, cfg);
 
     let s = result.stats;
-    let mut total_segments = s.total_segments.saturating_sub(pruned_tracks);
-    let total_vias = s.total_vias.saturating_sub(pruned_vias);
-    let mut total_wirelength_um = (s.total_wirelength_um - pruned_len_nm / 1000.0).max(0.0);
-    let mut length_violations = s.length_violations;
-    let mut elapsed_ms = s.elapsed_ms;
-    if cfg.tune_match_groups && !board.constraints.match_groups.is_empty() {
-        let len_before: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
-        let tune = tune_match_groups(
-            board,
-            &TuneOptions {
-                only_nets: cfg.reroute_nets.clone(),
-                ignored_nets: cfg.ignored_nets.clone(),
-            },
-        );
-        let len_after: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
-        total_segments += tune.added_segments;
-        total_wirelength_um = (total_wirelength_um + (len_after - len_before) / 1000.0).max(0.0);
-        elapsed_ms += tune.elapsed_ms;
-    }
-    if !board.constraints.match_groups.is_empty() || !board.constraints.max_lengths.is_empty() {
-        length_violations = count_length_violations(board);
-    }
-
-    Ok(RouteSummary {
+    let mut summary = RouteSummary {
         total_nets: s.total_nets,
         routable_nets: s.routable_nets,
         routed_nets: s.routed_nets,
         unconnected_pairs: s.unconnected_pairs,
-        total_segments,
-        total_vias,
-        total_wirelength_um,
+        total_segments: s.total_segments.saturating_sub(pruned_tracks),
+        total_vias: s.total_vias.saturating_sub(pruned_vias),
+        total_wirelength_um: (s.total_wirelength_um - pruned_len_nm / 1000.0).max(0.0),
         passes_run: s.passes_run,
         starts_run: s.starts_run,
         drc_violations: s.drc_violations,
-        length_violations,
+        length_violations: s.length_violations,
         dense_bga_pads: s.dense_bga_pads,
         pofv_capable_pads: s.pofv_capable_pads,
         grid_step_um: s.grid_step_um,
         stopped_early: s.stopped_early,
-        elapsed_ms,
-    })
+        elapsed_ms: s.elapsed_ms,
+        repair_passes_run: 0,
+    };
+    if cfg.tune_match_groups {
+        apply_match_group_tuning(
+            board,
+            &mut summary,
+            cfg.reroute_nets.clone(),
+            &cfg.ignored_nets,
+        );
+    } else if !board.constraints.match_groups.is_empty()
+        || !board.constraints.max_lengths.is_empty()
+    {
+        summary.length_violations = count_length_violations(board);
+    }
+    Ok(summary)
 }
