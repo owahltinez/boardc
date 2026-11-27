@@ -9,7 +9,7 @@ use crate::geom::polygon_signed_area_2;
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FabConfig, FootprintDef, Graphic, Keepout, LayerDef,
     Model3d, NetClass, NetDef, Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup,
-    Track, Via, default_two_layer_stackup,
+    Track, Via, default_two_layer_stackup, trim_nonempty,
 };
 use crate::kicad_io::load_kicad_net;
 use crate::spec_kicad::{
@@ -222,6 +222,29 @@ pub(crate) fn validate_pin_types_for_footprint(
     Ok(())
 }
 
+fn validate_graphics(owner: &str, graphics: &[Graphic]) -> Result<(), String> {
+    for g in graphics {
+        if let Graphic::Text {
+            height_nm,
+            stroke_nm,
+            rot_deg,
+            ..
+        } = g
+        {
+            if *height_nm <= 0 {
+                return Err(format!("{owner} text graphic height_nm must be > 0"));
+            }
+            if *stroke_nm <= 0 {
+                return Err(format!("{owner} text graphic stroke_nm must be > 0"));
+            }
+            if !rot_deg.is_finite() {
+                return Err(format!("{owner} text graphic rot_deg must be finite"));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_net_names(nets: &BTreeMap<String, NetDef>) -> Result<(), String> {
     for (key, nd) in nets {
         if !nd.name.trim().is_empty() && nd.name != *key {
@@ -244,6 +267,8 @@ pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
     ir.fab
         .validate()
         .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
+    validate_graphics("board", &ir.graphics)
+        .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     for (name, fp) in &ir.footprints {
         let owner = format!("footprint '{name}'");
         if !fp.courtyard.is_empty() {
@@ -253,6 +278,8 @@ pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
         validate_models(&owner, &fp.models)
             .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
         validate_pin_types_for_footprint("footprint", name, fp, &fp.pin_types)
+            .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
+        validate_graphics(&format!("footprint '{name}'"), &fp.graphics)
             .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     }
     for p in &ir.placements {
@@ -276,6 +303,10 @@ pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BoardSpec {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     #[serde(default)]
     pub outline: Vec<Pt>,
     #[serde(default)]
@@ -451,6 +482,11 @@ impl BoardIr {
             }
         }
 
+        for fp in footprints.values() {
+            validate_graphics(&format!("footprint '{}'", fp.name), &fp.graphics)?;
+        }
+        validate_graphics("board", &spec.graphics)?;
+
         sync_spec_and_netlist_nets(&mut placements, &mut nets, netlist.as_ref());
         if spec.rules.track_width_nm <= 0
             || spec.rules.via_dia_nm <= 0
@@ -485,6 +521,8 @@ impl BoardIr {
         }
         Ok(Self {
             name: spec.name.clone(),
+            title: trim_nonempty(spec.title.as_deref()).map(str::to_string),
+            revision: trim_nonempty(spec.revision.as_deref()).map(str::to_string),
             outline,
             cutouts: spec.cutouts.clone(),
             layers,

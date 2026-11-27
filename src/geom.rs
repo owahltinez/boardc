@@ -12,7 +12,7 @@ use crate::ir::{BBoxNm, Nm, PadDef, PourPoly, Pt, Side};
 
 pub(crate) const EPS_NM: f64 = 0.5;
 
-fn sin_cos_deg(rot_deg: f64) -> (f64, f64) {
+pub(crate) fn sin_cos_deg(rot_deg: f64) -> (f64, f64) {
     let rem = rot_deg.rem_euclid(360.0);
     let q = (rem / 90.0).round();
     if (rem - q * 90.0).abs() < 1e-9 {

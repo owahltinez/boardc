@@ -22,6 +22,10 @@ pub fn safe_slug(name: &str) -> String {
     if s.is_empty() { "board".into() } else { s }
 }
 
+pub(crate) fn trim_nonempty(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|s| !s.is_empty())
+}
+
 pub(crate) fn fnv1a_128(bytes: &[u8]) -> u128 {
     let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
     for &b in bytes {
@@ -383,7 +387,18 @@ pub struct PadDef {
     pub paste_margin_nm: Option<Nm>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub const DEFAULT_TEXT_HEIGHT_NM: Nm = 1_000_000;
+pub const DEFAULT_TEXT_STROKE_NM: Nm = 150_000;
+
+fn default_text_height_nm() -> Nm {
+    DEFAULT_TEXT_HEIGHT_NM
+}
+
+fn default_text_stroke_nm() -> Nm {
+    DEFAULT_TEXT_STROKE_NM
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Graphic {
     Line {
@@ -415,6 +430,17 @@ pub enum Graphic {
         #[serde(default)]
         fill: bool,
     },
+    Text {
+        layer: String,
+        text: String,
+        pos: Pt,
+        #[serde(default = "default_text_height_nm")]
+        height_nm: Nm,
+        #[serde(default = "default_text_stroke_nm")]
+        stroke_nm: Nm,
+        #[serde(default)]
+        rot_deg: f64,
+    },
 }
 
 impl Graphic {
@@ -423,7 +449,8 @@ impl Graphic {
             Self::Line { layer, .. }
             | Self::Rect { layer, .. }
             | Self::Circle { layer, .. }
-            | Self::Poly { layer, .. } => layer,
+            | Self::Poly { layer, .. }
+            | Self::Text { layer, .. } => layer,
         }
     }
 }
@@ -931,6 +958,10 @@ pub struct Constraints {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardIr {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     pub outline: Vec<Pt>,
     #[serde(default)]
     pub cutouts: Vec<Vec<Pt>>,
@@ -964,6 +995,18 @@ pub struct BoardIr {
 }
 
 impl BoardIr {
+    pub fn effective_title(&self) -> &str {
+        trim_nonempty(self.title.as_deref()).unwrap_or(&self.name)
+    }
+
+    pub fn revision_trimmed(&self) -> Option<&str> {
+        trim_nonempty(self.revision.as_deref())
+    }
+
+    pub fn effective_revision(&self) -> &str {
+        self.revision_trimmed().unwrap_or("1")
+    }
+
     pub fn effective_layers(&self) -> Vec<LayerDef> {
         if self.layers.is_empty() {
             default_two_layer_stackup()

@@ -225,6 +225,8 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
 
     let spec = BoardSpec {
         name: "roundtrip_board".into(),
+        title: None,
+        revision: None,
         outline: vec![
             Pt::new(0, 0),
             Pt::new(mm(40.0), 0),
@@ -477,6 +479,153 @@ fn cli_skill_install_show_and_uninstall() {
     assert!(!installed.exists());
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn board_metadata_and_graphic_text_parsing_and_validation() {
+    let draco_toml = r#"
+name = "draco"
+title = "Draco Rev A1"
+revision = "A1"
+size_nm = [60_000_000, 50_000_000]
+
+[[graphics]]
+kind = "text"
+layer = "F.SilkS"
+text = "DRACO\nREV A1"
+pos = { x = 30_600_000, y = 32_000_000 }
+height_nm = 650_000
+stroke_nm = 150_000
+
+[[graphics]]
+kind = "text"
+layer = "B.SilkS"
+text = "BOT"
+pos = { x = 10_000_000, y = 12_000_000 }
+"#;
+    let spec: BoardSpec = toml::from_str(draco_toml).expect("parse issue #16 toml");
+    let ir = BoardIr::from_spec(&spec).expect("from_spec draco");
+    assert_eq!(ir.name, "draco");
+    assert_eq!(ir.title.as_deref(), Some("Draco Rev A1"));
+    assert_eq!(ir.revision.as_deref(), Some("A1"));
+    assert_eq!(ir.effective_title(), "Draco Rev A1");
+    assert_eq!(ir.effective_revision(), "A1");
+    assert_eq!(ir.graphics.len(), 2);
+    assert_eq!(
+        ir.graphics[0],
+        boardc::ir::Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "DRACO\nREV A1".into(),
+            pos: Pt::new(30_600_000, 32_000_000),
+            height_nm: 650_000,
+            stroke_nm: 150_000,
+            rot_deg: 0.0,
+        }
+    );
+    assert_eq!(
+        ir.graphics[1],
+        boardc::ir::Graphic::Text {
+            layer: "B.SilkS".into(),
+            text: "BOT".into(),
+            pos: Pt::new(10_000_000, 12_000_000),
+            height_nm: 1_000_000,
+            stroke_nm: 150_000,
+            rot_deg: 0.0,
+        }
+    );
+
+    // JSON round-trip preserves metadata and Graphic::Text.
+    let tmp_dir = std::env::temp_dir().join(format!("boardc_meta_text_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let ir_path = tmp_dir.join("draco.board.json");
+    save_board_json(&ir, &ir_path).unwrap();
+    let reloaded = load_board_json(&ir_path).unwrap();
+    assert_eq!(reloaded, ir);
+
+    // Whitespace-only title/revision normalize to None and fall back to name / "1".
+    let ws_spec = BoardSpec {
+        name: "fallback_board".into(),
+        title: Some("  \t ".into()),
+        revision: Some(" ".into()),
+        size_nm: Some([mm(20.0), mm(20.0)]),
+        ..Default::default()
+    };
+    let ws_ir = BoardIr::from_spec(&ws_spec).unwrap();
+    assert_eq!(ws_ir.title, None);
+    assert_eq!(ws_ir.revision, None);
+    assert_eq!(ws_ir.effective_title(), "fallback_board");
+    assert_eq!(ws_ir.effective_revision(), "1");
+
+    // Validation rejects non-positive height_nm/stroke_nm and non-finite rot_deg on board and fp.graphics.
+    for bad in [
+        boardc::ir::Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "BAD".into(),
+            pos: Pt::new(0, 0),
+            height_nm: 0,
+            stroke_nm: 150_000,
+            rot_deg: 0.0,
+        },
+        boardc::ir::Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "BAD".into(),
+            pos: Pt::new(0, 0),
+            height_nm: 700_000,
+            stroke_nm: -10,
+            rot_deg: 0.0,
+        },
+        boardc::ir::Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "BAD".into(),
+            pos: Pt::new(0, 0),
+            height_nm: 700_000,
+            stroke_nm: 150_000,
+            rot_deg: f64::NAN,
+        },
+    ] {
+        let mut bad_spec = ws_spec.clone();
+        bad_spec.graphics = vec![bad.clone()];
+        assert!(BoardIr::from_spec(&bad_spec).is_err());
+
+        let mut bad_fp_spec = ws_spec.clone();
+        bad_fp_spec.footprints.insert(
+            "BAD_FP".into(),
+            FootprintSpec::Custom {
+                pads: Vec::new(),
+                courtyard: Vec::new(),
+                graphics: vec![bad.clone()],
+                keepouts: Vec::new(),
+                models: Vec::new(),
+                pin_types: BTreeMap::new(),
+            },
+        );
+        assert!(BoardIr::from_spec(&bad_fp_spec).is_err());
+
+        let mut bad_ir = ws_ir.clone();
+        bad_ir.graphics = vec![bad.clone()];
+        assert!(boardc::spec::validate_board_ir_pins(&bad_ir, &ir_path).is_err());
+        if !matches!(&bad, boardc::ir::Graphic::Text { rot_deg, .. } if !rot_deg.is_finite()) {
+            save_board_json(&bad_ir, &ir_path).unwrap();
+            assert!(load_board_json(&ir_path).is_err());
+        }
+
+        let mut bad_fp_ir = ws_ir.clone();
+        bad_fp_ir.footprints.insert(
+            "BAD_FP".into(),
+            boardc::ir::FootprintDef {
+                name: "BAD_FP".into(),
+                pads: Vec::new(),
+                courtyard: Vec::new(),
+                graphics: vec![bad],
+                keepouts: Vec::new(),
+                models: Vec::new(),
+                pin_types: BTreeMap::new(),
+            },
+        );
+        assert!(boardc::spec::validate_board_ir_pins(&bad_fp_ir, &ir_path).is_err());
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 #[test]

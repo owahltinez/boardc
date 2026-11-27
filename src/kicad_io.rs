@@ -99,7 +99,7 @@ pub(crate) fn parse_footprint_node(
                 pads.push(pad);
             }
             Some("fp_line") | Some("fp_arc") | Some("fp_rect") | Some("fp_circle")
-            | Some("fp_poly") => {
+            | Some("fp_poly") | Some("fp_text") => {
                 let raw_layer = child_atom(child, "layer").unwrap_or("");
                 let norm_layer = match layer_norm {
                     Some(s) => remap_layer_for_side(raw_layer, s),
@@ -108,7 +108,12 @@ pub(crate) fn parse_footprint_node(
                 if norm_layer == "F.CrtYd" || norm_layer == "B.CrtYd" {
                     collect_poly_or_segment(child, y_sign, &mut crtyd_open, &mut crtyd_closed);
                 } else if norm_layer != "Edge.Cuts" {
-                    graphics.extend(parse_graphic_node(child, y_sign, layer_norm));
+                    graphics.extend(parse_graphic_node(
+                        child,
+                        y_sign,
+                        layer_norm,
+                        is_placed_pcb.then_some(fp_rot),
+                    ));
                 }
             }
             Some("zone") => {

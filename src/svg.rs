@@ -12,6 +12,7 @@ use crate::ir::{
     mm, nm_to_mm, safe_slug,
 };
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
+use crate::stroke_text::text_graphic_segments;
 
 pub(crate) const DEFAULT_SVG_MARGIN_MM: f64 = 2.0;
 
@@ -170,7 +171,10 @@ pub(crate) fn render_graphic_svg(
             width,
             fill,
             ..
-        } if *radius > 0 => {
+        } => {
+            if *radius <= 0 {
+                return;
+            }
             let (cx, cy) = svg_pt(map_pt(*center), mirror_x);
             if *fill {
                 let _ = writeln!(
@@ -189,7 +193,10 @@ pub(crate) fn render_graphic_svg(
         }
         Graphic::Poly {
             verts, width, fill, ..
-        } if verts.len() >= 2 => {
+        } => {
+            if verts.len() < 2 {
+                return;
+            }
             let pts: Vec<Pt> = verts.iter().map(|&v| map_pt(v)).collect();
             let d = poly_path_d(&pts, mirror_x);
             if *fill {
@@ -202,7 +209,19 @@ pub(crate) fn render_graphic_svg(
                 );
             }
         }
-        _ => {}
+        Graphic::Text { .. } => {
+            if let Some((segs, w)) = text_graphic_segments(g) {
+                let sw = nm_to_mm(w.max(50_000));
+                for (a, b) in segs {
+                    let (ax, ay) = svg_pt(map_pt(a), mirror_x);
+                    let (bx, by) = svg_pt(map_pt(b), mirror_x);
+                    let _ = writeln!(
+                        out,
+                        r#"  <line x1="{ax:.4}" y1="{ay:.4}" x2="{bx:.4}" y2="{by:.4}" stroke="{color}" stroke-width="{sw:.4}" stroke-linecap="round" />"#,
+                    );
+                }
+            }
+        }
     }
 }
 
