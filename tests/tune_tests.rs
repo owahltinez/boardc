@@ -401,7 +401,13 @@ fn tight_obstacles_flip_side_and_shrink_amplitude_without_drc_violation() {
     );
 
     let drc = check_board_drc(&board);
-    assert!(drc.passed, "expected clean DRC, got {:?}", drc.violations);
+    assert!(
+        drc.violations
+            .iter()
+            .all(|v| v.kind == ViolationKind::ViaDangling && v.item_a == "via#0"),
+        "expected only intentional obstacle via#0 dangling, got {:?}",
+        drc.violations
+    );
 }
 
 #[test]

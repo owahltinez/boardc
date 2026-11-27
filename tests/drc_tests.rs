@@ -1100,6 +1100,7 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
         footprints: flush_fps,
         placements: vec![
             place("EDGE_PAD", "FLUSH_SMD", 0.5, 10.0, Side::Top, "SIG_E"),
+            place("SIG_E_END", "SMD", 6.0, 10.0, Side::Top, "SIG_E"),
             place("GND_PAD", "SMD", 10.0, 10.0, Side::Top, "GND"),
         ],
         pours: vec![PourSpec {
@@ -2835,8 +2836,10 @@ fn hotspot_omits_one_pin_track_net_so_reroute_freezes_obstacle() {
     assert_eq!(summary.unconnected_pairs, 0);
     let post = check_board_drc(&board);
     assert!(
-        post.passed,
-        "freezing 1-pin track obstacle and rerouting 2-pin net must pass DRC: {:?}",
+        post.violations
+            .iter()
+            .all(|v| v.kind == ViolationKind::TrackDangling && v.item_a == "track#0"),
+        "freezing 1-pin track obstacle and rerouting 2-pin net must only keep intentional stub dangling: {:?}",
         post.violations
     );
 }
@@ -3015,5 +3018,278 @@ fn hotspot_handles_multipin_same_name_and_net_def_pins_fallback() {
             "PASTE_FIRST_NET".to_string(),
             "SPLIT_SHIELD".to_string(),
         ]
+    );
+}
+
+#[test]
+fn native_drc_detects_dangling_tracks_and_vias_and_clusters_kicad_drc() {
+    let mk_layer = |name: &str, kind: LayerKind, side: Option<Side>| LayerDef {
+        name: name.into(),
+        kind,
+        side,
+        thickness_nm: None,
+    };
+    let mk_pour = |net: &str, layer: &str, x0: f64, y0: f64, x1: f64, y1: f64| FilledPour {
+        net: net.into(),
+        layer: layer.into(),
+        priority: 0,
+        polys: vec![PourPoly {
+            outer: rect_pts(x0, y0, x1, y1),
+            holes: Vec::new(),
+        }],
+    };
+    let mk_t = |net: &str, layer: &str, ax: f64, ay: f64, bx: f64, by: f64| {
+        mk_track(net, layer, mm(ax), mm(ay), mm(bx), mm(by), um(200.0))
+    };
+
+    let mut board = base_board();
+    board.layers = vec![
+        mk_layer("F.Cu", LayerKind::Signal, Some(Side::Top)),
+        mk_layer("In1.Cu", LayerKind::Plane, None),
+        mk_layer("B.Cu", LayerKind::Signal, Some(Side::Bottom)),
+    ];
+    board.footprints.insert(
+        "SMD".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu"], None)
+            .resolve("SMD")
+            .unwrap(),
+    );
+    // THT pad whose copper layers list only F.Cu/B.Cu; plated barrel bridges In1.Cu.
+    board.footprints.insert(
+        "THT_OB".into(),
+        single_pad_fp(0.8, PadKind::Tht, vec!["F.Cu", "B.Cu"], Some(0.4))
+            .resolve("THT_OB")
+            .unwrap(),
+    );
+    board.nets.insert(
+        "GND".into(),
+        NetDef {
+            name: "GND".into(),
+            ignore_route: true,
+            ..Default::default()
+        },
+    );
+    board.placements = vec![
+        place_pin1("U1", "SMD", 4.0, 4.0, Side::Top, "SIG_OK"),
+        place_pin1("U2", "SMD", 10.0, 4.0, Side::Top, "SIG_OK"),
+        place_pin1("U3", "SMD", 7.0, 7.0, Side::Top, "SIG_OK"),
+        place_pin1("J1", "THT_OB", 14.0, 4.0, Side::Top, "SIG_OK"),
+        place_pin1("U4", "SMD", 4.0, 12.0, Side::Top, "DANG_T"),
+        place_pin1("U5", "SMD", 4.0, 18.0, Side::Top, "VIA_1L"),
+        place_pin1("U6", "SMD", 16.0, 12.0, Side::Top, "VIA_POUR"),
+    ];
+    board.filled_pours = vec![
+        mk_pour("SIG_OK", "F.Cu", 17.0, 2.0, 21.0, 6.0),
+        mk_pour("VIA_POUR", "In1.Cu", 15.0, 10.0, 22.0, 14.0),
+        mk_pour("GND", "F.Cu", 24.0, 10.0, 32.0, 16.0),
+        mk_pour("GND", "B.Cu", 24.0, 10.0, 32.0, 16.0),
+    ];
+    board.tracks = vec![
+        mk_t("SIG_OK", "F.Cu", 4.0, 4.0, 10.0, 4.0),
+        mk_t("SIG_OK", "F.Cu", 7.0, 7.0, 7.0, 4.0),
+        mk_t("SIG_OK", "F.Cu", 10.0, 4.0, 12.0, 4.0),
+        mk_t("SIG_OK", "In1.Cu", 12.0, 4.0, 14.0, 4.0),
+        mk_t("SIG_OK", "F.Cu", 14.0, 4.0, 18.0, 4.0),
+        mk_t("SIG_OK", "F.Cu", 4.0, 4.0, 4.0, 8.0),
+        mk_t("SIG_OK", "B.Cu", 4.0, 8.0, 10.0, 8.0),
+        mk_t("SIG_OK", "F.Cu", 10.0, 8.0, 10.0, 4.0),
+        mk_t("DANG_T", "F.Cu", 4.0, 12.0, 8.0, 12.0), // track#8: dangling
+        mk_t("", "F.Cu", 4.0, 24.0, 8.0, 24.0),       // track#9: no-net dangling
+        mk_t("VIA_1L", "F.Cu", 4.0, 18.0, 8.0, 18.0), // track#10: clean; via#1 dangling
+    ];
+    let mk_span_via = |net: &str, x: f64, y: f64, l0: &str, l1: &str| Via {
+        net: net.into(),
+        pos: Pt::new(mm(x), mm(y)),
+        diameter: um(500.0),
+        drill: um(250.0),
+        layers: (l0.into(), l1.into()),
+        locked: false,
+        tented: true,
+    };
+    board.vias = vec![
+        mk_via("SIG_OK", mm(12.0), mm(4.0), um(500.0), um(250.0), true),
+        mk_via("VIA_1L", mm(8.0), mm(18.0), um(500.0), um(250.0), true), // via#1: 1L dangling
+        mk_via("VIA_POUR", mm(16.0), mm(12.0), um(500.0), um(250.0), true),
+        mk_via("GND", mm(28.0), mm(13.0), um(500.0), um(250.0), true),
+        mk_span_via("SIG_OK", 4.0, 8.0, "F.Cu", "In1.Cu"), // via#4: stacked
+        mk_span_via("SIG_OK", 4.0, 8.0, "In1.Cu", "B.Cu"), // via#5: stacked
+        mk_via("SIG_OK", mm(10.0), mm(8.0), um(500.0), um(250.0), true),
+        mk_via("", mm(20.0), mm(24.0), um(500.0), um(250.0), true), // via#7: orphan dangling
+    ];
+
+    let rep = check_board_drc(&board);
+    assert!(!rep.passed, "dangling tracks/vias must fail DRC");
+    let by_kind = |k: ViolationKind| -> Vec<&Violation> {
+        rep.violations.iter().filter(|v| v.kind == k).collect()
+    };
+    let track_dangs = by_kind(ViolationKind::TrackDangling);
+    let via_dangs = by_kind(ViolationKind::ViaDangling);
+
+    assert_eq!(track_dangs.len(), 2, "got {track_dangs:?}");
+    assert!(track_dangs.iter().all(|v| v.severity == Severity::Error));
+    assert!(track_dangs.iter().any(|v| {
+        v.item_a == "track#8"
+            && v.net_a == "DANG_T"
+            && v.pos_nm == Pt::new(mm(8.0), mm(12.0))
+            && v.layer == "F.Cu"
+    }));
+    assert!(
+        track_dangs
+            .iter()
+            .any(|v| v.item_a == "track#9" && v.net_a.is_empty())
+    );
+
+    assert_eq!(via_dangs.len(), 2, "got {via_dangs:?}");
+    assert!(via_dangs.iter().all(|v| v.severity == Severity::Error));
+    assert!(
+        via_dangs
+            .iter()
+            .any(|v| v.item_a == "via#1" && v.measured_nm == 1 && v.required_nm == 2)
+    );
+    assert!(
+        via_dangs
+            .iter()
+            .any(|v| v.item_a == "via#7" && v.measured_nm == 0 && v.required_nm == 2)
+    );
+
+    assert!(rep.hotspots.iter().any(|h| {
+        h.kinds.contains(&ViolationKind::TrackDangling)
+            && h.action_hint.starts_with("Trim or connect dangling track")
+    }));
+    assert!(rep.hotspots.iter().any(|h| {
+        h.kinds.contains(&ViolationKind::ViaDangling)
+            && h.action_hint.starts_with("Connect or remove dangling via")
+    }));
+
+    // KiCad DRC JSON mapping + error-beats-warning tiebreak for dominant_kind.
+    let kdrc = r#"{
+        "coordinate_units": "mm",
+        "violations": [
+            {
+                "type": "track_dangling",
+                "severity": "error",
+                "description": "Track has unconnected end",
+                "items": [{ "description": "Track [DANG_T] on F.Cu, length 4.0000 mm", "pos": { "x": 8.0, "y": -12.0 } }]
+            },
+            {
+                "type": "via_dangling",
+                "severity": "warning",
+                "description": "Via is not connected or connected on only one layer",
+                "items": [{ "description": "Via [<no net>] on F.Cu - B.Cu", "pos": { "x": 20.0, "y": -24.0 } }]
+            },
+            {
+                "type": "clearance",
+                "severity": "error",
+                "description": "Clearance violation",
+                "items": [{ "description": "Via [<no net>] on F.Cu - B.Cu", "pos": { "x": 20.0, "y": -24.0 } }]
+            }
+        ]
+    }"#;
+    let hs = cluster_kicad_drc_json(&board, kdrc).unwrap();
+    assert_eq!(hs.len(), 2);
+    let t_hs = hs
+        .iter()
+        .find(|h| h.kinds.contains(&ViolationKind::TrackDangling))
+        .unwrap();
+    assert_eq!(t_hs.violations[0].item_a, "track#8");
+    assert_eq!(t_hs.violations[0].net_a, "DANG_T");
+    let v_hs = hs
+        .iter()
+        .find(|h| h.kinds.contains(&ViolationKind::ViaDangling))
+        .unwrap();
+    assert_eq!(v_hs.violations[0].item_a, "via#7");
+    assert_eq!(v_hs.violations[0].net_a, "");
+    assert!(
+        v_hs.action_hint.starts_with("Reposition or resize"),
+        "Severity::Error must beat Severity::Warning on tiebreak, got {}",
+        v_hs.action_hint
+    );
+}
+
+#[test]
+fn via_dangling_rejects_orphan_via_bootstrapping_and_allows_stacked_blind_vias() {
+    let mk_layer = |name: &str, kind: LayerKind, side: Option<Side>| LayerDef {
+        name: name.into(),
+        kind,
+        side,
+        thickness_nm: None,
+    };
+    let mk_span_via = |net: &str, x: f64, y: f64, l0: &str, l1: &str| Via {
+        net: net.into(),
+        pos: Pt::new(mm(x), mm(y)),
+        diameter: um(500.0),
+        drill: um(250.0),
+        layers: (l0.into(), l1.into()),
+        locked: false,
+        tented: true,
+    };
+    let mk_t = |net: &str, layer: &str, ax: f64, ay: f64, bx: f64, by: f64| {
+        mk_track(net, layer, mm(ax), mm(ay), mm(bx), mm(by), um(200.0))
+    };
+
+    let mut board = base_board();
+    board.layers = vec![
+        mk_layer("F.Cu", LayerKind::Signal, Some(Side::Top)),
+        mk_layer("In1.Cu", LayerKind::Plane, None),
+        mk_layer("B.Cu", LayerKind::Signal, Some(Side::Bottom)),
+    ];
+    board.footprints.insert(
+        "SMD_F".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu"], None)
+            .resolve("SMD_F")
+            .unwrap(),
+    );
+    board.footprints.insert(
+        "SMD_B".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["B.Cu"], None)
+            .resolve("SMD_B")
+            .unwrap(),
+    );
+    board.placements = vec![
+        place_pin1("U1", "SMD_F", 4.0, 4.0, Side::Top, "DUP"),
+        place_pin1("U2", "SMD_F", 4.0, 10.0, Side::Top, "STACK"),
+        place_pin1("U3", "SMD_B", 14.0, 10.0, Side::Top, "STACK"),
+        place_pin1("U4", "SMD_F", 4.0, 16.0, Side::Top, "BLIND_BAD"),
+    ];
+    board.tracks = vec![
+        mk_t("DUP", "F.Cu", 4.0, 4.0, 8.0, 4.0),
+        mk_t("STACK", "F.Cu", 4.0, 10.0, 9.0, 10.0),
+        mk_t("STACK", "B.Cu", 9.0, 10.0, 14.0, 10.0),
+        mk_t("BLIND_BAD", "F.Cu", 4.0, 16.0, 8.0, 16.0),
+    ];
+    board.vias = vec![
+        // Overlapping duplicate THT vias with planar copper only on F.Cu -> BOTH dangling.
+        mk_span_via("DUP", 8.0, 4.0, "F.Cu", "B.Cu"),
+        mk_span_via("DUP", 8.05, 4.0, "F.Cu", "B.Cu"),
+        // Overlapping orphan same-net vias with 0 planar copper -> BOTH dangling.
+        mk_span_via("ORPH", 20.0, 4.0, "F.Cu", "B.Cu"),
+        mk_span_via("ORPH", 20.05, 4.0, "F.Cu", "B.Cu"),
+        // Stacked blind/buried vias bridging F.Cu and B.Cu -> NEITHER dangling.
+        mk_span_via("STACK", 9.0, 10.0, "F.Cu", "In1.Cu"),
+        mk_span_via("STACK", 9.0, 10.0, "In1.Cu", "B.Cu"),
+        // Actually-dangling blind via (F.Cu..In1.Cu touching only F.Cu track) -> dangling.
+        mk_span_via("BLIND_BAD", 8.0, 16.0, "F.Cu", "In1.Cu"),
+    ];
+
+    let rep = check_board_drc(&board);
+    assert!(!rep.passed);
+    let mut via_dangs: Vec<&str> = rep
+        .violations
+        .iter()
+        .filter(|v| v.kind == ViolationKind::ViaDangling)
+        .map(|v| v.item_a.as_str())
+        .collect();
+    via_dangs.sort();
+    assert_eq!(
+        via_dangs,
+        vec!["via#0", "via#1", "via#2", "via#3", "via#6"],
+        "got {:?}",
+        rep.violations
+    );
+    assert!(
+        rep.violations
+            .iter()
+            .filter(|v| v.kind == ViolationKind::ViaDangling)
+            .all(|v| v.severity == Severity::Error)
     );
 }

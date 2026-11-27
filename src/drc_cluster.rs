@@ -115,6 +115,12 @@ fn build_action_hint(
             format!("Place decoupling capacitor {root_item} closer to target IC")
         }
         ViolationKind::MinVias => format!("Add vias on {root_item}{net_suffix}"),
+        ViolationKind::TrackDangling => {
+            format!("Trim or connect dangling track {root_item}{net_suffix}")
+        }
+        ViolationKind::ViaDangling => {
+            format!("Connect or remove dangling via {root_item}{net_suffix}")
+        }
         ViolationKind::Other => {
             format!("Inspect {count} DRC violations around {root_item}{net_suffix}")
         }
@@ -238,7 +244,7 @@ pub(crate) fn cluster_hotspots(
         let mut warn_count = 0usize;
         let mut layers: BTreeSet<String> = BTreeSet::new();
         let mut kinds_set: BTreeSet<ViolationKind> = BTreeSet::new();
-        let mut kind_counts: BTreeMap<ViolationKind, usize> = BTreeMap::new();
+        let mut kind_counts: BTreeMap<ViolationKind, (bool, usize)> = BTreeMap::new();
         let mut item_counts: HashMap<String, (usize, BTreeMap<String, usize>)> = HashMap::new();
         let mut net_counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut cluster_violations = Vec::with_capacity(idxs.len());
@@ -255,7 +261,9 @@ pub(crate) fn cluster_hotspots(
                 layers.insert(v.layer.clone());
             }
             kinds_set.insert(v.kind);
-            *kind_counts.entry(v.kind).or_insert(0) += 1;
+            let entry = kind_counts.entry(v.kind).or_insert((false, 0));
+            entry.0 |= v.severity == Severity::Error;
+            entry.1 += 1;
             for (item, net) in violation_items(v) {
                 let entry = item_counts
                     .entry(item.to_string())
@@ -303,7 +311,7 @@ pub(crate) fn cluster_hotspots(
 
         let dominant_kind = kind_counts
             .into_iter()
-            .max_by_key(|&(_, c)| c)
+            .max_by_key(|&(_, (has_err, count))| (has_err, count))
             .map(|(k, _)| k)
             .unwrap_or(ViolationKind::Other);
         let affected_nets: Vec<String> =
@@ -404,7 +412,8 @@ fn map_kicad_kind(t: &str) -> ViolationKind {
         "copper_edge_clearance" => ViolationKind::EdgeClearance,
         "courtyards_overlap" => ViolationKind::CourtyardOverlap,
         "unconnected_items" => ViolationKind::OpenNet,
-        "via_dangling" | "track_dangling" => ViolationKind::OpenNet,
+        "track_dangling" => ViolationKind::TrackDangling,
+        "via_dangling" => ViolationKind::ViaDangling,
         "keepout" | "rule_area" => ViolationKind::Keepout,
         _ => ViolationKind::Other,
     }
@@ -415,7 +424,7 @@ fn extract_bracket_net(desc: &str) -> String {
         && r > l
     {
         let net = desc[l + 1..r].trim();
-        if net.eq_ignore_ascii_case("no net") {
+        if net.eq_ignore_ascii_case("no net") || net.eq_ignore_ascii_case("<no net>") {
             return String::new();
         }
         return net.to_string();
