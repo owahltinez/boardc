@@ -425,14 +425,24 @@ impl LegalizeCtx<'_> {
         let cy_bb = translate_bbox(tmpl.local_cy_bbox, pos);
         let cy_clr = self.board.rules.courtyard_clearance_nm;
 
-        if !pl.allow_edge_overhang && cya.len() >= 3 {
-            let cy_shape = ResolvedShape::Poly {
-                verts: cya.clone(),
-                bbox: cy_bb,
-            };
-            let (dist, off_board) =
-                shape_edge_clearance(&cy_shape, &self.board.outline, &self.board.cutouts);
-            if off_board || (cy_clr > 0 && dist < cy_clr as f64 - EPS_NM) {
+        if cya.len() >= 3 {
+            if !pl.allow_edge_overhang {
+                let cy_shape = ResolvedShape::Poly {
+                    verts: cya.clone(),
+                    bbox: cy_bb,
+                };
+                let (dist, off_board) =
+                    shape_edge_clearance(&cy_shape, &self.board.outline, &self.board.cutouts);
+                if off_board || (cy_clr > 0 && dist < cy_clr as f64 - EPS_NM) {
+                    return false;
+                }
+            } else if polys_overlap_area(&cya, &self.board.outline) <= 0.0
+                || self
+                    .board
+                    .cutouts
+                    .iter()
+                    .any(|c| c.len() >= 3 && polygon_violates_clearance(&cya, c, cy_clr))
+            {
                 return false;
             }
         }
@@ -451,14 +461,26 @@ impl LegalizeCtx<'_> {
             })
             .collect();
 
-        for (ws, _, _, lp) in &world_pads {
-            if lp.kind == PadKind::Npth || lp.layers.is_empty() {
-                continue;
+        for (ws, _, wc, lp) in &world_pads {
+            if lp.kind != PadKind::Npth && !lp.layers.is_empty() {
+                let (dist, off_board) =
+                    shape_edge_clearance(ws, &self.board.outline, &self.board.cutouts);
+                if off_board || dist < edge_clr as f64 - EPS_NM {
+                    return false;
+                }
             }
-            let (dist, off_board) =
-                shape_edge_clearance(ws, &self.board.outline, &self.board.cutouts);
-            if off_board || dist < edge_clr as f64 - EPS_NM {
-                return false;
+            if let Some(d) = lp.drill_nm
+                && d > 0
+            {
+                let drill_shape = ResolvedShape::Circle {
+                    center: *wc,
+                    radius: d / 2,
+                };
+                let (dist, off_board) =
+                    shape_edge_clearance(&drill_shape, &self.board.outline, &self.board.cutouts);
+                if off_board || dist < edge_clr as f64 - EPS_NM {
+                    return false;
+                }
             }
         }
 

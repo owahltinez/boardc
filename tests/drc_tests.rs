@@ -1258,7 +1258,7 @@ fn allow_edge_overhang_skips_component_to_edge_but_enforces_pads_courtyard_and_k
     );
 
     // 5. CourtyardOverlap with another component and placement Keepout still fail.
-    let mut bad_cy_ko = base;
+    let mut bad_cy_ko = base.clone();
     bad_cy_ko
         .placements
         .push(place_pin1("U2", "SMD", 10.0, 2.9, Side::Top, "SIG"));
@@ -1283,5 +1283,118 @@ fn allow_edge_overhang_skips_component_to_edge_but_enforces_pads_courtyard_and_k
             .any(|v| v.kind == ViolationKind::Keepout && v.item_a == "J1"),
         "expected placement Keepout even with allow_edge_overhang=true: {:?}",
         drc_cy_ko.violations
+    );
+
+    // 6. NPTH drill edge clearance violation is still caught when allow_edge_overhang=true.
+    let mut npth_spec = base.clone();
+    npth_spec.footprints.insert(
+        "EDGE_NPTH".into(),
+        FootprintSpec::Custom {
+            pads: vec![
+                PadDef {
+                    name: "1".into(),
+                    kind: PadKind::Smd,
+                    shape: PadShape::Rect {
+                        width: mm(1.0),
+                        height: mm(1.0),
+                    },
+                    pos: Pt::new(0, mm(2.0)),
+                    rot_deg: 0.0,
+                    drill_nm: None,
+                    layers: vec!["F.Cu".into(), "F.Mask".into()],
+                    mask_margin_nm: None,
+                    paste_margin_nm: None,
+                },
+                PadDef {
+                    name: "H1".into(),
+                    kind: PadKind::Npth,
+                    shape: PadShape::Circle { diameter: mm(1.0) },
+                    pos: Pt::new(0, mm(0.5)),
+                    rot_deg: 0.0,
+                    drill_nm: Some(mm(1.0)),
+                    layers: vec!["*.Mask".into()],
+                    mask_margin_nm: None,
+                    paste_margin_nm: None,
+                },
+            ],
+            courtyard: rect_pts(-2.0, -3.0, 2.0, 3.0),
+            graphics: vec![],
+            keepouts: vec![],
+            models: vec![],
+            pin_types: Default::default(),
+        },
+    );
+    npth_spec.placements[0].footprint = "EDGE_NPTH".into();
+    npth_spec.placements[0].pos = Pt::new(mm(10.0), mm(0.0));
+    let npth_ir = BoardIr::from_spec(&npth_spec).unwrap();
+    let drc_npth = check_board_drc(&npth_ir);
+    assert!(
+        drc_npth
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::EdgeClearance && v.item_a == "J1.H1"),
+        "expected EdgeClearance on NPTH drill with allow_edge_overhang=true: {:?}",
+        drc_npth.violations
+    );
+
+    // 7. Interior cutout courtyard overhang fails ComponentToEdge even when pads clear the cutout.
+    let mut cutout_cy = base.clone();
+    cutout_cy.placements[0].pos = Pt::new(mm(15.0), mm(11.2)); // pad top y=13.7 (0.3mm clear), courtyard top y=14.2 (> 14.0)
+    let cutout_ir = BoardIr::from_spec(&cutout_cy).unwrap();
+    let drc_cut_cy = check_board_drc(&cutout_ir);
+    assert!(
+        drc_cut_cy
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::ComponentToEdge && v.item_a == "J1"),
+        "expected ComponentToEdge against interior cutout with allow_edge_overhang=true: {:?}",
+        drc_cut_cy.violations
+    );
+    assert!(
+        !drc_cut_cy
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::EdgeClearance),
+        "pad clears cutout, only courtyard should fail: {:?}",
+        drc_cut_cy.violations
+    );
+
+    // 8. Completely off-board placement with allow_edge_overhang=true fails ComponentToEdge.
+    let mut off_board = base.clone();
+    off_board.placements[0].pos = Pt::new(mm(10.0), mm(-4.0));
+    let drc_off = check_board_drc(&BoardIr::from_spec(&off_board).unwrap());
+    assert!(
+        drc_off
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::ComponentToEdge && v.item_a == "J1"),
+        "expected ComponentToEdge for completely off-board placement: {:?}",
+        drc_off.violations
+    );
+
+    // 9. run_preflight agrees on clean overhang vs interior cutout / NPTH violations.
+    let mut pre_base = base;
+    pre_base.placements[0].pin_nets.clear();
+    let pre_ok = boardc::preflight::run_preflight(
+        &BoardIr::from_spec(&pre_base).unwrap(),
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(pre_ok.ok, "expected clean preflight: {pre_ok:?}");
+    let pre_cut = boardc::preflight::run_preflight(&cutout_ir, &Default::default()).unwrap();
+    assert!(!pre_cut.ok);
+    assert!(
+        pre_cut
+            .layout_violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::ComponentToEdge && v.item_a == "J1")
+    );
+    let pre_npth = boardc::preflight::run_preflight(&npth_ir, &Default::default()).unwrap();
+    assert!(!pre_npth.ok);
+    assert!(
+        pre_npth
+            .layout_violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::EdgeClearance && v.item_a == "J1.H1")
     );
 }

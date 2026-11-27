@@ -216,15 +216,29 @@ pub(crate) fn check_courtyards_and_component_edges(
                 });
             }
         }
-        if board.outline.len() >= 3 && !pla.allow_edge_overhang {
-            let cy_shape = ResolvedShape::polygon(cya.clone());
-            let (dist, off_board) = shape_edge_clearance(&cy_shape, &board.outline, &board.cutouts);
-            if off_board || (cy_clr > 0 && dist < cy_clr as f64 - EPS_NM) {
-                let meas = if off_board {
-                    0
+        if board.outline.len() >= 3 {
+            let violation_meas = if !pla.allow_edge_overhang {
+                let cy_shape = ResolvedShape::polygon(cya.clone());
+                let (dist, off_board) =
+                    shape_edge_clearance(&cy_shape, &board.outline, &board.cutouts);
+                if off_board {
+                    Some(0)
+                } else if cy_clr > 0 && dist < cy_clr as f64 - EPS_NM {
+                    Some(dist.max(0.0).round() as Nm)
                 } else {
-                    dist.max(0.0).round() as Nm
-                };
+                    None
+                }
+            } else if polys_overlap_area(cya, &board.outline) <= 0.0 {
+                Some(0)
+            } else {
+                board
+                    .cutouts
+                    .iter()
+                    .filter(|c| c.len() >= 3 && polygon_violates_clearance(cya, c, cy_clr))
+                    .map(|c| polygon_to_polygon_dist(cya, c).max(0.0).round() as Nm)
+                    .min()
+            };
+            if let Some(meas) = violation_meas {
                 out.push(Violation {
                     kind: ViolationKind::ComponentToEdge,
                     severity: Severity::Error,

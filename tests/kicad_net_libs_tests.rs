@@ -1148,14 +1148,61 @@ pos = { x = 5000000, y = 5000000 }
         exp_ir.footprints["conn:CONN_2P"].courtyard[0],
         Pt::new(mm(-1.1), mm(-0.5))
     );
+    let exp_pcb = render_kicad_pcb(&exp_ir);
+    let crtyd_lines: Vec<&str> = exp_pcb
+        .lines()
+        .filter(|l| l.contains("(layer \"F.CrtYd\")"))
+        .collect();
+    assert_eq!(
+        crtyd_lines.len(),
+        4,
+        "expected 4 F.CrtYd lines: {crtyd_lines:?}"
+    );
+    assert!(
+        crtyd_lines
+            .iter()
+            .any(|l| l.contains("1.100000") && l.contains("0.500000")),
+        "expected overridden courtyard in F.CrtYd: {crtyd_lines:?}"
+    );
+    assert!(
+        crtyd_lines.iter().all(|l| !l.contains("10.000000")),
+        "old library courtyard must not appear in F.CrtYd: {crtyd_lines:?}"
+    );
 
-    // 3. Reject degenerate < 3 vertex courtyard, unmatched lib courtyard overlay, and unknown kind='lib' fields.
+    // 3. Reject < 3 vertex, empty `courtyard = []`, collinear, empty `kind = "lib"`, unmatched overlay, and unknown fields.
     let bad_degenerate = inferred_cy_toml.replace(
         "  { x = 1200000, y = 600000 },\n  { x = -1200000, y = 600000 },\n",
         "",
     );
     let deg_spec: BoardSpec = toml::from_str(&bad_degenerate).unwrap();
     assert!(BoardIr::from_spec_with_base(&deg_spec, Some(&dir)).is_err());
+
+    let empty_cy = inferred_cy_toml.replace(
+        "[\n  { x = -1200000, y = -600000 },\n  { x = 1200000, y = -600000 },\n  { x = 1200000, y = 600000 },\n  { x = -1200000, y = 600000 },\n]",
+        "[]",
+    );
+    assert!(BoardIr::from_spec_with_base(&toml::from_str(&empty_cy).unwrap(), Some(&dir)).is_err());
+
+    let collinear_cy = inferred_cy_toml.replace(
+        "  { x = 1200000, y = 600000 },\n  { x = -1200000, y = 600000 },\n",
+        "  { x = 0, y = -600000 },\n",
+    );
+    assert!(
+        BoardIr::from_spec_with_base(&toml::from_str(&collinear_cy).unwrap(), Some(&dir)).is_err()
+    );
+
+    let empty_lib = r#"
+name = "empty_lib"
+size_nm = [10000000, 10000000]
+footprint_libs = ["conn.pretty"]
+[footprints.CONN_2P]
+kind = "lib"
+[[placements]]
+refdes = "J1"
+footprint = "CONN_2P"
+pos = { x = 5000000, y = 5000000 }
+"#;
+    assert!(BoardIr::from_spec_with_base(&toml::from_str(empty_lib).unwrap(), Some(&dir)).is_err());
 
     let unmatched = format!(
         "{inferred_cy_toml}\n[footprints.NO_SUCH_CONN]\ncourtyard = [{{ x = 0, y = 0 }}, {{ x = 1000000, y = 0 }}, {{ x = 0, y = 1000000 }}]\n"
