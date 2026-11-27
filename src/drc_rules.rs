@@ -329,11 +329,39 @@ pub(crate) fn check_edge_clearances(
         );
     }
     for pad in pads {
+        let mut worst: Option<(f64, bool, &str)> = None;
         if pad.kind != PadKind::Npth
             && let Some(layer) = pad.layers.first()
         {
             let (dist, off) =
                 indexed_shape_edge_clearance(&pad.shape, &outline_idx, &cutout_idxs, req);
+            if off || dist < req as f64 - EPS_NM {
+                worst = Some((dist, off, layer.as_str()));
+            }
+        }
+        if let Some(d) = pad.drill_nm
+            && d > 0
+            && (pad.kind == PadKind::Npth || pad.layers.is_empty() || d > pad.min_dim_nm)
+        {
+            let drill_shape = ResolvedShape::Circle {
+                center: pad.center,
+                radius: d / 2,
+            };
+            let (dist, off) =
+                indexed_shape_edge_clearance(&drill_shape, &outline_idx, &cutout_idxs, req);
+            if (off || dist < req as f64 - EPS_NM)
+                && worst.is_none_or(|(wd, woff, _)| !woff && (off || dist < wd))
+            {
+                let fallback = if pad.kind == PadKind::Npth {
+                    "NPTH"
+                } else {
+                    "*.Cu"
+                };
+                let layer = pad.layers.first().map(String::as_str).unwrap_or(fallback);
+                worst = Some((dist, off, layer));
+            }
+        }
+        if let Some((dist, off, layer)) = worst {
             push_edge(
                 dist,
                 off,

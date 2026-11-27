@@ -430,6 +430,15 @@ fn regression_cache_keys_invalidate_place_preflight_and_isolate_route_seeds() {
         "Place cache must invalidate when clearance_nm changes"
     );
 
+    // Changing allow_edge_overhang on a placement must invalidate StageKind::Place and downstream stages.
+    let mut ov_board = base_board.clone();
+    ov_board.placements[0].allow_edge_overhang = true;
+    let r_ov = compile_board(ov_board, &cfg).unwrap();
+    assert!(
+        !r_ov.stage_hit(StageKind::Place),
+        "Place cache must invalidate when allow_edge_overhang changes"
+    );
+
     // Changing pre-existing board.filled_pours must invalidate StageKind::Preflight while Place & PowerVia stay warm.
     let mut pour_board = base_board.clone();
     pour_board.filled_pours = r1.board.filled_pours.clone();

@@ -99,10 +99,17 @@ pub(crate) struct ClearanceHit<'a> {
 
 pub(crate) fn push_clearance_violation(out: &mut Vec<Violation>, hit: ClearanceHit<'_>) {
     let meas = hit.dist.max(0.0).round() as Nm;
-    let message = format!(
-        "{}{} to {} clearance {meas} nm < {} nm",
-        hit.prefix, hit.item_a, hit.item_b, hit.required_nm
-    );
+    let message = if hit.required_nm == 0 {
+        format!(
+            "{}{} intrudes on {} (0 nm clearance required)",
+            hit.prefix, hit.item_a, hit.item_b
+        )
+    } else {
+        format!(
+            "{}{} to {} clearance {meas} nm < {} nm",
+            hit.prefix, hit.item_a, hit.item_b, hit.required_nm
+        )
+    };
     out.push(Violation {
         kind: hit.kind,
         severity: Severity::Error,

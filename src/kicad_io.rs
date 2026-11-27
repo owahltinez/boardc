@@ -77,6 +77,10 @@ pub(crate) fn parse_footprint_node(
     let y_sign: i64 = if unflip_bottom { 1 } else { -1 };
     let layer_norm = unflip_bottom.then_some(Side::Bottom);
 
+    let fp_mask_margin = node
+        .find_child("solder_mask_margin")
+        .and_then(|n| f64_at(n, 1))
+        .map(mm);
     let mut pads = Vec::new();
     let mut pad_nets = Vec::new();
     let mut graphics = Vec::new();
@@ -88,7 +92,7 @@ pub(crate) fn parse_footprint_node(
     for child in node.as_list().into_iter().flatten().skip(1) {
         match child.tag() {
             Some("pad") => {
-                let (pad, net) = parse_pad(
+                let (mut pad, net) = parse_pad(
                     child,
                     y_sign,
                     fp_rot,
@@ -96,13 +100,14 @@ pub(crate) fn parse_footprint_node(
                     is_placed_pcb,
                     net_id_map,
                 )?;
+                pad.mask_margin_nm = pad.mask_margin_nm.or(fp_mask_margin);
                 if !pad.name.is_empty() && !net.is_empty() {
                     pad_nets.push((pad.name.clone(), net));
                 }
                 pads.push(pad);
             }
             Some("fp_line") | Some("fp_arc") | Some("fp_rect") | Some("fp_circle")
-            | Some("fp_poly") => {
+            | Some("fp_poly") | Some("fp_text") => {
                 let raw_layer = child_atom(child, "layer").unwrap_or("");
                 let norm_layer = match layer_norm {
                     Some(s) => remap_layer_for_side(raw_layer, s),
@@ -111,7 +116,12 @@ pub(crate) fn parse_footprint_node(
                 if norm_layer == "F.CrtYd" || norm_layer == "B.CrtYd" {
                     collect_poly_or_segment(child, y_sign, &mut crtyd_open, &mut crtyd_closed);
                 } else if norm_layer != "Edge.Cuts" {
-                    graphics.extend(parse_graphic_node(child, y_sign, layer_norm));
+                    graphics.extend(parse_graphic_node(
+                        child,
+                        y_sign,
+                        layer_norm,
+                        is_placed_pcb.then_some(fp_rot),
+                    ));
                 }
             }
             Some("zone") => {

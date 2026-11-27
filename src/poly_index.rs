@@ -166,7 +166,9 @@ impl IndexedRing {
                     let d = shape.dist_to_capsule(a, b, 0);
                     if d < best {
                         best = d;
-                        if best <= 0.0 {
+                        if best < -EPS_NM
+                            || (best <= 0.0 && matches!(shape, ResolvedShape::Poly { .. }))
+                        {
                             return best;
                         }
                     }
@@ -306,6 +308,33 @@ impl IndexedPour {
             }
         }
         0.0
+    }
+
+    /// True if `shape` strictly overlaps the interior of this pour (respecting holes).
+    pub(crate) fn overlaps_shape(&self, poly: &PourPoly, shape: &ResolvedShape) -> bool {
+        let sb = shape.bbox();
+        if self.outer.pts.len() < 3 || !sb.intersects(self.outer.bbox) {
+            return false;
+        }
+        match shape {
+            ResolvedShape::Circle { radius, .. } | ResolvedShape::Capsule { radius, .. } => {
+                if *radius <= 0 {
+                    return false;
+                }
+                if self.outer.min_dist_to_shape_bounded(shape, 0) < -EPS_NM {
+                    return true;
+                }
+                if self.holes.iter().any(|h| {
+                    h.bbox.intersects(sb) && h.min_dist_to_shape_bounded(shape, 0) < -EPS_NM
+                }) {
+                    return true;
+                }
+                self.contains_pt(shape.ref_pt())
+            }
+            ResolvedShape::Poly { verts, bbox } => {
+                self.intersects_poly(verts, *bbox) && pour_poly_overlaps_poly(poly, verts)
+            }
+        }
     }
 
     /// Exact intersection test between this pour (respecting holes) and a simple polygon `poly`.

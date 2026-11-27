@@ -628,3 +628,268 @@ fn power_via_solver_does_not_seal_adjacent_bga_pads_and_cli_place_works() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn legalize_placement_honors_allow_edge_overhang_while_enforcing_pads_and_courtyard() {
+    use boardc::ir::{PadDef, PadKind, PadShape};
+
+    let mut footprints = BTreeMap::new();
+    footprints.insert(
+        "EDGE_CONN".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Rect {
+                    width: mm(1.0),
+                    height: mm(1.0),
+                },
+                pos: Pt::new(0, mm(2.0)),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            }],
+            courtyard: rect_pts(-2.0, -3.0, 2.0, 3.0),
+            graphics: vec![],
+            keepouts: vec![],
+            models: vec![],
+            pin_types: Default::default(),
+        },
+    );
+
+    // Movable J1 starts with pad at y=0.5 (violating edge_clearance 0.3mm since pad bottom is 0.0)
+    // and overhanging courtyard; legalizer must push J1 inward until pad clears edge, while allowing
+    // its courtyard to continue overhanging the y=0 board edge.
+    let spec = BoardSpec {
+        name: "place_overhang".into(),
+        size_nm: Some([mm(20.0), mm(20.0)]),
+        layers: vec![layer_sig("F.Cu", Some(Side::Top))],
+        footprints,
+        placements: vec![Placement {
+            refdes: "J1".into(),
+            footprint: "EDGE_CONN".into(),
+            pos: Pt::new(mm(10.0), mm(-1.5)),
+            allow_edge_overhang: true,
+            pin_nets: BTreeMap::from([("1".into(), "SIG".into())]),
+            ..Default::default()
+        }],
+        rules: DesignRules {
+            edge_clearance_nm: mm(0.3),
+            courtyard_clearance_nm: mm(0.2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    let rep = legalize_placement(&mut board, &PlaceOptions::default()).unwrap();
+    assert!(rep.ok, "{rep:?}");
+    assert_eq!(rep.moved_parts.len(), 1);
+    // Pad bottom = pos.y + 2.0 - 0.5 >= 0.3 => pos.y >= -1.2mm, so courtyard bottom (-3.0) still overhangs < 0.
+    assert!(
+        board.placements[0].pos.y >= mm(-1.2) && board.placements[0].pos.y < mm(3.0),
+        "expected J1 to settle near edge with overhanging courtyard, got {:?}",
+        board.placements[0].pos
+    );
+    let drc = check_board_drc(&board);
+    assert!(
+        drc.passed,
+        "expected clean DRC after overhang placement legalization: {:?}",
+        drc.violations
+    );
+}
+
+#[test]
+fn legalize_placement_overhang_enforces_courtyard_keepout_npth_cutout_and_stays_on_board() {
+    use boardc::ir::{PadDef, PadKind, PadShape};
+
+    let mut footprints = BTreeMap::new();
+    footprints.insert(
+        "EDGE_CONN".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Rect {
+                    width: mm(1.0),
+                    height: mm(1.0),
+                },
+                pos: Pt::new(0, mm(2.0)),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            }],
+            courtyard: rect_pts(-2.0, -3.0, 2.0, 3.0),
+            graphics: vec![],
+            keepouts: vec![],
+            models: vec![],
+            pin_types: Default::default(),
+        },
+    );
+    footprints.insert(
+        "EDGE_NPTH".into(),
+        FootprintSpec::Custom {
+            pads: vec![
+                PadDef {
+                    name: "1".into(),
+                    kind: PadKind::Smd,
+                    shape: PadShape::Rect {
+                        width: mm(1.0),
+                        height: mm(1.0),
+                    },
+                    pos: Pt::new(0, mm(2.0)),
+                    rot_deg: 0.0,
+                    drill_nm: None,
+                    layers: vec!["F.Cu".into(), "F.Mask".into()],
+                    mask_margin_nm: None,
+                    paste_margin_nm: None,
+                },
+                PadDef {
+                    name: "H1".into(),
+                    kind: PadKind::Npth,
+                    shape: PadShape::Circle { diameter: mm(1.0) },
+                    pos: Pt::new(0, 0),
+                    rot_deg: 0.0,
+                    drill_nm: Some(mm(1.0)),
+                    layers: vec!["*.Mask".into()],
+                    mask_margin_nm: None,
+                    paste_margin_nm: None,
+                },
+            ],
+            courtyard: rect_pts(-2.0, -3.0, 2.0, 3.0),
+            graphics: vec![],
+            keepouts: vec![],
+            models: vec![],
+            pin_types: Default::default(),
+        },
+    );
+    footprints.insert(
+        "BOX".into(),
+        FootprintSpec::Custom {
+            pads: vec![],
+            courtyard: rect_pts(-1.0, -1.0, 1.0, 1.0),
+            graphics: vec![],
+            keepouts: vec![],
+            models: vec![],
+            pin_types: Default::default(),
+        },
+    );
+    footprints.insert(
+        "C_0402".into(),
+        FootprintSpec::Chip2Pin {
+            package: "0402".into(),
+            pin_types: Default::default(),
+        },
+    );
+
+    let base_spec =
+        |placements: Vec<Placement>, keepouts: Vec<Keepout>, cutouts: Vec<Vec<Pt>>| BoardSpec {
+            name: "overhang_place_guards".into(),
+            outline: rect_pts(0.0, 0.0, 30.0, 20.0),
+            cutouts,
+            layers: vec![layer_sig("F.Cu", Some(Side::Top))],
+            footprints: footprints.clone(),
+            placements,
+            keepouts,
+            rules: DesignRules {
+                edge_clearance_nm: mm(0.3),
+                courtyard_clearance_nm: mm(0.2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+    // 1. Courtyard-to-courtyard overlap + placement keepout push movable overhang part clear.
+    let mut b1 = BoardIr::from_spec(&base_spec(
+        vec![
+            Placement {
+                refdes: "U_LOCK".into(),
+                footprint: "C_0402".into(),
+                pos: Pt::new(mm(10.0), mm(2.5)),
+                locked: true,
+                pin_nets: BTreeMap::from([("1".into(), "A".into()), ("2".into(), "B".into())]),
+                ..Default::default()
+            },
+            Placement {
+                refdes: "J1".into(),
+                footprint: "EDGE_CONN".into(),
+                pos: Pt::new(mm(10.0), mm(0.0)),
+                allow_edge_overhang: true,
+                pin_nets: BTreeMap::from([("1".into(), "SIG".into())]),
+                ..Default::default()
+            },
+        ],
+        vec![Keepout {
+            kind: KeepoutKind::Placement,
+            layers: vec!["F.Cu".into()],
+            poly: rect_pts(8.0, 0.0, 12.0, 1.5),
+        }],
+        vec![],
+    ))
+    .unwrap();
+    let rep1 = legalize_placement(&mut b1, &PlaceOptions::default()).unwrap();
+    assert!(rep1.ok, "{rep1:?}");
+    let drc1 = check_board_drc(&b1);
+    assert!(drc1.passed, "{:?}", drc1.violations);
+
+    // 2. NPTH drill edge clearance pushes movable overhang part inward until drill clears 0.3mm.
+    let mut b2 = BoardIr::from_spec(&base_spec(
+        vec![Placement {
+            refdes: "J_NPTH".into(),
+            footprint: "EDGE_NPTH".into(),
+            pos: Pt::new(mm(10.0), mm(0.2)), // drill radius 0.5 => needs pos.y >= 0.8mm
+            allow_edge_overhang: true,
+            pin_nets: BTreeMap::from([("1".into(), "SIG".into())]),
+            ..Default::default()
+        }],
+        vec![],
+        vec![],
+    ))
+    .unwrap();
+    let rep2 = legalize_placement(&mut b2, &PlaceOptions::default()).unwrap();
+    assert!(rep2.ok, "{rep2:?}");
+    assert!(
+        b2.placements[0].pos.y >= mm(0.8),
+        "expected NPTH drill pushed inward to >= 0.8mm, got {:?}",
+        b2.placements[0].pos
+    );
+    let drc2 = check_board_drc(&b2);
+    assert!(drc2.passed, "{:?}", drc2.violations);
+
+    // 3. Interior cutout rejects courtyard overhang and padless part stays anchored to board.
+    let mut b3 = BoardIr::from_spec(&base_spec(
+        vec![
+            Placement {
+                refdes: "J_CUT".into(),
+                footprint: "EDGE_CONN".into(),
+                pos: Pt::new(mm(15.0), mm(11.2)), // pad clears cutout, courtyard top y=14.2 hits cutout [14..16]
+                allow_edge_overhang: true,
+                pin_nets: BTreeMap::from([("1".into(), "SIG".into())]),
+                ..Default::default()
+            },
+            Placement {
+                refdes: "MECH1".into(),
+                footprint: "BOX".into(),
+                pos: Pt::new(mm(5.0), mm(-2.0)), // completely off-board initially
+                allow_edge_overhang: true,
+                ..Default::default()
+            },
+        ],
+        vec![],
+        vec![rect_pts(14.0, 14.0, 16.0, 16.0)],
+    ))
+    .unwrap();
+    let rep3 = legalize_placement(&mut b3, &PlaceOptions::default()).unwrap();
+    assert!(rep3.ok, "{rep3:?}");
+    assert!(
+        b3.placements[1].pos.y > mm(-1.0),
+        "expected padless part moved back onto board, got {:?}",
+        b3.placements[1].pos
+    );
+    let drc3 = check_board_drc(&b3);
+    assert!(drc3.passed, "{:?}", drc3.violations);
+}

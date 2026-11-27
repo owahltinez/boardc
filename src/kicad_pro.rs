@@ -21,6 +21,12 @@ pub(crate) fn parse_kicad_pro(
         serde_json::from_str(src).map_err(|e| format!("failed to parse .kicad_pro JSON: {e}"))?;
     let mut has_min_via_dia = false;
     let mut has_min_via_drill = false;
+    let mask_bridge_sev = root
+        .get("board")
+        .and_then(|b| b.get("design_settings"))
+        .and_then(|d| d.get("rule_severities"))
+        .and_then(|s| s.get("solder_mask_bridge"))
+        .and_then(Value::as_str);
     if let Some(r) = root
         .get("board")
         .and_then(|b| b.get("design_settings"))
@@ -48,6 +54,17 @@ pub(crate) fn parse_kicad_pro(
         }
         if let Some(v) = json_mm(r, "min_hole_clearance") {
             rules.hole_clearance_nm = Some(v);
+        }
+        if mask_bridge_sev != Some("ignore")
+            && let Some(v) = r
+                .get("solder_mask_to_copper_clearance")
+                .and_then(Value::as_f64)
+        {
+            if v > 0.0 {
+                rules.mask_to_copper_nm = Some(mm(v));
+            } else if v == 0.0 && matches!(mask_bridge_sev, Some("error" | "warning")) {
+                rules.mask_to_copper_nm = Some(0);
+            }
         }
     }
     if let Some(ns) = root.get("net_settings") {

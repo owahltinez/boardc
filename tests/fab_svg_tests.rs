@@ -74,6 +74,7 @@ fn make_4layer_board() -> BoardIr {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -572,6 +573,7 @@ fn regression_cw_poly_mask_expands_and_blind_via_splits_drill_file() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -1262,6 +1264,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -1282,6 +1285,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -1305,6 +1309,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -1608,6 +1613,382 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
         .output()
         .unwrap();
     assert!(!res_conflict.status.success());
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn graphic_text_and_revision_render_across_gbrjob_gerbers_and_svg() {
+    use boardc::ir::Graphic;
+
+    let tmp = fresh_tmp_dir("graphic_text_rev");
+    let spec = BoardSpec {
+        name: "draco".into(),
+        title: Some("Draco Rev A1".into()),
+        revision: Some("A1".into()),
+        size_nm: Some([mm(60.0), mm(50.0)]),
+        graphics: vec![
+            // Multi-line top silkscreen text partially crossed by an F.Mask opening.
+            Graphic::Text {
+                layer: "F.SilkS".into(),
+                text: "DRACO\nREV A1".into(),
+                pos: Pt::new(30_600_000, 32_000_000),
+                height_nm: 1_200_000,
+                stroke_nm: 150_000,
+                rot_deg: 0.0,
+            },
+            Graphic::Rect {
+                layer: "F.Mask".into(),
+                min: Pt::new(29_500_000, 30_000_000),
+                max: Pt::new(31_700_000, 34_000_000),
+                width: 0,
+                fill: true,
+            },
+            // Multi-line bottom silkscreen text: top line 'L' sits on left in bottom view (world x > 15).
+            Graphic::Text {
+                layer: "B.SilkS".into(),
+                text: "L1\nAB".into(),
+                pos: Pt::new(mm(15.0), mm(15.0)),
+                height_nm: mm(1.2),
+                stroke_nm: mm(0.15),
+                rot_deg: 0.0,
+            },
+            // Non-silk copper and fab Graphic::Text.
+            Graphic::Text {
+                layer: "F.Cu".into(),
+                text: "CU".into(),
+                pos: Pt::new(mm(45.0), mm(10.0)),
+                height_nm: mm(1.0),
+                stroke_nm: mm(0.15),
+                rot_deg: 90.0,
+            },
+            Graphic::Text {
+                layer: "F.Fab".into(),
+                text: "FAB".into(),
+                pos: Pt::new(mm(10.0), mm(40.0)),
+                height_nm: mm(1.0),
+                stroke_nm: mm(0.12),
+                rot_deg: 0.0,
+            },
+        ],
+        rules: DesignRules {
+            silk_clearance_nm: mm(0.1),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let board = BoardIr::from_spec(&spec).unwrap();
+    let fab_dir = tmp.join("fab");
+    let manifest = export_fab(
+        &board,
+        &fab_dir,
+        &FabOptions {
+            clip_silk_to_mask: true,
+            assembly: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // gbrjob emits custom Revision "A1" and passes verification; tampering Revision fails.
+    let job_orig = fs::read_to_string(&manifest.gbrjob).unwrap();
+    let job_json: serde_json::Value = serde_json::from_str(&job_orig).unwrap();
+    assert_eq!(job_json["GeneralSpecs"]["ProjectId"]["Revision"], "A1");
+    let rep = boardc::verify::verify_fab_outputs(&board, &fab_dir).unwrap();
+    assert!(rep.passed, "verify failed: {:?}", rep.errors);
+
+    let mut bad_job = job_json.clone();
+    bad_job["GeneralSpecs"]["ProjectId"]["Revision"] = serde_json::json!("99");
+    fs::write(&manifest.gbrjob, serde_json::to_string(&bad_job).unwrap()).unwrap();
+    assert!(boardc::verify::verify_fab_outputs(&board, &fab_dir).is_err());
+    fs::write(&manifest.gbrjob, &job_orig).unwrap();
+
+    // Board without revision falls back to "1" in gbrjob.
+    let default_board = BoardIr::from_spec(&BoardSpec {
+        name: "def_rev".into(),
+        revision: Some("   ".into()),
+        size_nm: Some([mm(20.0), mm(20.0)]),
+        ..Default::default()
+    })
+    .unwrap();
+    let fab_def = tmp.join("fab_def");
+    let man_def = export_fab(&default_board, &fab_def, &FabOptions::default()).unwrap();
+    let def_job: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&man_def.gbrjob).unwrap()).unwrap();
+    assert_eq!(def_job["GeneralSpecs"]["ProjectId"]["Revision"], "1");
+
+    // Top silkscreen Graphic::Text emits strokes and gets clipped against F.Mask [29.5, 31.7].
+    let f_silk_segs = gerber_stroke_segments_mm(&fab_dir.join("F_Silkscreen.gto"));
+    assert!(
+        !f_silk_segs.is_empty(),
+        "expected strokes on F_Silkscreen.gto for Graphic::Text"
+    );
+    assert!(
+        f_silk_segs.iter().all(|&((x0, y0), (x1, y1))| {
+            let inside = |x: f64, y: f64| x > 29.35 && x < 31.85 && y > 29.85 && y < 34.15;
+            !(inside(x0, y0) && inside(x1, y1))
+        }),
+        "expected F.SilkS Graphic::Text strokes inside F.Mask opening to be clipped: {f_silk_segs:?}"
+    );
+
+    // Bottom silkscreen Graphic::Text is mirrored horizontally (x > 15 on left char, y > 15 on top line).
+    let b_silk_segs = gerber_stroke_segments_mm(&fab_dir.join("B_Silkscreen.gbo"));
+    assert!(!b_silk_segs.is_empty());
+    assert!(
+        b_silk_segs
+            .iter()
+            .any(|&((x0, y0), (_, y1))| y0 > 15.1 && y1 > 15.1 && x0 > 15.1),
+        "expected top line 'L' mirrored to x > 15 in world coords: {b_silk_segs:?}"
+    );
+    assert!(
+        b_silk_segs
+            .iter()
+            .any(|&((_, y0), (_, y1))| y0 < 14.9 && y1 < 14.9),
+        "expected second line 'AB' below center (y < 15): {b_silk_segs:?}"
+    );
+
+    // Copper layer Graphic::Text emits strokes on F_Cu.gtl.
+    let f_cu_segs = gerber_stroke_segments_mm(&fab_dir.join("F_Cu.gtl"));
+    assert!(
+        f_cu_segs
+            .iter()
+            .any(|&((x0, y0), (x1, y1))| x0 > 43.0 && x1 < 47.0 && y0 > 8.0 && y1 < 12.0),
+        "expected copper Graphic::Text strokes near (45, 10) on F_Cu.gtl, got: {f_cu_segs:?}"
+    );
+
+    // Top, Bottom, and Assembly SVGs render Graphic::Text strokes.
+    let top_svg = render_board_svg(&board, None, &SvgOptions::default());
+    assert!(
+        top_svg
+            .split("id=\"silkscreen\"")
+            .nth(1)
+            .unwrap()
+            .contains("<line "),
+        "expected Top SVG silkscreen lines for Graphic::Text"
+    );
+    let bot_svg = render_board_svg(
+        &board,
+        None,
+        &SvgOptions {
+            view: SvgView::Bottom,
+            ..Default::default()
+        },
+    );
+    assert!(
+        bot_svg
+            .split("id=\"silkscreen\"")
+            .nth(1)
+            .unwrap()
+            .contains("<line "),
+        "expected Bottom SVG silkscreen lines for Graphic::Text"
+    );
+    let assy_top = fs::read_to_string(&manifest.assembly_svgs[0]).unwrap();
+    let fab_group = assy_top.split("id=\"fab\"").nth(1).unwrap();
+    assert!(
+        fab_group.contains("<line "),
+        "expected Assembly Top SVG fab group to render F.Fab Graphic::Text"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+type SegMm = ((f64, f64), (f64, f64));
+
+fn svg_line_segments_mm(svg_fragment: &str) -> Vec<SegMm> {
+    let parse_attr = |line: &str, key: &str| -> Option<f64> {
+        let pat = format!("{key}=\"");
+        let start = line.find(&pat)? + pat.len();
+        let end = line[start..].find('"')? + start;
+        line[start..end].parse::<f64>().ok()
+    };
+    svg_fragment
+        .lines()
+        .filter(|l| l.contains("<line "))
+        .filter_map(|l| {
+            Some((
+                (parse_attr(l, "x1")?, parse_attr(l, "y1")?),
+                (parse_attr(l, "x2")?, parse_attr(l, "y2")?),
+            ))
+        })
+        .collect()
+}
+
+fn has_seg_mm(segs: &[SegMm], p0: (f64, f64), p1: (f64, f64)) -> bool {
+    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01;
+    segs.iter()
+        .any(|&(a, b)| (near(a, p0) && near(b, p1)) || (near(a, p1) && near(b, p0)))
+}
+
+#[test]
+fn footprint_graphic_text_and_rotated_bottom_silk_coordinates() {
+    use boardc::ir::Graphic;
+
+    let tmp = fresh_tmp_dir("fp_text_coords");
+    let mut footprints = BTreeMap::new();
+    footprints.insert(
+        "FP_TXT".into(),
+        FootprintSpec::Custom {
+            pads: Vec::new(),
+            courtyard: Vec::new(),
+            graphics: vec![
+                Graphic::Text {
+                    layer: "F.SilkS".into(),
+                    text: "L".into(),
+                    pos: Pt::new(mm(2.0), 0),
+                    height_nm: mm(1.2),
+                    stroke_nm: mm(0.15),
+                    rot_deg: 0.0,
+                },
+                Graphic::Text {
+                    layer: "F.Fab".into(),
+                    text: "L".into(),
+                    pos: Pt::new(mm(2.0), 0),
+                    height_nm: mm(1.2),
+                    stroke_nm: mm(0.12),
+                    rot_deg: 0.0,
+                },
+            ],
+            keepouts: Vec::new(),
+            models: Vec::new(),
+            pin_types: Default::default(),
+        },
+    );
+
+    let spec = BoardSpec {
+        name: "fp_text_coords".into(),
+        size_nm: Some([mm(60.0), mm(50.0)]),
+        footprints,
+        placements: vec![
+            Placement {
+                refdes: "U_TOP".into(),
+                footprint: "FP_TXT".into(),
+                pos: Pt::new(mm(20.0), mm(20.0)),
+                rot_deg: 90.0,
+                side: Side::Top,
+                ..Default::default()
+            },
+            Placement {
+                refdes: "U_BOT".into(),
+                footprint: "FP_TXT".into(),
+                pos: Pt::new(mm(40.0), mm(20.0)),
+                rot_deg: 0.0,
+                side: Side::Bottom,
+                ..Default::default()
+            },
+        ],
+        graphics: vec![
+            // F.Mask opening over top tip (19.4, 21.61) of U_TOP's F.SilkS 'L', leaving (20.6, 21.61)->(20.6, 22.39).
+            Graphic::Rect {
+                layer: "F.Mask".into(),
+                min: Pt::new(mm(19.2), mm(21.4)),
+                max: Pt::new(mm(20.2), mm(22.0)),
+                width: 0,
+                fill: true,
+            },
+            // Board-level B.SilkS 'L' rotated 90 deg at (15, 30).
+            Graphic::Text {
+                layer: "B.SilkS".into(),
+                text: "L".into(),
+                pos: Pt::new(mm(15.0), mm(30.0)),
+                height_nm: mm(1.2),
+                stroke_nm: mm(0.15),
+                rot_deg: 90.0,
+            },
+        ],
+        rules: DesignRules {
+            silk_clearance_nm: mm(0.1),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let board = BoardIr::from_spec(&spec).unwrap();
+    let fab_dir = tmp.join("fab");
+    let manifest = export_fab(
+        &board,
+        &fab_dir,
+        &FabOptions {
+            clip_silk_to_mask: true,
+            assembly: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Footprint F.SilkS 'L' on Side::Top gets clipped by F.Mask around (19.4, 21.61) while keeping (20.6, 21.61)->(20.6, 22.39).
+    let f_silk_segs = gerber_stroke_segments_mm(&fab_dir.join("F_Silkscreen.gto"));
+    assert!(
+        has_seg_mm(&f_silk_segs, (20.6, 21.61), (20.6, 22.39)),
+        "expected unclipped leg of U_TOP 'L': {f_silk_segs:?}"
+    );
+    assert!(
+        f_silk_segs.iter().all(|&((x0, y0), (x1, y1))| {
+            let inside = |x: f64, y: f64| x > 19.1 && x < 20.3 && y > 21.3 && y < 22.1;
+            !(inside(x0, y0) && inside(x1, y1))
+        }),
+        "expected U_TOP F.SilkS text inside F.Mask opening to be clipped: {f_silk_segs:?}"
+    );
+
+    // B_Silkscreen.gbo has U_BOT footprint text (41.61, 19.4)->(41.61, 20.6)->(42.39, 20.6) and rotated board B.SilkS text.
+    let b_silk_segs = gerber_stroke_segments_mm(&fab_dir.join("B_Silkscreen.gbo"));
+    assert!(
+        has_seg_mm(&b_silk_segs, (41.61, 19.4), (41.61, 20.6))
+            && has_seg_mm(&b_silk_segs, (41.61, 20.6), (42.39, 20.6)),
+        "expected U_BOT footprint B.SilkS 'L' coords: {b_silk_segs:?}"
+    );
+    assert!(
+        has_seg_mm(&b_silk_segs, (14.4, 30.39), (15.6, 30.39))
+            && has_seg_mm(&b_silk_segs, (15.6, 30.39), (15.6, 29.61)),
+        "expected rotated board B.SilkS 'L' coords: {b_silk_segs:?}"
+    );
+
+    // Board SVGs render exact Y-down (and Bottom-mirrored) coordinates for footprint and rotated board text.
+    let top_svg = render_board_svg(&board, None, &SvgOptions::default());
+    let top_silk_svg = svg_line_segments_mm(top_svg.split("id=\"silkscreen\"").nth(1).unwrap());
+    assert!(
+        has_seg_mm(&top_silk_svg, (19.4, -21.61), (20.6, -21.61))
+            && has_seg_mm(&top_silk_svg, (20.6, -21.61), (20.6, -22.39)),
+        "expected U_TOP SVG silk coords: {top_silk_svg:?}"
+    );
+
+    let bot_svg = render_board_svg(
+        &board,
+        None,
+        &SvgOptions {
+            view: SvgView::Bottom,
+            ..Default::default()
+        },
+    );
+    let bot_silk_svg = svg_line_segments_mm(bot_svg.split("id=\"silkscreen\"").nth(1).unwrap());
+    assert!(
+        has_seg_mm(&bot_silk_svg, (-41.61, -19.4), (-41.61, -20.6))
+            && has_seg_mm(&bot_silk_svg, (-41.61, -20.6), (-42.39, -20.6)),
+        "expected U_BOT Bottom SVG silk coords: {bot_silk_svg:?}"
+    );
+    assert!(
+        has_seg_mm(&bot_silk_svg, (-14.4, -30.39), (-15.6, -30.39))
+            && has_seg_mm(&bot_silk_svg, (-15.6, -30.39), (-15.6, -29.61)),
+        "expected rotated B.SilkS Bottom SVG silk coords: {bot_silk_svg:?}"
+    );
+
+    // Top and Bottom Assembly SVGs render exact footprint F.Fab / B.Fab text coordinates.
+    assert_eq!(manifest.assembly_svgs.len(), 2);
+    let assy_top = fs::read_to_string(&manifest.assembly_svgs[0]).unwrap();
+    let assy_top_segs = svg_line_segments_mm(assy_top.split("id=\"fab\"").nth(1).unwrap());
+    assert!(
+        has_seg_mm(&assy_top_segs, (19.4, -21.61), (20.6, -21.61))
+            && has_seg_mm(&assy_top_segs, (20.6, -21.61), (20.6, -22.39)),
+        "expected U_TOP Assembly Top SVG fab coords: {assy_top_segs:?}"
+    );
+
+    let assy_bot = fs::read_to_string(&manifest.assembly_svgs[1]).unwrap();
+    let assy_bot_segs = svg_line_segments_mm(assy_bot.split("id=\"fab\"").nth(1).unwrap());
+    assert!(
+        has_seg_mm(&assy_bot_segs, (-41.61, -19.4), (-41.61, -20.6))
+            && has_seg_mm(&assy_bot_segs, (-41.61, -20.6), (-42.39, -20.6)),
+        "expected U_BOT Assembly Bottom SVG fab coords: {assy_bot_segs:?}"
+    );
 
     let _ = fs::remove_dir_all(&tmp);
 }
