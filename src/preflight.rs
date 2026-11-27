@@ -11,6 +11,7 @@ use crate::drc_rules::check_edge_clearances;
 use crate::drc_scene::{
     collect_keepouts, collect_pads, collect_pours, collect_tracks, collect_vias,
 };
+use crate::erc::{ErcViolation, check_board_erc};
 use crate::ir::{BoardIr, Pt};
 use crate::route::{point_from_viahop as pt_from_viahop, to_viahop_board};
 use crate::zones::{ZoneChoke, analyze_zone_chokes, fill_zones};
@@ -77,6 +78,8 @@ pub struct PreflightSummary {
     pub sealed_pads: Vec<PreflightSealedPad>,
     pub blocked_nets: Vec<PreflightBlockedNet>,
     pub fixed_violations: Vec<PreflightFixedViolation>,
+    #[serde(default)]
+    pub erc_violations: Vec<ErcViolation>,
     pub elapsed_ms: u128,
 }
 
@@ -181,12 +184,15 @@ pub fn run_preflight(
         })
         .collect();
 
+    let erc = check_board_erc(board);
+
     let ok = !vreport.stopped_early
         && layout_violations.is_empty()
         && zone_chokes.is_empty()
         && sealed_pads.is_empty()
         && blocked_nets.is_empty()
-        && fixed_violations.is_empty();
+        && fixed_violations.is_empty()
+        && erc.passed;
 
     Ok(PreflightSummary {
         ok,
@@ -201,6 +207,7 @@ pub fn run_preflight(
         sealed_pads,
         blocked_nets,
         fixed_violations,
+        erc_violations: erc.violations,
         elapsed_ms: start.elapsed().as_millis(),
     })
 }

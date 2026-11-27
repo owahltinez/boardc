@@ -475,7 +475,13 @@ fn footprint_lib_errors_precedence_and_path_traversal_guards() {
         name: "override".into(),
         size_nm: Some([mm(20.0), mm(20.0)]),
         footprint_libs: vec!["lib.pretty".into()],
-        footprints: BTreeMap::from([("R_0402".into(), FootprintSpec::Sot23 { pin_count: 3 })]),
+        footprints: BTreeMap::from([(
+            "R_0402".into(),
+            FootprintSpec::Sot23 {
+                pin_count: 3,
+                pin_types: Default::default(),
+            },
+        )]),
         placements: vec![Placement {
             refdes: "R1".into(),
             footprint: "R_0402".into(),

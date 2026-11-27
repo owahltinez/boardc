@@ -34,6 +34,7 @@ fn make_two_sided_4layer_board() -> BoardIr {
         "C_0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -43,6 +44,7 @@ fn make_two_sided_4layer_board() -> BoardIr {
             pitch_nm: mm(0.5),
             body_nm: mm(3.0),
             ep_nm: mm(1.4),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -50,6 +52,7 @@ fn make_two_sided_4layer_board() -> BoardIr {
         FootprintSpec::PinHeader {
             pins: 2,
             pitch_nm: mm(2.54),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -75,6 +78,7 @@ fn make_two_sided_4layer_board() -> BoardIr {
                 fill: false,
             }],
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
 
@@ -209,6 +213,7 @@ fn make_one_sided_smd_board() -> BoardIr {
         "C_0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     let spec = BoardSpec {
@@ -750,6 +755,7 @@ fn roast_regressions_tools_bounds_asymmetric_mirror_and_edge_cases() {
         FootprintSpec::PinHeader {
             pins: 2,
             pitch_nm: mm(2.54),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -787,6 +793,7 @@ fn roast_regressions_tools_bounds_asymmetric_mirror_and_edge_cases() {
                 },
             ],
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -806,6 +813,7 @@ fn roast_regressions_tools_bounds_asymmetric_mirror_and_edge_cases() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
 

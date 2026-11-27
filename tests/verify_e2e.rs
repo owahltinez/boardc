@@ -37,6 +37,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
         "C_0603".into(),
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -44,6 +45,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
         FootprintSpec::PinHeader {
             pins: 2,
             pitch_nm: mm(2.54),
+            pin_types: Default::default(),
         },
     );
 

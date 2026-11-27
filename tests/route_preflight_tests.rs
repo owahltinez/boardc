@@ -79,6 +79,7 @@ fn build_2layer_board() -> BoardIr {
         "R_0603".into(),
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -88,6 +89,7 @@ fn build_2layer_board() -> BoardIr {
             pitch_nm: mm(0.8),
             body_nm: mm(4.0),
             ep_nm: 0,
+            pin_types: Default::default(),
         },
     );
 
@@ -172,6 +174,7 @@ fn route_4layer_board_ir_with_inner_planes_clean_drc() {
         "R_0603".into(),
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
+            pin_types: Default::default(),
         },
     );
     let mut nets = BTreeMap::new();
@@ -373,6 +376,7 @@ fn length_constraints_propagate_to_viahop() {
         "R_0603".into(),
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
+            pin_types: Default::default(),
         },
     );
     let mut net_classes = BTreeMap::new();
@@ -488,6 +492,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
         "C_0603".into(),
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -497,6 +502,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
             cols: 3,
             pitch_nm: mm(0.5),
             ball_dia_nm: mm(0.3),
+            pin_types: Default::default(),
         },
     );
     footprints.insert(
@@ -516,6 +522,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
 
@@ -753,6 +760,7 @@ fn preflight_catches_edge_keepout_blocked_net_and_fixed_violation() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
 
@@ -865,6 +873,7 @@ fn regression_ignore_and_reroute_preserve_unlocked_copper_and_copper_keepout_all
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            pin_types: Default::default(),
         },
     );
     let pad = |refdes: &str, x: f64, y: f64, net: &str| Placement {

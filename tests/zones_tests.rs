@@ -49,6 +49,7 @@ fn single_pad_fp(size_mm: f64, kind: PadKind, layers: Vec<&str>) -> FootprintSpe
         courtyard: Vec::new(),
         graphics: Vec::new(),
         keepouts: Vec::new(),
+        pin_types: Default::default(),
     }
 }
 
@@ -648,6 +649,7 @@ fn cli_zones_writes_filled_board_and_report_json() {
         "C_0402".into(),
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
+            pin_types: Default::default(),
         },
     );
     let mut c1_nets = BTreeMap::new();

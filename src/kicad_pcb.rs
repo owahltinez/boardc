@@ -557,7 +557,8 @@ fn parse_placed_footprint(
                 && existing.courtyard == fp_def.courtyard
                 && existing.graphics == fp_def.graphics
                 && existing.keepouts == fp_def.keepouts
-                && existing.models == fp_def.models =>
+                && existing.models == fp_def.models
+                && existing.pin_types == fp_def.pin_types =>
         {
             fp_def.name.clone()
         }
@@ -649,6 +650,7 @@ fn parse_placed_footprint(
         side,
         locked: has_flag(node, "locked"),
         pin_nets,
+        pin_types: BTreeMap::new(),
         mpn,
         lcsc,
         dnp,

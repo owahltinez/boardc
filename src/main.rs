@@ -6,7 +6,8 @@ use std::process;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use boardc::drc::{check_board_drc, cluster_kicad_drc_json};
+use boardc::drc::{Severity, check_board_drc, cluster_kicad_drc_json};
+use boardc::erc::check_board_erc;
 use boardc::fab::{FabOptions, export_fab};
 use boardc::ir::{
     BoardIr, BoardSpec, Constraints, FootprintSpec, LayerDef, LayerKind, MaxLengthRule, Placement,
@@ -148,6 +149,12 @@ enum Command {
         #[arg(long)]
         report: Option<PathBuf>,
     },
+    /// Run electrical rules check (single-pin nets, driver conflicts, undriven/unconnected pins).
+    Erc {
+        input: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Run continuous DRC engine and spatial hotspot clusterer.
     Drc {
         input: PathBuf,
@@ -237,6 +244,7 @@ fn sample_spec() -> BoardSpec {
             "C_0402".into(),
             FootprintSpec::Chip2Pin {
                 package: "0402".into(),
+                pin_types: BTreeMap::new(),
             },
         ),
         (
@@ -246,6 +254,7 @@ fn sample_spec() -> BoardSpec {
                 pitch_nm: mm(0.5),
                 body_nm: mm(3.0),
                 ep_nm: mm(1.6),
+                pin_types: BTreeMap::new(),
             },
         ),
     ]);
@@ -327,15 +336,7 @@ struct JsonBoardProbe {
 }
 
 fn validate_loaded_ir(ir: BoardIr, path: &Path) -> Result<BoardIr, String> {
-    for p in &ir.placements {
-        if p.footprint.trim().is_empty() {
-            return Err(format!(
-                "board IR '{}' placement '{}' has empty footprint",
-                path.display(),
-                p.refdes
-            ));
-        }
-    }
+    boardc::spec::validate_board_ir_pins(&ir, path)?;
     Ok(ir)
 }
 
@@ -364,12 +365,18 @@ fn load_board_input(path: &Path) -> Result<BoardIr, String> {
                 .map_err(|e| format!("failed to parse board IR '{}': {e}", path.display()))?;
             return validate_loaded_ir(ir, path);
         }
-        if let Ok(spec) = serde_json::from_str::<BoardSpec>(&text) {
-            return BoardIr::from_spec_with_base(&spec, base);
+        match serde_json::from_str::<BoardSpec>(&text) {
+            Ok(spec) => return BoardIr::from_spec_with_base(&spec, base),
+            Err(spec_err) => {
+                if let Ok(ir) = serde_json::from_str::<BoardIr>(&text) {
+                    return validate_loaded_ir(ir, path);
+                }
+                return Err(format!(
+                    "failed to parse JSON spec '{}': {spec_err}",
+                    path.display()
+                ));
+            }
         }
-        let ir: BoardIr = serde_json::from_str(&text)
-            .map_err(|e| format!("failed to parse board IR '{}': {e}", path.display()))?;
-        return validate_loaded_ir(ir, path);
     }
 
     let spec: BoardSpec = toml::from_str(&text)
@@ -443,13 +450,20 @@ fn run(cli: Cli) -> Result<(), String> {
                 print_json(&report, "BuildReport")?;
             } else {
                 let hits = report.stages.iter().filter(|s| s.cache_hit).count();
+                let erc_errs = report
+                    .preflight
+                    .erc_violations
+                    .iter()
+                    .filter(|v| v.severity == Severity::Error)
+                    .count();
                 println!(
-                    "Build {}: {}/{} nets routed ({} unconnected), {} chokes, {} DRC errors, {}/{} stages cached ({}ms)",
+                    "Build {}: {}/{} nets routed ({} unconnected), {} chokes, {} ERC errors, {} DRC errors, {}/{} stages cached ({}ms)",
                     if report.ok { "OK" } else { "FAILED" },
                     report.route.routed_nets,
                     report.route.routable_nets,
                     report.route.unconnected_pairs,
                     report.zones.chokes.len(),
+                    erc_errs,
                     report.drc.error_count,
                     hits,
                     report.stages.len(),
@@ -468,8 +482,14 @@ fn run(cli: Cli) -> Result<(), String> {
             if json {
                 print_json(&summary, "PreflightSummary")?;
             } else {
+                let erc_errs = summary
+                    .erc_violations
+                    .iter()
+                    .filter(|v| v.severity == Severity::Error)
+                    .count();
+                let erc_warns = summary.erc_violations.len() - erc_errs;
                 println!(
-                    "Preflight {}: {}/{} routable nets, {} layout violations, {} zone chokes, {} sealed pads, {} blocked nets, {} fixed violations, grid={:.1}um ({}ms)",
+                    "Preflight {}: {}/{} routable nets, {} layout violations, {} zone chokes, {} sealed pads, {} blocked nets, {} fixed violations, {} ERC errors ({} warnings), grid={:.1}um ({}ms)",
                     if summary.ok { "PASSED" } else { "FAILED" },
                     summary.routable_nets,
                     summary.total_nets,
@@ -478,6 +498,8 @@ fn run(cli: Cli) -> Result<(), String> {
                     summary.sealed_pads.len(),
                     summary.blocked_nets.len(),
                     summary.fixed_violations.len(),
+                    erc_errs,
+                    erc_warns,
                     summary.grid_step_um,
                     summary.elapsed_ms,
                 );
@@ -584,6 +606,30 @@ fn run(cli: Cli) -> Result<(), String> {
                 save_board_json(&ir, &out_path)?;
             } else {
                 print_json(&ir, "BoardIr")?;
+            }
+            Ok(())
+        }
+        Command::Erc { input, json } => {
+            let ir = load_board_input(&input)?;
+            let report = check_board_erc(&ir);
+            if json {
+                print_json(&report, "ErcReport")?;
+            } else {
+                println!(
+                    "ERC {}: {} errors, {} warnings ({} nets, {} typed pins)",
+                    if report.passed { "PASSED" } else { "FAILED" },
+                    report.error_count,
+                    report.warning_count,
+                    report.checked_nets,
+                    report.typed_pins
+                );
+                for (i, v) in report.violations.iter().enumerate() {
+                    let sev = match v.severity {
+                        Severity::Error => "ERROR",
+                        Severity::Warning => "WARN",
+                    };
+                    println!("  [{}] {sev} {:?}: {}", i + 1, v.kind, v.message);
+                }
             }
             Ok(())
         }
