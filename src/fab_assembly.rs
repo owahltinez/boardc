@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 
+use crate::fab_silk::text_graphic_local_segments;
 use crate::geom::{local_to_board, pad_copper_layers, remap_layer_for_side};
 use crate::ir::{BBoxNm, BoardIr, FootprintDef, Graphic, PadKind, Placement, Pt, Side, nm_to_mm};
 use crate::shapes::pad_to_world_shape;
@@ -37,12 +38,25 @@ fn push_graphic_local_pts(g: &Graphic, pts: &mut Vec<Pt>) {
             pts.push(*min);
             pts.push(*max);
         }
-        Graphic::Circle { center, radius, .. } if *radius > 0 => {
-            pts.push(Pt::new(center.x - *radius, center.y - *radius));
-            pts.push(Pt::new(center.x + *radius, center.y + *radius));
+        Graphic::Circle { center, radius, .. } => {
+            if *radius > 0 {
+                pts.push(Pt::new(center.x - *radius, center.y - *radius));
+                pts.push(Pt::new(center.x + *radius, center.y + *radius));
+            }
         }
         Graphic::Poly { verts, .. } => pts.extend_from_slice(verts),
-        _ => {}
+        Graphic::Text { pos, .. } => {
+            if let Some((segs, _)) = text_graphic_local_segments(g)
+                && !segs.is_empty()
+            {
+                for (a, b) in segs {
+                    pts.push(a);
+                    pts.push(b);
+                }
+            } else {
+                pts.push(*pos);
+            }
+        }
     }
 }
 

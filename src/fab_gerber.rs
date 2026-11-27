@@ -12,6 +12,7 @@ use gerber_types::{
     ZeroOmission,
 };
 
+use crate::fab_silk::text_graphic_world_segments;
 use crate::geom::{ensure_ccw, local_to_board, polygon_area};
 use crate::ir::{BBoxNm, Graphic, Nm, PadDef, PadShape, Placement, Pt, nm_to_mm, safe_slug};
 use crate::shapes::{
@@ -331,6 +332,13 @@ impl GerberBuilder {
                     self.fill_region(&pts, Polarity::Dark);
                 } else {
                     self.stroke_closed_poly(&pts, *width);
+                }
+            }
+            Graphic::Text { .. } => {
+                let mut segs = Vec::new();
+                text_graphic_world_segments(g, pl, &mut segs);
+                for (a, b, w) in segs {
+                    self.stroke_segment(a, b, w);
                 }
             }
         }

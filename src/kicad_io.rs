@@ -14,7 +14,7 @@ use crate::ir::{
 use crate::kicad_geom::{
     atom_at, chain_segments, child_atom, collect_poly_or_segment, f64_at, parse_at, parse_fill,
     parse_graphic_node, parse_kicad_sexp, parse_layers_list, parse_net_ref, parse_pt, parse_pts,
-    parse_stroke_width,
+    parse_stroke_width, parse_text_graphic,
 };
 pub use crate::kicad_net::{
     KicadNetlist, NetlistComponent, NetlistNet, load_kicad_net, parse_kicad_net,
@@ -109,6 +109,39 @@ pub(crate) fn parse_footprint_node(
                     collect_poly_or_segment(child, y_sign, &mut crtyd_open, &mut crtyd_closed);
                 } else if norm_layer != "Edge.Cuts" {
                     graphics.extend(parse_graphic_node(child, y_sign, layer_norm));
+                }
+            }
+            Some("fp_text") => {
+                if atom_at(child, 1) == Some("user")
+                    && let Some(text) = atom_at(child, 2)
+                {
+                    let raw_layer = child_atom(child, "layer").unwrap_or("");
+                    let norm_layer = match layer_norm {
+                        Some(s) => remap_layer_for_side(raw_layer, s),
+                        None => raw_layer.to_string(),
+                    };
+                    if norm_layer != "F.CrtYd"
+                        && norm_layer != "B.CrtYd"
+                        && norm_layer != "Edge.Cuts"
+                    {
+                        let raw_rot = child
+                            .find_child("at")
+                            .and_then(|n| parse_at(n, y_sign))
+                            .map(|(_, r)| r)
+                            .unwrap_or(0.0);
+                        let local_rot = if !is_placed_pcb {
+                            raw_rot
+                        } else if unflip_bottom {
+                            fp_rot - raw_rot + 180.0
+                        } else {
+                            raw_rot - fp_rot
+                        };
+                        if let Some(g) =
+                            parse_text_graphic(child, y_sign, norm_layer, text, Some(local_rot))
+                        {
+                            graphics.push(g);
+                        }
+                    }
                 }
             }
             Some("zone") => {

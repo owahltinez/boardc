@@ -665,3 +665,145 @@ fn export_and_import_kicad_pcb_preserves_via_tenting() {
     )"#;
     assert!(!parse_kicad_pcb(kicad8_plot, None).unwrap().vias[0].tented);
 }
+
+#[test]
+fn export_and_import_kicad_pcb_roundtrips_title_revision_and_graphic_text() {
+    use boardc::ir::{BoardIr, BoardSpec, FootprintSpec, PadDef, Placement};
+    use boardc::kicad_export::render_kicad_pcb;
+    use std::collections::BTreeMap;
+
+    let mut footprints = BTreeMap::new();
+    footprints.insert(
+        "TAG_FP".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Rect {
+                    width: mm(1.0),
+                    height: mm(1.0),
+                },
+                pos: Pt::new(0, 0),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            }],
+            courtyard: Vec::new(),
+            graphics: vec![Graphic::Text {
+                layer: "F.SilkS".into(),
+                text: "PIN1".into(),
+                pos: Pt::new(mm(1.5), mm(-0.5)),
+                height_nm: 600_000,
+                stroke_nm: 120_000,
+                rot_deg: 15.0,
+            }],
+            keepouts: Vec::new(),
+            pin_types: BTreeMap::new(),
+        },
+    );
+
+    let spec = BoardSpec {
+        name: "draco".into(),
+        title: Some("Draco Rev A1".into()),
+        revision: Some("A1".into()),
+        size_nm: Some([mm(60.0), mm(50.0)]),
+        footprints,
+        placements: vec![
+            Placement {
+                refdes: "U1".into(),
+                footprint: "TAG_FP".into(),
+                pos: Pt::new(mm(15.0), mm(15.0)),
+                rot_deg: 30.0,
+                side: Side::Top,
+                ..Default::default()
+            },
+            Placement {
+                refdes: "U2".into(),
+                footprint: "TAG_FP".into(),
+                pos: Pt::new(mm(25.0), mm(20.0)),
+                rot_deg: 90.0,
+                side: Side::Bottom,
+                ..Default::default()
+            },
+        ],
+        graphics: vec![
+            Graphic::Text {
+                layer: "F.SilkS".into(),
+                text: "DRACO\nREV A1".into(),
+                pos: Pt::new(30_600_000, 32_000_000),
+                height_nm: 650_000,
+                stroke_nm: 150_000,
+                rot_deg: 45.0,
+            },
+            Graphic::Text {
+                layer: "B.SilkS".into(),
+                text: "BOT \"REV\"\nLINE2".into(),
+                pos: Pt::new(mm(12.0), mm(8.0)),
+                height_nm: 800_000,
+                stroke_nm: 120_000,
+                rot_deg: 90.0,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let board = BoardIr::from_spec(&spec).unwrap();
+    let rendered = render_kicad_pcb(&board);
+
+    assert!(rendered.contains("(title \"Draco Rev A1\")"));
+    assert!(rendered.contains("(rev \"A1\")"));
+    assert!(rendered.contains("(gr_text \"DRACO\\nREV A1\""));
+    assert!(rendered.contains("(at 30.600000 -32.000000 45.0000)"));
+    assert!(rendered.contains("(size 0.650000 0.650000) (thickness 0.150000)"));
+    assert!(rendered.contains("(gr_text \"BOT \\\"REV\\\"\\nLINE2\""));
+    assert!(rendered.contains("(layer \"B.SilkS\")"));
+    assert!(rendered.contains("(justify mirror)"));
+    assert!(rendered.contains("(fp_text user \"PIN1\""));
+
+    let rt = parse_kicad_pcb(&rendered, None).expect("reimport rendered kicad_pcb");
+    assert_eq!(rt.title.as_deref(), Some("Draco Rev A1"));
+    assert_eq!(rt.revision.as_deref(), Some("A1"));
+    assert_eq!(rt.name, "Draco Rev A1");
+    assert_eq!(rt.graphics, board.graphics);
+
+    let u1 = rt.placements.iter().find(|p| p.refdes == "U1").unwrap();
+    let u2 = rt.placements.iter().find(|p| p.refdes == "U2").unwrap();
+    assert_eq!(
+        rt.footprints[&u1.footprint].graphics,
+        board.footprints["TAG_FP"].graphics
+    );
+    assert_eq!(
+        rt.footprints[&u2.footprint].graphics,
+        board.footprints["TAG_FP"].graphics
+    );
+
+    // Without title/revision, KiCad export falls back to board.name and omits (rev ...).
+    let minimal = BoardIr::from_spec(&BoardSpec {
+        name: "plain_board".into(),
+        size_nm: Some([mm(20.0), mm(20.0)]),
+        ..Default::default()
+    })
+    .unwrap();
+    let minimal_pcb = render_kicad_pcb(&minimal);
+    assert!(minimal_pcb.contains("(title \"plain_board\")"));
+    assert!(!minimal_pcb.contains("(rev "));
+    let minimal_rt = parse_kicad_pcb(&minimal_pcb, None).unwrap();
+    assert_eq!(minimal_rt.name, "plain_board");
+    assert_eq!(minimal_rt.title.as_deref(), Some("plain_board"));
+    assert_eq!(minimal_rt.revision, None);
+
+    // Hidden gr_text is skipped on import.
+    let hidden_pcb = r#"(kicad_pcb (version 20241229)
+        (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+        (gr_rect (start 0 0) (end 20 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (gr_text "HIDDEN" (at 5 -5 0) (layer "F.SilkS") (hide yes) (effects (font (size 1 1) (thickness 0.15))))
+    )"#;
+    assert!(
+        parse_kicad_pcb(hidden_pcb, None)
+            .unwrap()
+            .graphics
+            .is_empty()
+    );
+}

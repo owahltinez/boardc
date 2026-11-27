@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use crate::drc::DrcReport;
 use crate::fab_assembly::render_assembly_svg;
 use crate::fab_drills::render_drill_map_svg;
-use crate::fab_silk::{is_silk_layer, refdes_local_pos, text_stroke_segments};
+use crate::fab_silk::{
+    is_silk_layer, refdes_local_pos, text_graphic_world_segments, text_stroke_segments,
+};
 use crate::geom::{local_to_board, pad_copper_layers, remap_layer_for_side};
 use crate::ir::{BBoxNm, BoardIr, Graphic, PadKind, Pt, Side, mm, nm_to_mm, safe_slug};
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
@@ -167,7 +169,10 @@ pub(crate) fn render_graphic_svg(
             width,
             fill,
             ..
-        } if *radius > 0 => {
+        } => {
+            if *radius <= 0 {
+                return;
+            }
             let (cx, cy) = svg_pt(map_pt(*center), mirror_x);
             if *fill {
                 let _ = writeln!(
@@ -186,7 +191,10 @@ pub(crate) fn render_graphic_svg(
         }
         Graphic::Poly {
             verts, width, fill, ..
-        } if verts.len() >= 2 => {
+        } => {
+            if verts.len() < 2 {
+                return;
+            }
             let pts: Vec<Pt> = verts.iter().map(|&v| map_pt(v)).collect();
             let d = poly_path_d(&pts, mirror_x);
             if *fill {
@@ -199,7 +207,19 @@ pub(crate) fn render_graphic_svg(
                 );
             }
         }
-        _ => {}
+        Graphic::Text { .. } => {
+            let mut segs = Vec::new();
+            text_graphic_world_segments(g, pl, &mut segs);
+            for (a, b, w) in segs {
+                let (ax, ay) = svg_pt(a, mirror_x);
+                let (bx, by) = svg_pt(b, mirror_x);
+                let _ = writeln!(
+                    out,
+                    r#"  <line x1="{ax:.4}" y1="{ay:.4}" x2="{bx:.4}" y2="{by:.4}" stroke="{color}" stroke-width="{:.4}" stroke-linecap="round" />"#,
+                    nm_to_mm(w.max(50_000))
+                );
+            }
+        }
     }
 }
 

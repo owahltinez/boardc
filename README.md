@@ -64,6 +64,8 @@ boardc skill <install|uninstall|show> [--to <DIR>]
 
 ```toml
 name = "example"
+title = "Example Rev A1"
+revision = "A1"
 size_nm = [30000000, 20000000]
 
 [[layers]]
@@ -99,4 +101,12 @@ outline = [
   { x = 30000000, y = 20000000 },
   { x = 0, y = 20000000 },
 ]
+
+[[graphics]]
+kind = "text"
+layer = "F.SilkS"
+text = "EXAMPLE\nREV A1"
+pos = { x = 15000000, y = 17000000 }
+height_nm = 650000
+stroke_nm = 150000
 ```

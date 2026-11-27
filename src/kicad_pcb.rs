@@ -8,7 +8,7 @@ use crate::geom::{ensure_ccw, local_to_board, polygon_area};
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FilledPour, FootprintDef, Keepout, LayerDef, LayerKind,
     NetDef, Nm, Placement, PourPoly, PourSpec, Pt, SchematicMeta, Side, Stackup, Track, Via,
-    default_net_class, default_two_layer_stackup, mm,
+    default_net_class, default_two_layer_stackup, mm, trim_nonempty,
 };
 use crate::kicad_geom::{
     atom_at, chain_segments, child_atom, collect_poly_or_segment, discretize_arc, f64_at,
@@ -57,6 +57,8 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     let items = root.as_list().ok_or("invalid kicad_pcb list")?;
 
     let mut name = String::new();
+    let mut title: Option<String> = None;
+    let mut revision: Option<String> = None;
     let mut layers = Vec::new();
     let mut net_id_map: HashMap<i64, String> = HashMap::new();
     let mut footprints: BTreeMap<String, FootprintDef> = BTreeMap::new();
@@ -81,10 +83,12 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                 }
             }
             Some("title_block") => {
-                if let Some(t) = child_atom(node, "title")
-                    && !t.is_empty()
-                {
-                    name = t.to_string();
+                if let Some(t) = trim_nonempty(child_atom(node, "title")) {
+                    name = t.clone();
+                    title = Some(t);
+                }
+                if let Some(r) = trim_nonempty(child_atom(node, "rev")) {
+                    revision = Some(r);
                 }
             }
             Some("layers") => layers = parse_layers_block(node),
@@ -120,7 +124,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                 &mut filled_pours,
             ),
             Some("gr_line") | Some("gr_arc") | Some("gr_rect") | Some("gr_circle")
-            | Some("gr_poly") => {
+            | Some("gr_poly") | Some("gr_text") => {
                 if child_atom(node, "layer") == Some("Edge.Cuts") {
                     collect_poly_or_segment(node, -1, &mut edge_open, &mut edge_closed);
                 } else {
@@ -221,6 +225,8 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
         } else {
             name
         },
+        title,
+        revision,
         outline,
         cutouts,
         layers,

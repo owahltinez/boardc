@@ -107,13 +107,20 @@ pub(crate) fn write_closed_poly_lines(
 
 pub(crate) fn write_graphic(
     out: &mut String,
-    tag_prefix: &str,
     g: &Graphic,
-    y_sign: i64,
-    side: Side,
-    indent: &str,
+    pl: Option<&Placement>,
     uuids: &mut UuidGen,
 ) {
+    let (tag_prefix, indent, side, y_sign, pl_rot_deg) = match pl {
+        Some(p) => (
+            "fp",
+            "\t\t",
+            p.side,
+            if p.side == Side::Bottom { 1 } else { -1 },
+            p.rot_deg,
+        ),
+        None => ("gr", "\t", Side::Top, -1, 0.0),
+    };
     match g {
         Graphic::Line { a, b, width, layer } => {
             let l = remap_kicad_layer(layer, side);
@@ -192,6 +199,41 @@ pub(crate) fn write_graphic(
                 uuids.next(),
             );
             let _ = writeln!(out, "{indent})");
+        }
+        Graphic::Text {
+            layer,
+            text,
+            pos,
+            height_nm,
+            stroke_nm,
+            rot_deg,
+        } => {
+            let l = remap_kicad_layer(layer, side);
+            let (tag_open, abs_rot) = if tag_prefix == "fp" {
+                let r = match side {
+                    Side::Top => pl_rot_deg + *rot_deg,
+                    Side::Bottom => pl_rot_deg - *rot_deg + 180.0,
+                };
+                ("fp_text user", r.rem_euclid(360.0))
+            } else {
+                ("gr_text", rot_deg.rem_euclid(360.0))
+            };
+            let mirror = if l.starts_with("B.") {
+                " (justify mirror)"
+            } else {
+                ""
+            };
+            let h = nm_to_mm((*height_nm).max(10_000));
+            let t = nm_to_mm((*stroke_nm).max(10_000));
+            let _ = writeln!(
+                out,
+                "{indent}({tag_open} \"{}\" (at {:.6} {:.6} {abs_rot:.4}) (layer \"{}\") (uuid \"{}\") (effects (font (size {h:.6} {h:.6}) (thickness {t:.6})){mirror}))",
+                esc(text),
+                nm_to_mm(pos.x),
+                nm_to_mm(y_sign * pos.y),
+                esc(&l),
+                uuids.next(),
+            );
         }
     }
 }
@@ -464,7 +506,7 @@ pub(crate) fn write_footprint(
         if layer == "F.CrtYd" || layer == "B.CrtYd" || layer == "Edge.Cuts" {
             continue;
         }
-        write_graphic(out, "fp", g, y_sign, pl.side, "\t\t", uuids);
+        write_graphic(out, g, Some(pl), uuids);
     }
 
     if fp.courtyard.len() >= 3 {

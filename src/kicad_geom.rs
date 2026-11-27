@@ -204,6 +204,53 @@ pub(crate) fn parse_fill(node: &SExp) -> bool {
     }
 }
 
+fn parse_text_font(node: &SExp) -> (Nm, Nm) {
+    let font = node
+        .find_child("effects")
+        .and_then(|e| e.find_child("font"));
+    let height_nm = font
+        .and_then(|f| f.find_child("size"))
+        .and_then(|s| f64_at(s, 2).or_else(|| f64_at(s, 1)))
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .map(mm)
+        .unwrap_or(1_000_000);
+    let stroke_nm = font
+        .and_then(|f| f.find_child("thickness"))
+        .and_then(|t| f64_at(t, 1))
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .map(mm)
+        .unwrap_or(150_000);
+    (height_nm, stroke_nm)
+}
+
+pub(crate) fn parse_text_graphic(
+    node: &SExp,
+    y_sign: i64,
+    layer: String,
+    text: &str,
+    rot_override: Option<f64>,
+) -> Option<Graphic> {
+    if has_flag(node, "hide") {
+        return None;
+    }
+    let (pos, raw_rot) = node.find_child("at").and_then(|n| parse_at(n, y_sign))?;
+    let (height_nm, stroke_nm) = parse_text_font(node);
+    let r = rot_override.unwrap_or(raw_rot);
+    let rot_deg = if r.is_finite() {
+        r.rem_euclid(360.0)
+    } else {
+        0.0
+    };
+    Some(Graphic::Text {
+        layer,
+        text: text.to_string(),
+        pos,
+        height_nm,
+        stroke_nm,
+        rot_deg,
+    })
+}
+
 pub(crate) fn parse_pts(node: &SExp, y_sign: i64) -> Vec<Pt> {
     let Some(pts) = node.find_child("pts").and_then(SExp::as_list) else {
         return Vec::new();
@@ -379,6 +426,13 @@ pub(crate) fn parse_graphic_node(
                         width,
                     })
                     .collect();
+            }
+        }
+        "gr_text" => {
+            if let Some(text) = atom_at(node, 1)
+                && let Some(g) = parse_text_graphic(node, y_sign, layer, text, None)
+            {
+                return vec![g];
             }
         }
         _ => {}

@@ -275,11 +275,12 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
         nm_to_mm(board.effective_board_thickness_nm())
     );
     out.push_str("\t(paper \"A4\")\n");
-    let _ = writeln!(
-        out,
-        "\t(title_block\n\t\t(title \"{}\")\n\t)",
-        esc(&board.name)
-    );
+    out.push_str("\t(title_block\n");
+    let _ = writeln!(out, "\t\t(title \"{}\")", esc(board.effective_title()));
+    if let Some(rev) = board.revision_trimmed() {
+        let _ = writeln!(out, "\t\t(rev \"{}\")", esc(rev));
+    }
+    out.push_str("\t)\n");
     write_layers(&mut out, board);
     write_setup(&mut out, board);
     out.push_str("\t(net 0 \"\")\n");
@@ -308,7 +309,7 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
         );
     }
     for g in &board.graphics {
-        write_graphic(&mut out, "gr", g, -1, Side::Top, "\t", &mut uuids);
+        write_graphic(&mut out, g, None, &mut uuids);
     }
 
     for pl in &board.placements {
