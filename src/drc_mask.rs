@@ -9,7 +9,7 @@ use crate::geom::{
 use crate::ir::{BBoxNm, BoardIr, Nm, PadKind, Pt, Side, same_named_net};
 use crate::shapes::ResolvedShape;
 
-enum MaskOwner {
+pub(crate) enum MaskOwner {
     Pad {
         pad_idx: usize,
         pl_idx: usize,
@@ -18,13 +18,13 @@ enum MaskOwner {
     Via(usize),
 }
 
-struct MaskOpening<'a> {
-    label: &'a str,
-    net: &'a str,
-    center: Pt,
-    shape: ResolvedShape,
-    bbox: BBoxNm,
-    owner: MaskOwner,
+pub(crate) struct MaskOpening<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) net: &'a str,
+    pub(crate) center: Pt,
+    pub(crate) shape: ResolvedShape,
+    pub(crate) bbox: BBoxNm,
+    pub(crate) owner: MaskOwner,
 }
 
 enum TargetKind {
@@ -42,7 +42,7 @@ struct CopperTarget<'a> {
     kind: TargetKind,
 }
 
-fn collect_mask_openings<'a>(
+pub(crate) fn collect_mask_openings<'a>(
     board: &'a BoardIr,
     cu_layers: &[String],
     pads: &'a [PadItem],
@@ -114,7 +114,7 @@ fn collect_mask_openings<'a>(
     openings
 }
 
-fn shape_violates_mask(a: &ResolvedShape, b: &ResolvedShape, req: Nm) -> Option<f64> {
+pub(crate) fn shape_violates_mask(a: &ResolvedShape, b: &ResolvedShape, req: Nm) -> Option<f64> {
     let dist = a.dist_to_shape(b);
     if dist < req as f64 - EPS_NM {
         return Some(dist);

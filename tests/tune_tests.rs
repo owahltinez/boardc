@@ -1256,3 +1256,104 @@ fn validation_cutouts_and_prefilled_pours() {
     assert!(drc.passed, "expected clean DRC, got {:?}", drc.violations);
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn tune_match_groups_respects_mask_to_copper() {
+    let mut footprints = BTreeMap::new();
+    footprints.insert("PAD".into(), pad_fp(0.5));
+    footprints.insert(
+        "MASK_PAD".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Circle { diameter: mm(0.6) },
+                pos: Pt::new(0, 0),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: Some(mm(0.25)),
+                paste_margin_nm: None,
+            }],
+            courtyard: Vec::new(),
+            graphics: Vec::new(),
+            keepouts: Vec::new(),
+            models: Vec::new(),
+            pin_types: Default::default(),
+        },
+    );
+
+    let (mut placements, mut tracks) = (Vec::new(), Vec::new());
+    add_h_net(
+        &mut placements,
+        &mut tracks,
+        "A",
+        "CLK_A",
+        4.0,
+        24.0,
+        10.0,
+        false,
+    );
+    add_h_net(
+        &mut placements,
+        &mut tracks,
+        "B",
+        "CLK_B",
+        4.0,
+        20.0,
+        14.0,
+        false,
+    );
+    // Place masked obstacle pads near CLK_B where copper clearance allows meanders, but mask_to_copper forbids them.
+    placements.push(place_pad("OBS1", "MASK_PAD", 12.0, 15.1, "OTHER1"));
+    placements.push(place_pad("OBS2", "MASK_PAD", 16.0, 12.9, "OTHER2"));
+
+    let mut board = BoardIr::from_spec(&BoardSpec {
+        name: "tune_m2c".into(),
+        size_nm: Some([mm(30.0), mm(20.0)]),
+        layers: vec![
+            layer_sig("F.Cu", Some(Side::Top)),
+            layer_sig("B.Cu", Some(Side::Bottom)),
+        ],
+        footprints,
+        placements,
+        tracks,
+        rules: DesignRules {
+            clearance_nm: mm(0.15),
+            mask_expansion_nm: mm(0.05),
+            mask_to_copper_nm: Some(mm(0.35)),
+            ..Default::default()
+        },
+        constraints: Constraints {
+            match_groups: vec![MatchGroupRule {
+                name: "CLK".into(),
+                nets: vec!["CLK_A".into(), "CLK_B".into()],
+                tolerance_nm: mm(0.2),
+                target_nm: None,
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .unwrap();
+
+    let report = tune_match_groups(&mut board, &TuneOptions::default());
+    assert!(report.ok, "expected tune_match_groups ok: {report:?}");
+    let drc = check_board_drc(&board);
+    assert!(
+        drc.passed,
+        "tuned match_group must produce zero SolderMaskToCopper/DRC violations: {:?}",
+        drc.violations
+    );
+
+    // Also verify end-to-end route_board_ir with match_groups + mask_to_copper_nm enabled.
+    board.tracks.clear();
+    let rsum = route_board_ir(&mut board, &RouteOptions::default()).unwrap();
+    assert_eq!(rsum.unconnected_pairs, 0);
+    let rdrc = check_board_drc(&board);
+    assert!(
+        rdrc.passed,
+        "routed+tuned board with mask_to_copper_nm must pass DRC: {:?}",
+        rdrc.violations
+    );
+}

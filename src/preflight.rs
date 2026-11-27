@@ -12,7 +12,7 @@ use crate::drc_scene::{
     collect_keepouts, collect_pads, collect_pours, collect_tracks, collect_vias,
 };
 use crate::erc::{ErcViolation, check_board_erc};
-use crate::ir::{BoardIr, Pt};
+use crate::ir::{BoardIr, LayerKind, Pt};
 use crate::route::{point_from_viahop as pt_from_viahop, to_viahop_board};
 use crate::zones::{ZoneChoke, analyze_zone_chokes, fill_zones};
 
@@ -169,9 +169,25 @@ pub fn run_preflight(
             reason: b.reason,
         })
         .collect();
+    let mask_active = board.rules.mask_to_copper_nm.is_some_and(|v| v >= 0);
+    let eff_layers = board.effective_layers();
+    let has_signal_layer = eff_layers.iter().any(|l| l.kind != LayerKind::Plane);
     let fixed_violations: Vec<PreflightFixedViolation> = vreport
         .fixed_violations
         .into_iter()
+        .filter(|v| {
+            // Synthetic mask-guard FixedPlanes live only on non-Plane outer layers; ignore phantom hits against them.
+            if !mask_active || !v.blocker.starts_with("plane (") {
+                return true;
+            }
+            match v.layer.as_deref() {
+                Some(name) => !eff_layers
+                    .iter()
+                    .find(|l| l.name == name)
+                    .is_some_and(|l| l.kind != LayerKind::Plane),
+                None => !has_signal_layer,
+            }
+        })
         .map(|v| PreflightFixedViolation {
             kind: v.kind.to_string(),
             net_a: v.net_a,
