@@ -131,8 +131,12 @@ pub(crate) fn is_ignored_kicad_field(name: &str) -> bool {
         || name.starts_with("ki_")
 }
 
+pub(crate) fn is_exportable_kicad_field(k: &str, v: &str) -> bool {
+    !(is_ignored_kicad_field(k) || v.is_empty() || (k == "Datasheet" && v == "~"))
+}
+
 pub(crate) fn insert_kicad_field(fields: &mut BTreeMap<String, String>, k: &str, v: &str) {
-    if is_ignored_kicad_field(k) || v.is_empty() || (k == "Datasheet" && v == "~") {
+    if !is_exportable_kicad_field(k, v) {
         return;
     }
     fields.insert(k.to_string(), v.to_string());

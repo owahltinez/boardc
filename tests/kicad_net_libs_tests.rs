@@ -378,7 +378,7 @@ pos = { x = 30000000, y = 10000000 }
     ));
     assert!(rendered.contains("(sheetname \"/Power/\")"));
     assert!(rendered.contains("(sheetfile \"power.kicad_sch\")"));
-    assert!(rendered.contains("(attr smd exclude_from_bom dnp)"));
+    assert!(rendered.contains("(attr exclude_from_bom dnp)"));
 
     let reimported = parse_kicad_pcb(&rendered, None).expect("reimport exported pcb");
     let u1_rt = reimported
@@ -1110,10 +1110,21 @@ fn export_kicad_preserves_kicad_mod_fidelity_across_sides_rotations_and_roundtri
     let legacy_mod = r#"(module "LegacyMod" (layer "F.Cu")
   (fp_text reference "REF**" (at 0 -1.0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
   (fp_text value "LegacyMod" (at 0 1.0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_arc (start 0 -0.5) (end 0.5 0) (angle 90) (width 0.12) (layer "F.SilkS"))
   (fp_rect (start -1.0 -0.8) (end 1.0 0.8) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))
   (pad "1" smd rect (at -0.5 0) (size 0.4 0.5) (layers "F.Cu" "F.Mask" "F.Paste"))
 )"#;
     fs::write(lib_dir.join("LegacyMod.kicad_mod"), legacy_mod).unwrap();
+
+    let fptext_mod = r#"(footprint "FpTextPart"
+  (version 20211014)
+  (layer "F.Cu")
+  (fp_text reference "REF**" (at 0 -1.0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text value "FpTextPart" (at 0 1.0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_rect (start -1.0 -0.8) (end 1.0 0.8) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))
+  (pad "1" smd rect (at -0.5 0) (size 0.4 0.5) (layers "F.Cu" "F.Mask" "F.Paste"))
+)"#;
+    fs::write(lib_dir.join("FpTextPart.kicad_mod"), fptext_mod).unwrap();
 
     let mut placements = Vec::new();
     let mut idx = 0usize;
@@ -1156,6 +1167,15 @@ fn export_kicad_preserves_kicad_mod_fidelity_across_sides_rotations_and_roundtri
         ..Default::default()
     });
     placements.push(Placement {
+        refdes: "U_FTX".into(),
+        footprint: "RichLib:FpTextPart".into(),
+        value: "2k".into(),
+        pos: Pt::new(mm(25.0), mm(30.0)),
+        rot_deg: 90.0,
+        side: Side::Bottom,
+        ..Default::default()
+    });
+    placements.push(Placement {
         refdes: "R_PARAM".into(),
         footprint: "C_0402".into(),
         value: "100nF".into(),
@@ -1180,6 +1200,8 @@ fn export_kicad_preserves_kicad_mod_fidelity_across_sides_rotations_and_roundtri
 
     let board = BoardIr::from_spec_with_base(&spec, Some(&dir)).expect("from_spec_with_base");
     assert!(board.footprints["RichLib:RichPart"].kicad_raw.is_some());
+    assert!(board.footprints["RichLib:FpTextPart"].kicad_raw.is_some());
+    assert!(board.footprints["RichLib:LegacyMod"].kicad_raw.is_none());
     assert!(board.footprints["C_0402"].kicad_raw.is_none());
 
     // Non-library footprints must omit `kicad_raw` in JSON so pipeline cache keys stay unchanged.
@@ -1250,7 +1272,7 @@ fn export_kicad_preserves_kicad_mod_fidelity_across_sides_rotations_and_roundtri
     assert!(u6_block.contains("(pad \"1\" smd roundrect\n\t\t\t(at -0.8 0.4 60)"));
     assert!(u6_block.contains("(pad \"2\" smd custom\n\t\t\t(at 0.8 -0.4 75)"));
 
-    // Legacy fp_text module updates reference/value without adding duplicate property nodes.
+    // Legacy KiCad 5 `(module ...)` falls back to structured emission (no 2-point fp_arc passthrough).
     let leg_block = pcb
         .split("(footprint \"RichLib:LegacyMod\"")
         .nth(1)
@@ -1258,14 +1280,26 @@ fn export_kicad_preserves_kicad_mod_fidelity_across_sides_rotations_and_roundtri
         .split("(footprint ")
         .next()
         .unwrap();
-    assert!(leg_block.contains("(fp_text reference \"U_LEG\" (at 0 1.0 90) (layer \"B.SilkS\")"));
-    assert!(leg_block.contains("(fp_text value \"1k\" (at 0 -1.0 90) (layer \"B.Fab\")"));
-    assert!(!leg_block.contains("(property \"Reference\""));
-    assert!(!leg_block.contains("(property \"Value\""));
+    assert!(leg_block.contains("(property \"Reference\" \"U_LEG\""));
+    assert!(leg_block.contains("(property \"Value\" \"1k\""));
+    assert!(!leg_block.contains("(angle 90)"));
+
+    // KiCad 6+ fp_text footprint updates reference/value without adding duplicate property nodes.
+    let ftx_block = pcb
+        .split("(footprint \"RichLib:FpTextPart\"")
+        .nth(1)
+        .unwrap()
+        .split("(footprint ")
+        .next()
+        .unwrap();
+    assert!(ftx_block.contains("(fp_text reference \"U_FTX\" (at 0 1.0 90) (layer \"B.SilkS\")"));
+    assert!(ftx_block.contains("(fp_text value \"2k\" (at 0 -1.0 90) (layer \"B.Fab\")"));
+    assert!(!ftx_block.contains("(property \"Reference\""));
+    assert!(!ftx_block.contains("(property \"Value\""));
 
     // Re-importing exported .kicad_pcb preserves exact world pad geometry and deduplicates U1..U8 into 1 FootprintDef.
     let rt = parse_kicad_pcb(&pcb, None).expect("reimport exported pcb");
-    assert_eq!(rt.placements.len(), 10);
+    assert_eq!(rt.placements.len(), 11);
     assert!(rt.footprints.contains_key("RichLib:RichPart"));
     assert!(
         !rt.footprints
@@ -1314,7 +1348,7 @@ fn opportunistic_kicad_cli_zero_lib_footprint_mismatch() {
     let dir = test_dir("kicad_cli_fidelity");
     fs::write(
         dir.join("fp-lib-table"),
-        "(fp_lib_table (version 7)\n  (lib (name \"Resistor_SMD\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Resistor_SMD.pretty\")(options \"\")(descr \"\"))\n  (lib (name \"Package_DFN_QFN\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Package_DFN_QFN.pretty\")(options \"\")(descr \"\"))\n)\n",
+        "(fp_lib_table (version 7)\n  (lib (name \"Resistor_SMD\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Resistor_SMD.pretty\")(options \"\")(descr \"\"))\n  (lib (name \"Package_DFN_QFN\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Package_DFN_QFN.pretty\")(options \"\")(descr \"\"))\n  (lib (name \"RF_Module\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/RF_Module.pretty\")(options \"\")(descr \"\"))\n  (lib (name \"Connector_FFC-FPC\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Connector_FFC-FPC.pretty\")(options \"\")(descr \"\"))\n  (lib (name \"Package_LGA\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Package_LGA.pretty\")(options \"\")(descr \"\"))\n  (lib (name \"Package_DIP\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Package_DIP.pretty\")(options \"\")(descr \"\"))\n  (lib (name \"Symbol\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Symbol.pretty\")(options \"\")(descr \"\"))\n)\n",
     )
     .unwrap();
     let mut placements = Vec::new();
@@ -1322,6 +1356,11 @@ fn opportunistic_kicad_cli_zero_lib_footprint_mismatch() {
     for fp in [
         "Resistor_SMD:R_0402_1005Metric",
         "Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm_EP2.6x2.6mm",
+        "RF_Module:Raytac_MDBT42Q",
+        "Connector_FFC-FPC:Molex_502244-3330_1x33-1MP_P0.5mm_Horizontal",
+        "Package_LGA:AMS_LGA-10-1EP_2.7x4mm_P0.6mm",
+        "Package_DIP:DIP-24_18.0mmx34.29mm_W15.24mm",
+        "Symbol:Smolhaj_Scale_0.1",
     ] {
         for side in [Side::Top, Side::Bottom] {
             for rot in [0.0, 90.0, 180.0, 270.0] {
@@ -1331,8 +1370,8 @@ fn opportunistic_kicad_cli_zero_lib_footprint_mismatch() {
                     footprint: fp.into(),
                     value: "VAL".into(),
                     pos: Pt::new(
-                        mm(20.0 + (idx % 4) as f64 * 20.0),
-                        mm(20.0 + (idx / 4) as f64 * 20.0),
+                        mm(30.0 + (idx % 7) as f64 * 70.0),
+                        mm(30.0 + (idx / 7) as f64 * 70.0),
                     ),
                     rot_deg: rot,
                     side,
@@ -1343,7 +1382,7 @@ fn opportunistic_kicad_cli_zero_lib_footprint_mismatch() {
     }
     let spec = BoardSpec {
         name: "cli_fidelity".into(),
-        size_nm: Some([mm(140.0), mm(120.0)]),
+        size_nm: Some([mm(550.0), mm(650.0)]),
         footprint_libs: vec![sys_libs.to_string_lossy().into_owned()],
         placements,
         ..Default::default()
@@ -1378,5 +1417,231 @@ fn opportunistic_kicad_cli_zero_lib_footprint_mismatch() {
         mismatches.is_empty(),
         "unexpected lib_footprint_mismatch: {mismatches:#?}"
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn roast_raw_fp_fixes_zone_rect_delta_padstack_groups_bcu_textbox_dimension_and_stale_guard() {
+    use boardc::ir::{Keepout, KeepoutKind};
+    use boardc::kicad_io::parse_kicad_mod;
+
+    let legacy_fp = parse_kicad_mod(r#"(module "Leg" (layer "F.Cu") (pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu")))"#).unwrap();
+    assert!(legacy_fp.kicad_raw.is_none());
+
+    let dir = test_dir("roast_raw_fp");
+    let lib_dir = dir.join("Edge.pretty");
+    fs::create_dir_all(&lib_dir).unwrap();
+
+    // Covers: zone + arc, rect_delta, padstack(layer ...), group(members ...), omitted attr,
+    // fp_text_box (angle, no uuid), dimension (gr_text, height, override_value), private_layers,
+    // net_tie_pad_groups, font face, and `(at ... unlocked)`.
+    let edge_mod = r#"(footprint "EdgeCase"
+  (version 20260206)
+  (layer "F.Cu")
+  (private_layers "User.2")
+  (net_tie_pad_groups "1,2")
+  (property "Reference" "REF**" (at 0 -2 30 unlocked) (layer "F.SilkS") (uuid "ref-old") (effects (font (face "Arial") (size 1 1) (thickness 0.15))))
+  (property "Value" "EdgeCase" (at 0 2 unlocked) (layer "F.Fab") (uuid "val-old") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_line (start -1 -1) (end 1 -1) (stroke (width 0.12) (type solid)) (layer "F.SilkS") (uuid "line-old"))
+  (fp_text_box "Box\nText" (start -1 -1) (end 1 1) (angle 30) (layer "F.SilkS") (effects (font (size 0.5 0.5) (thickness 0.1))))
+  (dimension (type aligned) (layer "Dwgs.User") (uuid "dim-old")
+    (pts (xy 0 0) (xy 4 0))
+    (height 2.5)
+    (format (prefix "") (suffix "") (units 3) (units_format 1) (precision 4) (override_value "Span"))
+    (gr_text "Span" (at 2 -2.5 0) (layer "Dwgs.User") (uuid "dim-old") (effects (font (size 1 1) (thickness 0.15))))
+  )
+  (zone (layer "F.Cu") (uuid "zone-old")
+    (keepout (tracks not_allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints allowed))
+    (polygon (pts (xy 1 0) (arc (start 1 0) (mid 0 1) (end -1 0)) (xy 0 -1))))
+  (pad "1" smd trapezoid (at -1 0.5 0) (size 1 0.5) (rect_delta 0.2 0.3) (layers "F.Cu" "F.Mask")
+    (padstack (layer "F.Cu" (offset 0.1 0.2) (chamfer top_left) (rect_delta 0 0.3)))
+    (uuid "pad1-old"))
+  (group "" (uuid "grp-old") (members "line-old" "pad1-old"))
+)"#;
+    fs::write(lib_dir.join("EdgeCase.kicad_mod"), edge_mod).unwrap();
+
+    // Board-only raw attr + B.Cu-authored footprint.
+    let bo_mod = r#"(footprint "BoardOnly"
+  (version 20260206) (layer "F.Cu")
+  (attr board_only)
+  (pad "1" np_thru_hole circle (at 0 0) (size 1 1) (drill 1) (layers "*.Cu" "*.Mask"))
+)"#;
+    fs::write(lib_dir.join("BoardOnly.kicad_mod"), bo_mod).unwrap();
+
+    let bcu_mod = r#"(footprint "BCuPart"
+  (version 20260206) (layer "B.Cu")
+  (property "Reference" "REF**" (at 0 -2 30) (layer "B.SilkS") (uuid "bref") (effects (font (size 1 1) (thickness 0.15)) (justify mirror)))
+  (property "Value" "BCuPart" (at 0 2 0) (layer "B.Fab") (uuid "bval") (effects (font (size 1 1) (thickness 0.15)) (justify mirror)))
+  (attr smd)
+  (pad "1" smd rect (at -1 0.5 30) (size 0.5 0.5) (layers "B.Cu" "B.Mask"))
+)"#;
+    fs::write(lib_dir.join("BCuPart.kicad_mod"), bcu_mod).unwrap();
+
+    let spec = BoardSpec {
+        name: "roast_raw".into(),
+        size_nm: Some([mm(100.0), mm(80.0)]),
+        footprint_libs: vec!["Edge.pretty".into()],
+        placements: vec![
+            Placement {
+                refdes: "U_TOP".into(),
+                footprint: "Edge:EdgeCase".into(),
+                value: "V1".into(),
+                pos: Pt::new(mm(20.0), mm(10.0)),
+                rot_deg: 90.0,
+                side: Side::Top,
+                ..Default::default()
+            },
+            Placement {
+                refdes: "U_BOT".into(),
+                footprint: "Edge:EdgeCase".into(),
+                value: "V2".into(),
+                pos: Pt::new(mm(40.0), mm(10.0)),
+                rot_deg: 90.0,
+                side: Side::Bottom,
+                dnp: true,
+                ..Default::default()
+            },
+            Placement {
+                refdes: "H_SCH".into(),
+                footprint: "Edge:BoardOnly".into(),
+                pos: Pt::new(mm(60.0), mm(10.0)),
+                schematic: Some(SchematicMeta {
+                    path: Some("/sch-h".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Placement {
+                refdes: "B_BOT".into(),
+                footprint: "Edge:BCuPart".into(),
+                pos: Pt::new(mm(70.0), mm(10.0)),
+                rot_deg: 90.0,
+                side: Side::Bottom,
+                ..Default::default()
+            },
+            Placement {
+                refdes: "B_TOP".into(),
+                footprint: "Edge:BCuPart".into(),
+                pos: Pt::new(mm(80.0), mm(10.0)),
+                rot_deg: 90.0,
+                side: Side::Top,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let mut board = BoardIr::from_spec_with_base(&spec, Some(&dir)).unwrap();
+    let pcb = render_kicad_pcb(&board);
+
+    let block_of = |refdes: &str| -> String {
+        let key = format!("(property \"Reference\" \"{refdes}\"");
+        let pos = pcb.find(&key).unwrap();
+        let start = pcb[..pos].rfind("\t(footprint ").unwrap();
+        let end = pcb[pos..].find("\n\t)\n").map(|o| pos + o + 4).unwrap();
+        pcb[start..end].to_string()
+    };
+
+    let u_top = block_of("U_TOP");
+    let u_bot = block_of("U_BOT");
+    // Omitted (attr ...) on EdgeCase: U_TOP omits attr completely; U_BOT emits only `(attr dnp)`.
+    assert!(!u_top.contains("(attr "));
+    assert!(u_bot.contains("(attr dnp)"));
+    // Quoted tags & unlocked preserved in `(at ...)`.
+    assert!(u_top.contains("(private_layers \"User.2\")"));
+    assert!(u_top.contains("(net_tie_pad_groups \"1,2\")"));
+    assert!(u_top.contains("(face \"Arial\")"));
+    assert!(u_top.contains("(override_value \"Span\")"));
+    assert!(u_top.contains("(at 0 -2 120 unlocked)"));
+    assert!(u_top.contains("(at 0 2 90 unlocked)"));
+    // fp_text_box quoting + angle + uuid synthesis on Top/Bottom.
+    assert!(u_top.contains("(fp_text_box \"Box\\nText\""));
+    assert!(u_top.contains("(angle 120)"));
+    assert!(u_bot.contains("(angle 60)"));
+    assert!(u_bot.contains("(fp_text_box \"Box\\nText\" (start -1 1) (end 1 -1)"));
+    assert!(u_bot.contains("(justify mirror)"));
+    // dimension gr_text idx==1 quoted, height negated on Bottom, gr_text mirrored on Bottom.
+    assert!(u_top.contains("(gr_text \"Span\" (at 2 -2.5 90)"));
+    assert!(u_bot.contains("(height -2.5)"));
+    assert!(u_bot.contains("(gr_text \"Span\" (at 2 2.5 90)"));
+    // Zone transformed to board coords: U_TOP at board (20, 10) -> KiCad (20, -10), rot 90 CCW:
+    // local (1, 0) -> (20, -11), (0, 1) -> (21, -10), (-1, 0) -> (20, -9).
+    assert!(u_top.contains("(xy 20 -11)"));
+    assert!(u_top.contains("(mid 21 -10)"));
+    assert!(u_top.contains("(end 20 -9)"));
+    // U_BOT at KiCad (40, -10), rot 90 CCW, Y-flipped:
+    // local (0, 1) -> flip (0, -1) -> rot90 (-1, 0) -> (39, -10).
+    assert!(u_bot.contains("(mid 39 -10)"));
+    // rect_delta & padstack(layer ...) recursion on Bottom flip.
+    assert!(u_bot.contains("(rect_delta 0.2 -0.3)"));
+    assert!(u_bot.contains(
+        "(padstack (layer \"B.Cu\" (offset 0.1 -0.2) (chamfer bottom_left) (rect_delta 0 -0.3))"
+    ));
+    // Group member UUIDs remapped to actual emitted line & pad UUIDs (no `line-old`/`pad1-old`).
+    assert!(!u_bot.contains("line-old"));
+    assert!(!u_bot.contains("pad1-old"));
+    let line_uuid = u_bot
+        .split("(fp_line ")
+        .nth(1)
+        .unwrap()
+        .split("(uuid \"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let pad_uuid = u_bot
+        .split("(pad \"1\"")
+        .nth(1)
+        .unwrap()
+        .split("(uuid \"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let grp_line = u_bot.lines().find(|l| l.contains("(group ")).unwrap();
+    assert!(grp_line.contains(line_uuid) && grp_line.contains(pad_uuid));
+
+    // Schematic-linked MountingHole strips `board_only`.
+    let h_sch = block_of("H_SCH");
+    assert!(!h_sch.contains("board_only"));
+    assert!(!h_sch.contains("(attr "));
+
+    // B.Cu-authored footprint placed on Bottom (unflipped) and Top (flipped).
+    let b_bot = block_of("B_BOT");
+    assert!(b_bot.contains("(layer \"B.Cu\")"));
+    assert!(b_bot.contains("(at 0 -2 120)"));
+    assert!(b_bot.contains("(justify mirror)"));
+    assert!(b_bot.contains("(pad \"1\" smd rect\n\t\t\t(at -1 0.5 120)"));
+    let b_top = block_of("B_TOP");
+    assert!(b_top.contains("(layer \"F.Cu\")"));
+    assert!(b_top.contains("(at 0 2 60)"));
+    assert!(!b_top.contains("(justify mirror)"));
+    assert!(b_top.contains("(pad \"1\" smd rect\n\t\t\t(at -1 -0.5 60)"));
+
+    // Mutating structural IR invalidates stale `kicad_raw` -> structured fallback runs,
+    // and degenerate 4-vertex L-spike courtyard falls back to `fp_line` instead of `fp_rect`.
+    let edge_fp = board.footprints.get_mut("Edge:EdgeCase").unwrap();
+    edge_fp.courtyard = vec![
+        Pt::new(0, 0),
+        Pt::new(mm(2.0), 0),
+        Pt::new(mm(2.0), mm(2.0)),
+        Pt::new(mm(2.0), 0),
+    ];
+    edge_fp.keepouts = vec![Keepout {
+        kind: KeepoutKind::All,
+        layers: vec!["F.Cu".into()],
+        poly: vec![Pt::new(0, 0), Pt::new(mm(1.0), 0), Pt::new(0, mm(1.0))],
+    }];
+    let mut mutated_board = board;
+    mutated_board.placements.truncate(1);
+    let mutated_pcb = render_kicad_pcb(&mutated_board);
+    assert!(!mutated_pcb.contains("(fp_rect "));
+    assert!(mutated_pcb.contains("(fp_line (start 0.000000 0.000000)"));
+    // Fallback keepout emitted in board coords around U_TOP (20, 10) rot 90 -> (20, -10), (19, -10), (20, -11).
+    assert!(mutated_pcb.contains("(xy 20.000000 -10.000000)"));
+    assert!(mutated_pcb.contains("(xy 19.000000 -10.000000)"));
+
     let _ = fs::remove_dir_all(&dir);
 }

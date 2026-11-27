@@ -8,8 +8,9 @@ use serde_json::json;
 use crate::geom::{ensure_ccw, polygon_signed_area_2};
 use crate::ir::{BoardIr, LayerKind, Nm, PourPoly, Pt, SOLDER_MASK_THICKNESS_NM, Side, nm_to_mm};
 use crate::kicad_export_items::{
-    UuidGen, esc, write_closed_poly_lines, write_footprint, write_graphic, write_keepout, write_pts,
+    UuidGen, esc, write_closed_poly_lines, write_graphic, write_keepout, write_pts,
 };
+use crate::kicad_raw_fp::write_footprint;
 use crate::zone_scene::match_pour_specs;
 
 fn collect_net_ids(board: &BoardIr) -> BTreeMap<String, usize> {

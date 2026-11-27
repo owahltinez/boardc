@@ -1,25 +1,49 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 use viahop::sexp::SExp;
 
-use crate::ir::{FootprintDef, Placement, Side, nm_to_mm};
-use crate::kicad_export_items::{
-    UuidGen, collect_attr_tokens, esc, is_exportable_kicad_field, remap_kicad_layer,
-    write_fp_property, write_schematic_paths,
-};
-use crate::kicad_geom::parse_kicad_sexp;
+use crate::geom::sin_cos_deg;
+use crate::ir::{BoardIr, FootprintDef, PadKind, Placement, SchematicMeta, Side, nm_to_mm};
+use crate::kicad_export_items::{UuidGen, esc, remap_kicad_layer, write_footprint_body};
+use crate::kicad_geom::{atom_at, f64_at, is_exportable_kicad_field, parse_kicad_sexp};
+use crate::kicad_io::parse_footprint_node;
 
-fn list_tag(node: &SExp) -> Option<&str> {
-    node.as_list()?.first()?.as_atom()
+struct RawCtx<'a> {
+    bx_mm: f64,
+    by_mm: f64,
+    fp_rot: f64,
+    needs_flip: bool,
+    remap_side: Side,
+    zone_xf: Option<(f64, f64)>,
+    uuids: &'a mut UuidGen,
+    uuid_map: HashMap<String, String>,
 }
 
-fn atom(node: &SExp, idx: usize) -> Option<&str> {
-    node.as_list()?.get(idx)?.as_atom()
-}
+impl RawCtx<'_> {
+    fn replace_uuid(&mut self, node: &mut SExp) {
+        let new_u = self.uuids.next();
+        let SExp::List(items) = node else { return };
+        if let Some(SExp::Atom(old)) = items.get_mut(1) {
+            if !old.is_empty() {
+                self.uuid_map.insert(old.clone(), new_u.clone());
+            }
+            *old = new_u;
+        } else {
+            *node = SExp::List(vec![SExp::Atom("uuid".into()), SExp::Atom(new_u)]);
+        }
+    }
 
-fn uuid_node(uuids: &mut UuidGen) -> SExp {
-    SExp::List(vec![SExp::Atom("uuid".into()), SExp::Atom(uuids.next())])
+    fn ensure_uuid(&mut self, node: &mut SExp) {
+        if let SExp::List(items) = node
+            && !items.iter().any(|it| it.tag() == Some("uuid"))
+        {
+            items.push(SExp::List(vec![
+                SExp::Atom("uuid".into()),
+                SExp::Atom(self.uuids.next()),
+            ]));
+        }
+    }
 }
 
 fn format_rot(deg: f64) -> String {
@@ -31,184 +55,191 @@ fn format_rot(deg: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-fn negate_num_atom(raw: &str) -> String {
-    if let Ok(v) = raw.parse::<f64>() {
-        if v == 0.0 {
-            return "0".into();
-        }
-        if !raw.contains(['e', 'E']) {
-            let trimmed = raw.strip_prefix('+').unwrap_or(raw);
-            return match trimmed.strip_prefix('-') {
-                Some(rest) => rest.to_string(),
-                None => format!("-{trimmed}"),
-            };
-        }
-        let s = format!("{:.6}", -v);
-        return s.trim_end_matches('0').trim_end_matches('.').to_string();
-    }
-    raw.to_string()
-}
-
-fn transform_at(node: &SExp, fp_rot: f64, bottom: bool) -> SExp {
-    let items = node.as_list().unwrap_or(&[]);
-    let x = items.get(1).and_then(SExp::as_atom).unwrap_or("0");
-    let y_raw = items.get(2).and_then(SExp::as_atom).unwrap_or("0");
-    let y = if bottom {
-        negate_num_atom(y_raw)
+fn format_mm(v: f64) -> String {
+    let s = format!("{:.6}", if v.abs() < 5e-7 { 0.0 } else { v });
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed == "-0" || trimmed.is_empty() {
+        "0".into()
     } else {
-        y_raw.to_string()
-    };
-    let lrot = items.get(3).and_then(SExp::as_f64).unwrap_or(0.0);
-    let abs_rot = if bottom { fp_rot - lrot } else { fp_rot + lrot };
-    SExp::List(vec![
-        SExp::Atom("at".into()),
-        SExp::Atom(x.to_string()),
-        SExp::Atom(y),
-        SExp::Atom(format_rot(abs_rot)),
-    ])
+        trimmed.to_string()
+    }
 }
 
-fn transform_effects(node: &SExp, bottom: bool) -> SExp {
-    let mut out = Vec::new();
-    let mut saw_justify = false;
-    for item in node.as_list().unwrap_or(&[]) {
-        if list_tag(item) != Some("justify") {
-            out.push(item.clone());
-            continue;
-        }
+fn negate_num_atom(raw: &str) -> String {
+    let Ok(v) = raw.parse::<f64>() else {
+        return raw.to_string();
+    };
+    if v == 0.0 {
+        return "0".into();
+    }
+    let trimmed = raw.strip_prefix('+').unwrap_or(raw);
+    match trimmed.strip_prefix('-') {
+        Some(rest) => rest.to_string(),
+        None => format!("-{trimmed}"),
+    }
+}
+
+fn transform_at(node: &mut SExp, fp_rot: f64, needs_flip: bool) {
+    let SExp::List(items) = node else { return };
+    if items.len() < 3 {
+        return;
+    }
+    if needs_flip && let SExp::Atom(y) = &mut items[2] {
+        *y = negate_num_atom(y);
+    }
+    let lrot = items.get(3).and_then(SExp::as_f64).unwrap_or(0.0);
+    let has_unlocked = items[3..].iter().any(|x| x.as_atom() == Some("unlocked"));
+    let abs_rot = if needs_flip {
+        fp_rot - lrot
+    } else {
+        fp_rot + lrot
+    };
+    items.truncate(3);
+    items.push(SExp::Atom(format_rot(abs_rot)));
+    if has_unlocked {
+        items.push(SExp::Atom("unlocked".into()));
+    }
+}
+
+fn mirror_effects(node: &mut SExp) {
+    let SExp::List(items) = node else { return };
+    let (mut saw_justify, mut drop_empty) = (false, false);
+    for item in items
+        .iter_mut()
+        .skip(1)
+        .filter(|i| i.tag() == Some("justify"))
+    {
         saw_justify = true;
-        let mut j = vec![SExp::Atom("justify".into())];
-        let mut had_mirror = false;
-        for tok in item.as_list().unwrap_or(&[]).iter().skip(1) {
-            if tok.as_atom() == Some("mirror") {
-                had_mirror = true;
-                if !bottom {
-                    j.push(tok.clone());
-                }
-            } else {
-                j.push(tok.clone());
+        if let SExp::List(j) = item {
+            let orig_len = j.len();
+            j.retain(|t| t.as_atom() != Some("mirror"));
+            if j.len() == orig_len {
+                j.push(SExp::Atom("mirror".into()));
+            } else if j.len() <= 1 {
+                drop_empty = true;
             }
         }
-        if bottom && !had_mirror {
-            j.push(SExp::Atom("mirror".into()));
-        }
-        if j.len() > 1 {
-            out.push(SExp::List(j));
-        }
     }
-    if bottom && !saw_justify {
-        out.push(SExp::List(vec![
+    if drop_empty {
+        items.retain(|item| item.tag() != Some("justify"));
+    } else if !saw_justify {
+        items.push(SExp::List(vec![
             SExp::Atom("justify".into()),
             SExp::Atom("mirror".into()),
         ]));
     }
-    SExp::List(out)
 }
 
-fn transform_generic(node: &SExp, side: Side, uuids: &mut UuidGen, top_item: bool) -> SExp {
-    let SExp::List(items) = node else {
-        return node.clone();
+fn transform_generic(node: &mut SExp, ctx: &mut RawCtx<'_>) {
+    let SExp::List(items) = node else { return };
+    let Some(tag) = items.first().and_then(SExp::as_atom) else {
+        return;
     };
-    let tag = items.first().and_then(SExp::as_atom).unwrap_or("");
-    let bottom = side == Side::Bottom;
-    if tag == "uuid" {
-        return uuid_node(uuids);
-    }
-    if tag == "layer" && items.len() >= 2 {
-        let mut out = items.clone();
-        if let Some(l) = items[1].as_atom() {
-            out[1] = SExp::Atom(remap_kicad_layer(l, side));
+    match tag {
+        "uuid" => return ctx.replace_uuid(node),
+        "gr_text" => return transform_text_item(node, None, ctx),
+        "layer" | "layers" => {
+            let single = tag == "layer";
+            let end = if single {
+                2.min(items.len())
+            } else {
+                items.len()
+            };
+            for item in &mut items[1..end] {
+                if let SExp::Atom(l) = item {
+                    *l = remap_kicad_layer(l, ctx.remap_side);
+                }
+            }
+            if single {
+                for item in items.iter_mut().skip(2) {
+                    transform_generic(item, ctx);
+                }
+            }
+            return;
         }
-        return SExp::List(out);
-    }
-    if tag == "layers" {
-        let mut out = vec![SExp::Atom("layers".into())];
-        for item in items.iter().skip(1) {
-            out.push(match item.as_atom() {
-                Some(l) => SExp::Atom(remap_kicad_layer(l, side)),
-                None => item.clone(),
-            });
+        "chamfer" if ctx.needs_flip => {
+            for item in items.iter_mut().skip(1) {
+                if let SExp::Atom(s) = item {
+                    *s = match s.as_str() {
+                        "top_left" => "bottom_left".into(),
+                        "bottom_left" => "top_left".into(),
+                        "top_right" => "bottom_right".into(),
+                        "bottom_right" => "top_right".into(),
+                        _ => continue,
+                    };
+                }
+            }
+            return;
         }
-        return SExp::List(out);
-    }
-    if bottom && tag == "chamfer" {
-        let mut out = vec![SExp::Atom("chamfer".into())];
-        for item in items.iter().skip(1) {
-            out.push(match item.as_atom() {
-                Some("top_left") => SExp::Atom("bottom_left".into()),
-                Some("bottom_left") => SExp::Atom("top_left".into()),
-                Some("top_right") => SExp::Atom("bottom_right".into()),
-                Some("bottom_right") => SExp::Atom("top_right".into()),
-                Some(other) => SExp::Atom(other.to_string()),
-                None => item.clone(),
-            });
+        "height" if ctx.needs_flip => {
+            if let Some(SExp::Atom(h)) = items.get_mut(1) {
+                *h = negate_num_atom(h);
+            }
+            return;
         }
-        return SExp::List(out);
+        "xy" | "start" | "mid" | "end" if ctx.zone_xf.is_some() => {
+            if let (Some(lx), Some(raw_ly), Some((sr, cr))) = (
+                items.get(1).and_then(SExp::as_f64),
+                items.get(2).and_then(SExp::as_f64),
+                ctx.zone_xf,
+            ) {
+                let ly = if ctx.needs_flip { -raw_ly } else { raw_ly };
+                items[1] = SExp::Atom(format_mm(ctx.bx_mm + lx * cr + ly * sr));
+                items[2] = SExp::Atom(format_mm(ctx.by_mm - lx * sr + ly * cr));
+                return;
+            }
+        }
+        _ => {}
     }
-    let flip_y_here = bottom
-        && (matches!(tag, "start" | "end" | "mid" | "center" | "xy" | "at")
-            || (tag == "offset" && items.get(1).and_then(SExp::as_atom).is_some()));
 
-    let mut out = Vec::with_capacity(items.len() + 1);
-    let mut has_uuid = false;
-    for (idx, item) in items.iter().enumerate() {
-        if flip_y_here
-            && idx == 2
-            && let Some(s) = item.as_atom()
-        {
-            out.push(SExp::Atom(negate_num_atom(s)));
-            continue;
-        }
-        if list_tag(item) == Some("uuid") {
-            has_uuid = true;
-        }
-        out.push(transform_generic(item, side, uuids, false));
-    }
-    if top_item
-        && !has_uuid
-        && matches!(
+    let flip_y = ctx.needs_flip
+        && (matches!(
             tag,
-            "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" | "fp_poly" | "fp_curve" | "zone"
-        )
-    {
-        out.push(uuid_node(uuids));
+            "start" | "end" | "mid" | "center" | "xy" | "at" | "rect_delta"
+        ) || (tag == "offset" && items.get(1).and_then(SExp::as_atom).is_some()));
+    if flip_y && let Some(SExp::Atom(y)) = items.get_mut(2) {
+        *y = negate_num_atom(y);
     }
-    SExp::List(out)
+    for item in items.iter_mut().skip(1) {
+        transform_generic(item, ctx);
+    }
 }
 
-fn transform_text_item(
-    items: &[SExp],
-    val_override: Option<&str>,
-    fp_rot: f64,
-    side: Side,
-    uuids: &mut UuidGen,
-) -> SExp {
-    let bottom = side == Side::Bottom;
-    let mut out = Vec::with_capacity(items.len() + 2);
+fn transform_text_item(node: &mut SExp, val_override: Option<&str>, ctx: &mut RawCtx<'_>) {
+    let SExp::List(items) = node else { return };
+    if let Some(v) = val_override
+        && let Some(slot) = items.get_mut(2)
+    {
+        *slot = SExp::Atom(v.to_string());
+    }
     let mut has_effects = false;
-    let mut has_uuid = false;
-    for (idx, item) in items.iter().enumerate() {
-        if idx == 2
-            && let Some(v) = val_override
-        {
-            out.push(SExp::Atom(v.to_string()));
-            continue;
-        }
-        match list_tag(item) {
-            Some("at") => out.push(transform_at(item, fp_rot, bottom)),
+    for item in items.iter_mut().skip(1) {
+        match item.tag() {
+            Some("at") => transform_at(item, ctx.fp_rot, ctx.needs_flip),
+            Some("angle") => {
+                if let Some(lrot) = f64_at(item, 1)
+                    && let SExp::List(a) = item
+                {
+                    let abs_rot = if ctx.needs_flip {
+                        ctx.fp_rot - lrot
+                    } else {
+                        ctx.fp_rot + lrot
+                    };
+                    a[1] = SExp::Atom(format_rot(abs_rot));
+                }
+            }
             Some("effects") => {
                 has_effects = true;
-                out.push(transform_effects(item, bottom));
+                if ctx.needs_flip {
+                    mirror_effects(item);
+                }
             }
-            Some("uuid") => {
-                has_uuid = true;
-                out.push(uuid_node(uuids));
-            }
-            _ => out.push(transform_generic(item, side, uuids, false)),
+            Some("uuid") => ctx.replace_uuid(item),
+            _ => transform_generic(item, ctx),
         }
     }
-    if !has_effects && bottom {
-        out.push(SExp::List(vec![
+    if !has_effects && ctx.needs_flip {
+        items.push(SExp::List(vec![
             SExp::Atom("effects".into()),
             SExp::List(vec![
                 SExp::Atom("justify".into()),
@@ -216,54 +247,48 @@ fn transform_text_item(
             ]),
         ]));
     }
-    if !has_uuid {
-        out.push(uuid_node(uuids));
-    }
-    SExp::List(out)
+    ctx.ensure_uuid(node);
 }
 
 fn transform_pad(
-    items: &[SExp],
+    node: &mut SExp,
     pl: &Placement,
     net_ids: &BTreeMap<String, usize>,
-    uuids: &mut UuidGen,
-) -> SExp {
-    let bottom = pl.side == Side::Bottom;
-    let fp_rot = pl.rot_deg.rem_euclid(360.0);
-    let pad_name = items.get(1).and_then(SExp::as_atom).unwrap_or("");
-    let pad_kind = items.get(2).and_then(SExp::as_atom).unwrap_or("");
-    let mut out = Vec::with_capacity(items.len() + 2);
-    for item in items {
-        match list_tag(item) {
-            Some("at") => out.push(transform_at(item, fp_rot, bottom)),
-            Some("net") | Some("uuid") => {}
-            _ => out.push(transform_generic(item, pl.side, uuids, false)),
+    ctx: &mut RawCtx<'_>,
+) {
+    let pad_name = atom_at(node, 1).unwrap_or("").to_string();
+    let pad_kind = atom_at(node, 2).unwrap_or("").to_string();
+    let SExp::List(items) = node else { return };
+    items.retain(|it| it.tag() != Some("net"));
+    for item in items.iter_mut().skip(1) {
+        if item.tag() == Some("at") {
+            transform_at(item, ctx.fp_rot, ctx.needs_flip);
+        } else {
+            transform_generic(item, ctx);
         }
     }
     if pad_kind != "np_thru_hole"
-        && let Some(net_name) = pl.pin_nets.get(pad_name)
+        && let Some(net_name) = pl.pin_nets.get(&pad_name)
         && let Some(&net_id) = net_ids.get(net_name)
     {
-        out.push(SExp::List(vec![
+        items.push(SExp::List(vec![
             SExp::Atom("net".into()),
             SExp::Atom(net_id.to_string()),
             SExp::Atom(net_name.clone()),
         ]));
     }
-    out.push(uuid_node(uuids));
-    SExp::List(out)
+    ctx.ensure_uuid(node);
 }
 
 fn is_quoted_arg(parent_tag: &str, parent_len: usize, idx: usize) -> bool {
     match parent_tag {
         // Footprint `(property "Key" "Val" ...)` has >= 3 items; pad `(property pad_prop_*)` has 2 unquoted items.
         "property" => parent_len >= 3 && (idx == 1 || idx == 2),
-        "fp_text" | "gr_text" | "net" => idx == 2,
-        "layers" | "members" => idx >= 1,
-        "footprint" | "layer" | "uuid" | "descr" | "tags" | "model" | "pad" | "path"
-        | "sheetname" | "sheetfile" | "name" | "net_name" | "group" | "pinfunction" | "pintype"
-        | "prefix" | "suffix" | "tstamp" | "generator" | "generator_version" | "paper"
-        | "title" | "copper_finish" | "material" => idx == 1,
+        "fp_text" | "net" => idx == 2,
+        "layers" | "members" | "private_layers" | "net_tie_pad_groups" => idx >= 1,
+        "gr_text" | "fp_text_box" | "override_value" | "face" | "layer" | "uuid" | "descr"
+        | "tags" | "model" | "pad" | "name" | "net_name" | "group" | "pinfunction" | "pintype"
+        | "prefix" | "suffix" => idx == 1,
         _ => false,
     }
 }
@@ -281,22 +306,12 @@ fn write_atom(out: &mut String, s: &str, force_quote: bool) {
     }
 }
 
-fn write_sexp_inline(
-    out: &mut String,
-    node: &SExp,
-    parent_tag: &str,
-    parent_len: usize,
-    idx: usize,
-) {
+fn write_sexp_inline(out: &mut String, node: &SExp, ptag: &str, plen: usize, idx: usize) {
     match node {
-        SExp::Atom(s) => write_atom(
-            out,
-            s,
-            idx > 0 && is_quoted_arg(parent_tag, parent_len, idx),
-        ),
+        SExp::Atom(s) => write_atom(out, s, idx > 0 && is_quoted_arg(ptag, plen, idx)),
         SExp::List(items) => {
             out.push('(');
-            let tag = items.first().and_then(SExp::as_atom).unwrap_or("");
+            let tag = node.tag().unwrap_or("");
             let len = items.len();
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
@@ -310,10 +325,8 @@ fn write_sexp_inline(
 }
 
 fn write_top_child(out: &mut String, node: &SExp) {
-    let Some(items) = node.as_list() else {
-        return;
-    };
-    let tag = items.first().and_then(SExp::as_atom).unwrap_or("");
+    let Some(items) = node.as_list() else { return };
+    let tag = node.tag().unwrap_or("");
     let len = items.len();
     if !matches!(tag, "pad" | "zone" | "model" | "fp_poly") {
         out.push_str("\t\t");
@@ -321,34 +334,123 @@ fn write_top_child(out: &mut String, node: &SExp) {
         out.push('\n');
         return;
     }
+    let split = items
+        .iter()
+        .position(|it| matches!(it, SExp::List(_)))
+        .unwrap_or(len);
     out.push_str("\t\t(");
-    let mut header_done = false;
-    for (i, item) in items.iter().enumerate() {
-        match item {
-            SExp::Atom(s) if !header_done => {
-                if i > 0 {
-                    out.push(' ');
-                }
-                write_atom(out, s, i > 0 && is_quoted_arg(tag, len, i));
-            }
-            _ => {
-                if !header_done {
-                    out.push('\n');
-                    header_done = true;
-                }
-                out.push_str("\t\t\t");
-                write_sexp_inline(out, item, tag, len, i);
-                out.push('\n');
-            }
+    for (i, item) in items[..split].iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
         }
+        write_sexp_inline(out, item, tag, len, i);
     }
-    if !header_done {
+    out.push('\n');
+    for (i, item) in items[split..].iter().enumerate() {
+        out.push_str("\t\t\t");
+        write_sexp_inline(out, item, tag, len, split + i);
         out.push('\n');
     }
     out.push_str("\t\t)\n");
 }
 
-pub(crate) fn try_write_raw_footprint(
+fn write_fp_header(out: &mut String, fp_id: &str, pl: &Placement, rot: f64, uuids: &mut UuidGen) {
+    let _ = writeln!(out, "\t(footprint \"{}\"", esc(fp_id));
+    let _ = writeln!(out, "\t\t(layer \"{}\")", pl.side.cu_layer());
+    let _ = writeln!(out, "\t\t(uuid \"{}\")", uuids.next());
+    let _ = writeln!(
+        out,
+        "\t\t(at {:.6} {:.6} {})",
+        nm_to_mm(pl.pos.x),
+        nm_to_mm(-pl.pos.y),
+        format_rot(rot)
+    );
+    if pl.locked {
+        out.push_str("\t\t(locked yes)\n");
+    }
+}
+
+fn write_fp_property(out: &mut String, key: &str, val: &str, mirror: bool, uuids: &mut UuidGen) {
+    let fab_layer = if mirror { "B.Fab" } else { "F.Fab" };
+    let just = if mirror { " (justify mirror)" } else { "" };
+    let _ = writeln!(
+        out,
+        "\t\t(property \"{}\" \"{}\" (at 0 0 0) (layer \"{fab_layer}\") (hide yes) (uuid \"{}\") (effects (font (size 1 1) (thickness 0.15)){just}))",
+        esc(key),
+        esc(val),
+        uuids.next()
+    );
+}
+
+fn write_schematic_paths(out: &mut String, sch: &SchematicMeta) {
+    for (tag, val) in [
+        ("path", sch.path.as_deref()),
+        ("sheetname", sch.sheetname.as_deref()),
+        ("sheetfile", sch.sheetfile.as_deref()),
+    ] {
+        if let Some(v) = val.map(str::trim).filter(|s| !s.is_empty()) {
+            let _ = writeln!(out, "\t\t({tag} \"{}\")", esc(v));
+        }
+    }
+}
+
+fn write_fp_attr(
+    out: &mut String,
+    raw_attr: Option<Vec<String>>,
+    fp: &FootprintDef,
+    pl: &Placement,
+) {
+    let has_sch_path = pl
+        .schematic
+        .as_ref()
+        .and_then(|s| s.path.as_deref())
+        .is_some_and(|p| !p.trim().is_empty());
+    let mut toks: Vec<String> = match raw_attr {
+        Some(mut raw) => {
+            if has_sch_path {
+                raw.retain(|t| t != "board_only");
+            }
+            raw
+        }
+        None => {
+            // Schematic-linked padless/NPTH footprints (e.g. MountingHole) must omit `board_only` for parity.
+            if fp.pads.iter().any(|p| p.kind == PadKind::Tht) {
+                vec!["through_hole".into()]
+            } else if fp.pads.iter().any(|p| p.kind == PadKind::Smd) {
+                vec!["smd".into()]
+            } else if !has_sch_path {
+                vec!["board_only".into()]
+            } else {
+                Vec::new()
+            }
+        }
+    };
+    for (flag, name) in [
+        (pl.exclude_from_pos, "exclude_from_pos_files"),
+        (pl.exclude_from_bom, "exclude_from_bom"),
+        (pl.dnp, "dnp"),
+    ] {
+        if flag && !toks.iter().any(|t| t == name) {
+            toks.push(name.to_string());
+        }
+    }
+    if !toks.is_empty() {
+        let _ = writeln!(out, "\t\t(attr {})", toks.join(" "));
+    }
+}
+
+fn raw_matches_fp(root: &SExp, fp: &FootprintDef) -> bool {
+    let Ok((parsed, _)) = parse_footprint_node(root, false, &HashMap::new()) else {
+        return false;
+    };
+    parsed.pads == fp.pads
+        && parsed.courtyard == fp.courtyard
+        && parsed.graphics == fp.graphics
+        && parsed.keepouts == fp.keepouts
+        && parsed.models == fp.models
+}
+
+fn try_write_raw_footprint(
     out: &mut String,
     raw: &str,
     fp_id: &str,
@@ -360,20 +462,27 @@ pub(crate) fn try_write_raw_footprint(
     let Ok(root) = parse_kicad_sexp(raw) else {
         return false;
     };
-    let Some(items) = root.as_list() else {
-        return false;
-    };
-    if !matches!(
-        items.first().and_then(SExp::as_atom),
-        Some("footprint" | "module")
-    ) {
+    if root.tag() != Some("footprint") || !raw_matches_fp(&root, fp) {
         return false;
     }
+    let raw_is_bottom = root.find_child("layer").and_then(|n| atom_at(n, 1)) == Some("B.Cu");
+    let SExp::List(items) = root else {
+        return false;
+    };
 
     let bottom = pl.side == Side::Bottom;
-    let fp_rot = pl.rot_deg.rem_euclid(360.0);
-    let fab_layer = if bottom { "B.Fab" } else { "F.Fab" };
-    let sch_fields: BTreeMap<&str, &str> = pl
+    let needs_flip = bottom != raw_is_bottom;
+    let mut ctx = RawCtx {
+        bx_mm: nm_to_mm(pl.pos.x),
+        by_mm: nm_to_mm(-pl.pos.y),
+        fp_rot: pl.rot_deg.rem_euclid(360.0),
+        needs_flip,
+        remap_side: if needs_flip { Side::Bottom } else { Side::Top },
+        zone_xf: None,
+        uuids,
+        uuid_map: HashMap::new(),
+    };
+    let mut sch_fields: BTreeMap<&str, &str> = pl
         .schematic
         .as_ref()
         .map(|s| {
@@ -385,132 +494,199 @@ pub(crate) fn try_write_raw_footprint(
         })
         .unwrap_or_default();
 
-    let start_idx = if items.get(1).and_then(SExp::as_atom).is_some() {
-        2
-    } else {
-        1
-    };
-    let mut head_meta = Vec::new();
-    let mut props = Vec::new();
+    let start_idx = usize::from(items.get(1).and_then(SExp::as_atom).is_some()) + 1;
+    let (mut head_meta, mut props, mut body, mut group_indices) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut raw_attr: Option<Vec<String>> = None;
-    let mut body = Vec::new();
-    let mut saw_reference = false;
-    let mut saw_value = false;
-    let mut emitted_fields: HashSet<&str> = HashSet::new();
+    let (mut saw_ref, mut saw_val) = (false, false);
 
-    for child in &items[start_idx..] {
-        let Some(ch) = child.as_list() else {
+    for mut child in items.into_iter().skip(start_idx) {
+        let Some(tag) = child.tag().map(str::to_string) else {
             continue;
         };
-        let tag = ch.first().and_then(SExp::as_atom).unwrap_or("");
-        match tag {
+        match tag.as_str() {
             "version" | "generator" | "generator_version" | "tedit" | "layer" | "uuid" | "at"
             | "locked" | "path" | "sheetname" | "sheetfile" => {}
-            "descr" | "tags" => head_meta.push(child.clone()),
+            "descr" | "tags" => head_meta.push(child),
             "property" => {
-                let key = atom(child, 1).unwrap_or("");
-                let val_ov = match key {
+                let key = atom_at(&child, 1).unwrap_or("").to_string();
+                let val_ov: Option<&str> = match key.as_str() {
                     "Reference" => {
-                        saw_reference = true;
+                        saw_ref = true;
                         Some(pl.refdes.as_str())
                     }
                     "Value" => {
-                        saw_value = true;
+                        saw_val = true;
                         Some(pl.value.as_str())
                     }
                     "Footprint" => Some(fp_id),
-                    _ => sch_fields.get(key).copied().inspect(|_| {
-                        emitted_fields.insert(key);
-                    }),
+                    _ => sch_fields.remove(key.as_str()),
                 };
-                props.push(transform_text_item(ch, val_ov, fp_rot, pl.side, uuids));
+                transform_text_item(&mut child, val_ov, &mut ctx);
+                props.push(child);
             }
             "fp_text" => {
-                let val_ov = match atom(child, 1).unwrap_or("") {
+                let kind = atom_at(&child, 1).unwrap_or("").to_string();
+                let val_ov = match kind.as_str() {
                     "reference" => {
-                        saw_reference = true;
+                        saw_ref = true;
                         Some(pl.refdes.as_str())
                     }
                     "value" => {
-                        saw_value = true;
+                        saw_val = true;
                         Some(pl.value.as_str())
                     }
                     _ => None,
                 };
-                body.push(transform_text_item(ch, val_ov, fp_rot, pl.side, uuids));
+                transform_text_item(&mut child, val_ov, &mut ctx);
+                body.push(child);
+            }
+            "fp_text_box" => {
+                transform_text_item(&mut child, None, &mut ctx);
+                body.push(child);
             }
             "attr" => {
                 let mut toks = Vec::new();
-                for t in ch.iter().skip(1).filter_map(SExp::as_atom) {
+                for t in child
+                    .as_list()
+                    .into_iter()
+                    .flatten()
+                    .skip(1)
+                    .filter_map(SExp::as_atom)
+                {
                     if !toks.iter().any(|x: &String| x == t) {
                         toks.push(t.to_string());
                     }
                 }
                 raw_attr = Some(toks);
             }
-            "pad" => body.push(transform_pad(ch, pl, net_ids, uuids)),
-            "model" => body.push(child.clone()),
-            _ => body.push(transform_generic(child, pl.side, uuids, true)),
+            "pad" => {
+                transform_pad(&mut child, pl, net_ids, &mut ctx);
+                body.push(child);
+            }
+            "zone" => {
+                ctx.zone_xf = Some(sin_cos_deg(ctx.fp_rot));
+                transform_generic(&mut child, &mut ctx);
+                ctx.zone_xf = None;
+                ctx.ensure_uuid(&mut child);
+                body.push(child);
+            }
+            "group" => {
+                if let SExp::List(g_items) = &mut child {
+                    for g_ch in g_items
+                        .iter_mut()
+                        .skip(1)
+                        .filter(|c| c.tag() == Some("uuid"))
+                    {
+                        ctx.replace_uuid(g_ch);
+                    }
+                }
+                ctx.ensure_uuid(&mut child);
+                group_indices.push(body.len());
+                body.push(child);
+            }
+            "model" => body.push(child),
+            _ => {
+                transform_generic(&mut child, &mut ctx);
+                if matches!(
+                    tag.as_str(),
+                    "fp_line"
+                        | "fp_rect"
+                        | "fp_circle"
+                        | "fp_arc"
+                        | "fp_poly"
+                        | "fp_curve"
+                        | "dimension"
+                ) {
+                    ctx.ensure_uuid(&mut child);
+                }
+                body.push(child);
+            }
         }
     }
 
-    let _ = writeln!(out, "\t(footprint \"{}\"", esc(fp_id));
-    let _ = writeln!(out, "\t\t(layer \"{}\")", pl.side.cu_layer());
-    let _ = writeln!(out, "\t\t(uuid \"{}\")", uuids.next());
-    let _ = writeln!(
-        out,
-        "\t\t(at {:.6} {:.6} {})",
-        nm_to_mm(pl.pos.x),
-        nm_to_mm(-pl.pos.y),
-        format_rot(fp_rot)
-    );
-    if pl.locked {
-        out.push_str("\t\t(locked yes)\n");
+    for idx in group_indices {
+        if let Some(SExp::List(g_items)) = body.get_mut(idx) {
+            for g_ch in g_items
+                .iter_mut()
+                .skip(1)
+                .filter(|c| c.tag() == Some("members"))
+            {
+                if let SExp::List(m_items) = g_ch {
+                    for m in m_items.iter_mut().skip(1) {
+                        if let SExp::Atom(u) = m
+                            && let Some(new_u) = ctx.uuid_map.get(u.as_str())
+                        {
+                            *u = new_u.clone();
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    write_fp_header(out, fp_id, pl, ctx.fp_rot, ctx.uuids);
     for node in &head_meta {
         write_top_child(out, node);
     }
     for node in &props {
         write_top_child(out, node);
     }
-    if !saw_reference {
-        write_fp_property(out, "Reference", &pl.refdes, fab_layer, bottom, uuids);
+    if !saw_ref {
+        write_fp_property(out, "Reference", &pl.refdes, bottom, ctx.uuids);
     }
-    if !saw_value {
-        write_fp_property(out, "Value", &pl.value, fab_layer, bottom, uuids);
+    if !saw_val {
+        write_fp_property(out, "Value", &pl.value, bottom, ctx.uuids);
     }
-    for (k, v) in &sch_fields {
-        if !emitted_fields.contains(k) {
-            write_fp_property(out, k, v, fab_layer, bottom, uuids);
-        }
+    for (k, v) in sch_fields {
+        write_fp_property(out, k, v, bottom, ctx.uuids);
     }
     if let Some(sch) = &pl.schematic {
         write_schematic_paths(out, sch);
     }
-    let attr_tokens = match raw_attr {
-        Some(mut toks) => {
-            for (flag, name) in [
-                (pl.exclude_from_pos, "exclude_from_pos_files"),
-                (pl.exclude_from_bom, "exclude_from_bom"),
-                (pl.dnp, "dnp"),
-            ] {
-                if flag && !toks.iter().any(|t| t == name) {
-                    toks.push(name.to_string());
-                }
-            }
-            toks
-        }
-        None => collect_attr_tokens(fp, pl)
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-    };
-    if !attr_tokens.is_empty() {
-        let _ = writeln!(out, "\t\t(attr {})", attr_tokens.join(" "));
-    }
+    write_fp_attr(out, Some(raw_attr.unwrap_or_default()), fp, pl);
     for node in &body {
         write_top_child(out, node);
     }
     out.push_str("\t)\n");
     true
+}
+
+pub(crate) fn write_footprint(
+    out: &mut String,
+    pl: &Placement,
+    board: &BoardIr,
+    net_ids: &BTreeMap<String, usize>,
+    uuids: &mut UuidGen,
+) {
+    let Some(fp) = board.footprints.get(&pl.footprint) else {
+        return;
+    };
+    let fp_id = pl
+        .schematic
+        .as_ref()
+        .and_then(|s| s.footprint.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&fp.name);
+    if let Some(raw) = &fp.kicad_raw
+        && try_write_raw_footprint(out, raw, fp_id, pl, fp, net_ids, uuids)
+    {
+        return;
+    }
+    let bottom = pl.side == Side::Bottom;
+    write_fp_header(out, fp_id, pl, pl.rot_deg, uuids);
+    write_fp_property(out, "Reference", &pl.refdes, bottom, uuids);
+    write_fp_property(out, "Value", &pl.value, bottom, uuids);
+    if let Some(sch) = &pl.schematic {
+        for (k, v) in &sch.fields {
+            if is_exportable_kicad_field(k, v) {
+                write_fp_property(out, k, v, bottom, uuids);
+            }
+        }
+        write_schematic_paths(out, sch);
+    }
+    write_fp_attr(out, None, fp, pl);
+    write_footprint_body(out, pl, fp, net_ids, uuids);
+    out.push_str("\t)\n");
 }
