@@ -5,9 +5,11 @@ use clipper2_rust::{
     difference_64, inflate_paths_64, intersect_64,
 };
 
+use crate::fab_gerber::pad_world_shape_with_margin;
 use crate::geom::{
-    ensure_ccw, local_to_board, pad_copper_layers, pad_to_world_shape, path64_to_pts,
-    point_in_polygon, polygon_area, polygon_signed_area_2, pts_to_path64, remap_layer_for_side,
+    ensure_ccw, local_to_board, pad_copper_layers, pad_to_world_shape, pad_world_layers,
+    path64_to_pts, point_in_polygon, polygon_area, polygon_signed_area_2, pts_to_path64,
+    remap_layer_for_side,
 };
 use crate::ir::{
     BBoxNm, BoardIr, FilledPour, KeepoutKind, Nm, PadKind, PourPoly, PourSpec, Pt, Side,
@@ -155,6 +157,12 @@ pub(crate) fn collect_layer_scene(
     pour_clr_opt: Option<Nm>,
 ) -> LayerScene {
     let cu_layers = board.copper_layer_names();
+    let mask_layer_opt = match layer {
+        "F.Cu" => Some("F.Mask"),
+        "B.Cu" => Some("B.Mask"),
+        _ => None,
+    };
+    let m2c_opt = mask_layer_opt.and(board.rules.mask_to_copper_nm.filter(|&v| v >= 0));
     let mut terminals = Vec::new();
     let mut obstacles = Vec::new();
 
@@ -251,6 +259,33 @@ pub(crate) fn collect_layer_scene(
                     });
                 }
             }
+
+            if let (Some(mask_layer), Some(m2c)) = (mask_layer_opt, m2c_opt)
+                && (!is_same_net || pad.kind == PadKind::Npth)
+                && pad_world_layers(pad, pl.side, &cu_layers)
+                    .iter()
+                    .any(|l| l == mask_layer)
+            {
+                let margin = pad.mask_margin_nm.unwrap_or(board.rules.mask_expansion_nm);
+                if let Some(mask_shape) = pad_world_shape_with_margin(pad, pl, margin) {
+                    let pts = shape_inflated_poly(&mask_shape, m2c);
+                    if pts.len() >= 3 {
+                        let cleared_bbox = BBoxNm::from_pts(&pts);
+                        obstacles.push(Obstacle {
+                            kind: BlockerKind::Pad,
+                            net: if pad.kind == PadKind::Npth {
+                                String::new()
+                            } else {
+                                pad_net.to_string()
+                            },
+                            label: format!("{}.{}", pl.refdes, pad.name),
+                            pos: center,
+                            cleared_poly: pts_to_path64(&pts),
+                            cleared_bbox,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -314,7 +349,15 @@ pub(crate) fn collect_layer_scene(
             let clr = board.pour_pair_clearance(pour_net, pour_clr_opt, &via.net);
             let hole_clr = clr.max(board.rules.effective_hole_clearance_nm());
             // Full via pads are flashed on every spanned layer, so clear both pad and drill.
-            let radius = (via.diameter / 2 + clr).max(via.drill / 2 + hole_clr);
+            let mut radius = (via.diameter / 2 + clr).max(via.drill / 2 + hole_clr);
+            if let Some(m2c) = m2c_opt
+                && !via.tented
+            {
+                let mask_dia = via.diameter + 2 * board.rules.mask_expansion_nm;
+                if mask_dia > 0 {
+                    radius = radius.max(mask_dia / 2 + m2c);
+                }
+            }
             let pts = circle_poly_outer(via.pos, radius);
             if pts.len() >= 3 {
                 let cleared_bbox = BBoxNm::from_pts(&pts);

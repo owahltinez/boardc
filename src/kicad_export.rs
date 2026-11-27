@@ -490,7 +490,7 @@ pub fn render_kicad_pro(board: &BoardIr) -> String {
                     "keepout": "error",
                     "rule_area": "error",
                     "shorting_items": "error",
-                    "solder_mask_to_copper": "error",
+                    "solder_mask_bridge": if r.mask_to_copper_nm.is_some() { "error" } else { "ignore" },
                     "track_dangling": "error",
                     "track_width": "error",
                     "tracks_crossing": "error",

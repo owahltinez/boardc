@@ -8,8 +8,8 @@ use boardc::drc::{
 use boardc::ir::{
     BgaShadowRule, BoardIr, BoardSpec, CapProximityRule, Constraints, DesignRules, FilledPour,
     FootprintSpec, Keepout, KeepoutKind, LayerDef, LayerKind, MatchGroupRule, MaxLengthRule,
-    MinViasRule, NetClass, NetDef, PadDef, PadKind, PadShape, Placement, PourPoly, PourSpec, Pt,
-    Side, Track, Via, mm, um,
+    MinViasRule, NetClass, NetDef, Nm, PadDef, PadKind, PadShape, Placement, PourPoly, PourSpec,
+    Pt, Side, Track, Via, mm, um,
 };
 use boardc::zones::fill_zones;
 
@@ -1148,6 +1148,49 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
     assert_eq!(hs[0].violations[0].measured_nm, mm(0.05));
 }
 
+fn mask_viols(rep: &DrcReport) -> Vec<&Violation> {
+    rep.violations
+        .iter()
+        .filter(|v| v.kind == ViolationKind::SolderMaskToCopper)
+        .collect()
+}
+
+fn mask_pairs(rep: &DrcReport) -> Vec<(&str, &str, &str)> {
+    mask_viols(rep)
+        .into_iter()
+        .map(|v| {
+            (
+                v.layer.as_str(),
+                v.item_a.as_str(),
+                v.item_b.as_deref().unwrap_or(""),
+            )
+        })
+        .collect()
+}
+
+fn mk_track(net: &str, layer: &str, ax: Nm, ay: Nm, bx: Nm, by: Nm, width: Nm) -> Track {
+    Track {
+        net: net.into(),
+        layer: layer.into(),
+        a: Pt::new(ax, ay),
+        b: Pt::new(bx, by),
+        width,
+        locked: true,
+    }
+}
+
+fn mk_via(net: &str, x: Nm, y: Nm, diameter: Nm, drill: Nm, tented: bool) -> Via {
+    Via {
+        net: net.into(),
+        pos: Pt::new(x, y),
+        diameter,
+        drill,
+        layers: ("F.Cu".into(), "B.Cu".into()),
+        locked: true,
+        tented,
+    }
+}
+
 #[test]
 fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
     // 1. 0.4 mm-pitch NSMD BGA scenario: 0.23 mm pad + 0.03 mm mask expansion,
@@ -1176,9 +1219,7 @@ fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
             pin_types: Default::default(),
         },
     );
-    let mut bga_nets = BTreeMap::new();
-    bga_nets.insert("A1".into(), "DQ0".into());
-    bga_nets.insert("A2".into(), "DQ1".into());
+    let bga_nets = BTreeMap::from([("A1".into(), "DQ0".into()), ("A2".into(), "DQ1".into())]);
 
     let mut spec = BoardSpec {
         name: "bga_mask".into(),
@@ -1215,8 +1256,6 @@ fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
             pin_nets: bga_nets,
             ..Default::default()
         }],
-        tracks: vec![],
-        vias: vec![],
         rules: DesignRules {
             track_width_nm: um(60.0),
             clearance_nm: um(90.0),
@@ -1228,36 +1267,33 @@ fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
     };
 
     let mut board = BoardIr::from_spec(&spec).unwrap();
-    let a1_pad_y = board.placements[0].pos.y + um(200.0);
-    let a1_pad_x = board.placements[0].pos.x - um(200.0);
+    let a1_y = board.placements[0].pos.y + um(200.0);
+    let a1_x = board.placements[0].pos.x - um(200.0);
+    let a2_x = board.placements[0].pos.x + um(200.0);
     // Copper gap: 240 - 115 - 30 = 95 um (>= 90 um). Mask gap: 240 - 145 - 30 = 65 um (< 80 um).
-    board.tracks.push(Track {
-        net: "SIG".into(),
-        layer: "F.Cu".into(),
-        a: Pt::new(a1_pad_x - mm(1.0), a1_pad_y + um(240.0)),
-        b: Pt::new(a1_pad_x + um(50.0), a1_pad_y + um(240.0)),
-        width: um(60.0),
-        locked: true,
-    });
-    // Same-net track at identical offset on A2 must NOT trigger SolderMaskToCopper.
-    let a2_pad_x = board.placements[0].pos.x + um(200.0);
-    board.tracks.push(Track {
-        net: "DQ1".into(),
-        layer: "F.Cu".into(),
-        a: Pt::new(a2_pad_x, a1_pad_y),
-        b: Pt::new(a2_pad_x, a1_pad_y + um(300.0)),
-        width: um(60.0),
-        locked: true,
-    });
-    // Inner-layer track directly under A1 pad must NEVER trigger SolderMaskToCopper.
-    board.tracks.push(Track {
-        net: "INNER".into(),
-        layer: "In1.Cu".into(),
-        a: Pt::new(a1_pad_x - mm(1.0), a1_pad_y),
-        b: Pt::new(a1_pad_x + mm(1.0), a1_pad_y),
-        width: um(100.0),
-        locked: true,
-    });
+    board.tracks = vec![
+        mk_track(
+            "SIG",
+            "F.Cu",
+            a1_x - mm(1.0),
+            a1_y + um(240.0),
+            a1_x + um(50.0),
+            a1_y + um(240.0),
+            um(60.0),
+        ),
+        // Same-net track at identical offset on A2 must NOT trigger SolderMaskToCopper.
+        mk_track("DQ1", "F.Cu", a2_x, a1_y, a2_x, a1_y + um(300.0), um(60.0)),
+        // Inner-layer track directly under A1 pad must NEVER trigger SolderMaskToCopper.
+        mk_track(
+            "INNER",
+            "In1.Cu",
+            a1_x - mm(1.0),
+            a1_y,
+            a1_x + mm(1.0),
+            a1_y,
+            um(100.0),
+        ),
+    ];
 
     let rep = check_board_drc(&board);
     assert!(
@@ -1267,23 +1303,15 @@ fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
         "95 um copper gap should pass 90 um clearance: {:?}",
         rep.violations
     );
-    let mask_viols: Vec<&Violation> = rep
-        .violations
-        .iter()
-        .filter(|v| v.kind == ViolationKind::SolderMaskToCopper)
-        .collect();
-    assert_eq!(
-        mask_viols.len(),
-        1,
-        "expected 1 mask violation: {mask_viols:?}"
-    );
-    assert_eq!(mask_viols[0].layer, "F.Cu");
-    assert_eq!(mask_viols[0].item_a, "U1.A1");
-    assert_eq!(mask_viols[0].item_b.as_deref(), Some("track#0"));
-    assert_eq!(mask_viols[0].measured_nm, um(65.0));
-    assert_eq!(mask_viols[0].required_nm, um(80.0));
+    let mv = mask_viols(&rep);
+    assert_eq!(mv.len(), 1, "expected 1 mask violation: {mv:?}");
+    assert_eq!(mv[0].layer, "F.Cu");
+    assert_eq!(mv[0].item_a, "U1.A1");
+    assert_eq!(mv[0].item_b.as_deref(), Some("track#0"));
+    assert_eq!(mv[0].measured_nm, um(65.0));
+    assert_eq!(mv[0].required_nm, um(80.0));
     assert!(
-        serde_json::to_string(&mask_viols[0].kind)
+        serde_json::to_string(&mv[0].kind)
             .unwrap()
             .contains("solder_mask_to_copper")
     );
@@ -1292,50 +1320,51 @@ fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
     // Disabled when mask_to_copper_nm is None.
     let mut disabled = board.clone();
     disabled.rules.mask_to_copper_nm = None;
-    assert!(
-        check_board_drc(&disabled)
-            .violations
-            .iter()
-            .all(|v| v.kind != ViolationKind::SolderMaskToCopper)
-    );
+    assert!(mask_viols(&check_board_drc(&disabled)).is_empty());
 
     // 2. Per-pad mask_margin_nm override: negative margin shrinks opening to pass; collapsed pad skipped;
     //    positive override causes violation even with global mask_expansion_nm = 0.
     let mut shrunk = board.clone();
     shrunk.footprints.get_mut("BGA").unwrap().pads[0].mask_margin_nm = Some(-um(20.0));
-    assert!(
-        check_board_drc(&shrunk)
-            .violations
-            .iter()
-            .all(|v| v.kind != ViolationKind::SolderMaskToCopper)
-    );
+    assert!(mask_viols(&check_board_drc(&shrunk)).is_empty());
 
     let mut collapsed = board.clone();
     collapsed.footprints.get_mut("BGA").unwrap().pads[0].mask_margin_nm = Some(-um(150.0));
-    assert!(
-        check_board_drc(&collapsed)
-            .violations
-            .iter()
-            .all(|v| v.kind != ViolationKind::SolderMaskToCopper)
-    );
+    assert!(mask_viols(&check_board_drc(&collapsed)).is_empty());
 
     let mut pos_ov = board.clone();
     pos_ov.rules.mask_expansion_nm = 0;
     pos_ov.footprints.get_mut("BGA").unwrap().pads[0].mask_margin_nm = Some(um(50.0));
     let pos_rep = check_board_drc(&pos_ov);
-    let pos_viols: Vec<&Violation> = pos_rep
-        .violations
-        .iter()
-        .filter(|v| v.kind == ViolationKind::SolderMaskToCopper)
-        .collect();
+    let pos_viols = mask_viols(&pos_rep);
     assert_eq!(pos_viols.len(), 1);
     assert_eq!(pos_viols[0].measured_nm, um(45.0));
 
-    // 3. Untented vs tented vias + filled pour + bottom-side check.
+    // 3. Untented vs tented vias + blind via + filled pour + bottom-side check.
     let mut via_board = base_board();
     via_board.rules.clearance_nm = um(90.0);
     via_board.rules.mask_expansion_nm = um(50.0);
     via_board.rules.mask_to_copper_nm = Some(um(80.0));
+    via_board.layers = vec![
+        LayerDef {
+            name: "F.Cu".into(),
+            kind: LayerKind::Signal,
+            side: Some(Side::Top),
+            thickness_nm: None,
+        },
+        LayerDef {
+            name: "In1.Cu".into(),
+            kind: LayerKind::Signal,
+            side: None,
+            thickness_nm: None,
+        },
+        LayerDef {
+            name: "B.Cu".into(),
+            kind: LayerKind::Signal,
+            side: Some(Side::Bottom),
+            thickness_nm: None,
+        },
+    ];
     via_board.footprints.insert(
         "BOT_SMD".into(),
         single_pad_fp(0.4, PadKind::Smd, vec!["F.Cu", "F.Mask"], None)
@@ -1350,66 +1379,75 @@ fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
         Side::Bottom,
         "NET_B1",
     ));
-    // Bottom-side track: pad r=200um, mask r=250um; track r=50um at dy=360um -> cu gap 110um, mask gap 60um.
     via_board.tracks = vec![
-        Track {
-            net: "NET_B2".into(),
-            layer: "B.Cu".into(),
-            a: Pt::new(mm(4.0), mm(5.0) + um(360.0)),
-            b: Pt::new(mm(6.0), mm(5.0) + um(360.0)),
-            width: um(100.0),
-            locked: true,
-        },
-        // Track near untented via#0 (r=200um, mask r=250um) at dy=360um -> mask gap 60um (< 80um).
-        Track {
-            net: "SIG_V".into(),
-            layer: "F.Cu".into(),
-            a: Pt::new(mm(14.0), mm(15.0) + um(360.0)),
-            b: Pt::new(mm(16.0), mm(15.0) + um(360.0)),
-            width: um(100.0),
-            locked: true,
-        },
-        // Track near tented via#1 (r=200um, NO mask opening) at dy=360um -> cu gap 110um, must PASS!
-        Track {
-            net: "SIG_T".into(),
-            layer: "F.Cu".into(),
-            a: Pt::new(mm(24.0), mm(15.0) + um(360.0)),
-            b: Pt::new(mm(26.0), mm(15.0) + um(360.0)),
-            width: um(100.0),
-            locked: true,
-        },
+        mk_track(
+            "NET_B2",
+            "B.Cu",
+            mm(4.0),
+            mm(5.0) + um(360.0),
+            mm(6.0),
+            mm(5.0) + um(360.0),
+            um(100.0),
+        ),
+        mk_track(
+            "SIG_V",
+            "F.Cu",
+            mm(14.0),
+            mm(15.0) + um(360.0),
+            mm(16.0),
+            mm(15.0) + um(360.0),
+            um(100.0),
+        ),
+        mk_track(
+            "SIG_T",
+            "F.Cu",
+            mm(24.0),
+            mm(15.0) + um(360.0),
+            mm(26.0),
+            mm(15.0) + um(360.0),
+            um(100.0),
+        ),
+        // Blind via#3 only spans F.Cu..In1.Cu: B.Cu track near it must pass, F.Cu track must fail.
+        mk_track(
+            "SIG_BLIND_B",
+            "B.Cu",
+            mm(34.0),
+            mm(15.0) + um(360.0),
+            mm(36.0),
+            mm(15.0) + um(360.0),
+            um(100.0),
+        ),
+        mk_track(
+            "SIG_BLIND_F",
+            "F.Cu",
+            mm(34.0),
+            mm(15.0) - um(360.0),
+            mm(36.0),
+            mm(15.0) - um(360.0),
+            um(100.0),
+        ),
     ];
     via_board.vias = vec![
+        mk_via("V_UNTENT", mm(15.0), mm(15.0), um(400.0), um(200.0), false),
+        mk_via("V_TENT", mm(25.0), mm(15.0), um(400.0), um(200.0), true),
+        mk_via(
+            "V_COPPER",
+            mm(15.0) + um(410.0),
+            mm(15.0),
+            um(200.0),
+            um(100.0),
+            true,
+        ),
         Via {
-            net: "V_UNTENT".into(),
-            pos: Pt::new(mm(15.0), mm(15.0)),
+            net: "V_BLIND".into(),
+            pos: Pt::new(mm(35.0), mm(15.0)),
             diameter: um(400.0),
             drill: um(200.0),
-            layers: ("F.Cu".into(), "B.Cu".into()),
+            layers: ("F.Cu".into(), "In1.Cu".into()),
             locked: true,
             tented: false,
         },
-        Via {
-            net: "V_TENT".into(),
-            pos: Pt::new(mm(25.0), mm(15.0)),
-            diameter: um(400.0),
-            drill: um(200.0),
-            layers: ("F.Cu".into(), "B.Cu".into()),
-            locked: true,
-            tented: true,
-        },
-        // Tented via whose outer copper encroaches on untented via#0's mask opening (gap 410-250-100 = 60um < 80um).
-        Via {
-            net: "V_COPPER".into(),
-            pos: Pt::new(mm(15.0) + um(410.0), mm(15.0)),
-            diameter: um(200.0),
-            drill: um(100.0),
-            layers: ("F.Cu".into(), "B.Cu".into()),
-            locked: true,
-            tented: true,
-        },
     ];
-    // Filled pour on F.Cu encroaching on untented via#0's mask (antipad edge at x=15.0 + 300um -> 50um from mask).
     via_board.filled_pours.push(FilledPour {
         net: "GND".into(),
         layer: "F.Cu".into(),
@@ -1421,32 +1459,276 @@ fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
     });
 
     let vrep = check_board_drc(&via_board);
-    let pairs: Vec<(&str, &str, &str)> = vrep
-        .violations
-        .iter()
-        .filter(|v| v.kind == ViolationKind::SolderMaskToCopper)
-        .map(|v| {
-            (
-                v.layer.as_str(),
-                v.item_a.as_str(),
-                v.item_b.as_deref().unwrap_or(""),
-            )
-        })
-        .collect();
-    assert!(pairs.contains(&("B.Cu", "U_BOT.1", "track#0")), "{pairs:?}");
-    assert!(pairs.contains(&("F.Cu", "via#0", "track#1")), "{pairs:?}");
-    assert!(pairs.contains(&("F.Cu", "via#0", "via#2")), "{pairs:?}");
-    assert!(pairs.contains(&("F.Cu", "via#0", "pour#0")), "{pairs:?}");
+    let mut pairs = mask_pairs(&vrep);
+    pairs.sort();
+    let expected = vec![
+        ("B.Cu", "U_BOT.1", "track#0"),
+        ("B.Cu", "via#0", "via#2"),
+        ("F.Cu", "via#0", "pour#0"),
+        ("F.Cu", "via#0", "track#1"),
+        ("F.Cu", "via#0", "via#2"),
+        ("F.Cu", "via#3", "track#4"),
+    ];
+    assert_eq!(pairs, expected, "exact mask violations mismatch: {pairs:?}");
+
+    // 4. Negative mask_to_copper_nm rejected cleanly in BoardSpec and BoardIr validation.
+    spec.rules.mask_to_copper_nm = Some(-1);
+    assert!(BoardIr::from_spec(&spec).is_err());
+
+    let mut bad_ir = board.clone();
+    bad_ir.rules.mask_to_copper_nm = Some(-10);
     assert!(
-        !pairs.iter().any(|(_, a, _)| *a == "via#1"),
-        "tented via#1 must not emit a mask opening violation: {pairs:?}"
+        boardc::spec::validate_board_ir_pins(&bad_ir, std::path::Path::new("mem.json")).is_err()
+    );
+}
+
+#[test]
+fn solder_mask_zero_clearance_sagitta_shapes_npth_and_mask_only_pads() {
+    // 1. req == 0: track intrusion, 0 nm tangent touch, sub-micron Circle & Oval sagitta into pour,
+    //    rotated RoundRect pad, named NPTH inheriting pin_nets, and unnamed mask-only pad on same footprint.
+    let mut board = base_board();
+    board.rules.clearance_nm = um(50.0);
+    board.rules.mask_expansion_nm = um(50.0);
+    board.rules.mask_to_copper_nm = Some(0);
+
+    board.footprints.insert(
+        "CIRC".into(),
+        single_pad_fp(0.9, PadKind::Smd, vec!["F.Cu", "F.Mask"], None)
+            .resolve("CIRC")
+            .unwrap(),
+    );
+    board.footprints.insert(
+        "OVAL_ROT".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Oval {
+                    width: mm(1.9),
+                    height: mm(0.9),
+                },
+                pos: Pt::new(0, 0),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            }],
+            courtyard: vec![],
+            graphics: vec![],
+            keepouts: vec![],
+            pin_types: Default::default(),
+        }
+        .resolve("OVAL_ROT")
+        .unwrap(),
+    );
+    board.footprints.insert(
+        "ROUNDRECT_45".into(),
+        FootprintSpec::Custom {
+            pads: vec![PadDef {
+                name: "1".into(),
+                kind: PadKind::Smd,
+                shape: PadShape::RoundRect {
+                    width: um(400.0),
+                    height: um(400.0),
+                    corner_radius: um(50.0),
+                },
+                pos: Pt::new(0, 0),
+                rot_deg: 45.0,
+                drill_nm: None,
+                layers: vec!["F.Cu".into(), "F.Mask".into()],
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            }],
+            courtyard: vec![],
+            graphics: vec![],
+            keepouts: vec![],
+            pin_types: Default::default(),
+        }
+        .resolve("ROUNDRECT_45")
+        .unwrap(),
+    );
+    board.footprints.insert(
+        "NPTH_MASK".into(),
+        FootprintSpec::Custom {
+            pads: vec![
+                PadDef {
+                    name: "1".into(),
+                    kind: PadKind::Smd,
+                    shape: PadShape::Circle { diameter: mm(0.4) },
+                    pos: Pt::new(0, 0),
+                    rot_deg: 0.0,
+                    drill_nm: None,
+                    layers: vec!["F.Cu".into(), "F.Mask".into()],
+                    mask_margin_nm: None,
+                    paste_margin_nm: None,
+                },
+                PadDef {
+                    name: "M1".into(),
+                    kind: PadKind::Npth,
+                    shape: PadShape::Circle { diameter: mm(0.6) },
+                    pos: Pt::new(um(450.0), 0),
+                    rot_deg: 0.0,
+                    drill_nm: Some(mm(0.4)),
+                    layers: vec!["*.Mask".into()],
+                    mask_margin_nm: None,
+                    paste_margin_nm: None,
+                },
+            ],
+            courtyard: vec![],
+            graphics: vec![],
+            keepouts: vec![],
+            pin_types: Default::default(),
+        }
+        .resolve("NPTH_MASK")
+        .unwrap(),
+    );
+    board.footprints.insert(
+        "MASK_WIN".into(),
+        FootprintSpec::Custom {
+            pads: vec![
+                PadDef {
+                    name: "1".into(),
+                    kind: PadKind::Smd,
+                    shape: PadShape::Rect {
+                        width: mm(0.6),
+                        height: mm(0.6),
+                    },
+                    pos: Pt::new(0, 0),
+                    rot_deg: 0.0,
+                    drill_nm: None,
+                    layers: vec!["F.Cu".into(), "F.Mask".into()],
+                    mask_margin_nm: None,
+                    paste_margin_nm: None,
+                },
+                PadDef {
+                    name: String::new(),
+                    kind: PadKind::Smd,
+                    shape: PadShape::Rect {
+                        width: mm(0.8),
+                        height: mm(0.8),
+                    },
+                    pos: Pt::new(0, 0),
+                    rot_deg: 0.0,
+                    drill_nm: None,
+                    layers: vec!["F.Mask".into()],
+                    mask_margin_nm: None,
+                    paste_margin_nm: None,
+                },
+            ],
+            courtyard: vec![],
+            graphics: vec![],
+            keepouts: vec![],
+            pin_types: Default::default(),
+        }
+        .resolve("MASK_WIN")
+        .unwrap(),
     );
 
-    // 4. mask_to_copper_nm = Some(0) catches strict intrusion (track, rect pad, pour) and allows exact 0 nm touch.
-    let mut zboard = base_board();
-    zboard.rules.mask_expansion_nm = um(50.0);
-    zboard.rules.mask_to_copper_nm = Some(0);
-    zboard.footprints.insert(
+    board.placements = vec![
+        place_pin1("C1", "CIRC", 5.0, 10.0, Side::Top, "NC1"),
+        place_pin1("O1", "OVAL_ROT", 15.0, 10.0, Side::Top, "NO1"),
+        place_pin1("RR1", "ROUNDRECT_45", 25.0, 10.0, Side::Top, "NRR"),
+        Placement {
+            refdes: "U_NPTH".into(),
+            footprint: "NPTH_MASK".into(),
+            pos: Pt::new(mm(5.0), mm(20.0)),
+            side: Side::Top,
+            locked: true,
+            // Even if pin_nets assigns "GND" to NPTH M1, NPTH must not inherit net!
+            pin_nets: BTreeMap::from([("1".into(), "GND".into()), ("M1".into(), "GND".into())]),
+            ..Default::default()
+        },
+        place_pin1("U_WIN", "MASK_WIN", 15.0, 20.0, Side::Top, "VCC"),
+    ];
+
+    // C1 mask radius = 500 um at (5, 10) mm:
+    // - track#0 at y = 10 mm + 550 um (width 100 um -> edge at +500 um) is exact 0 nm tangent touch -> PASS!
+    // - track#1 at y = 10 mm - 549 um (edge at -499 um) intrudes 1 um -> FAIL!
+    // RR1 rotated 45 deg at (25, 10) mm: half-diag = 250*sqrt(2) ~= 353.55 um; track#2 at x=25.30 mm intrudes -> FAIL!
+    board.tracks = vec![
+        mk_track(
+            "T_TANGENT",
+            "F.Cu",
+            mm(4.0),
+            mm(10.0) + um(550.0),
+            mm(6.0),
+            mm(10.0) + um(550.0),
+            um(100.0),
+        ),
+        mk_track(
+            "T_INTRUDE",
+            "F.Cu",
+            mm(4.0),
+            mm(10.0) - um(549.0),
+            mm(6.0),
+            mm(10.0) - um(549.0),
+            um(100.0),
+        ),
+        mk_track(
+            "T_RR",
+            "F.Cu",
+            mm(25.32),
+            mm(9.0),
+            mm(25.32),
+            mm(11.0),
+            um(40.0),
+        ),
+    ];
+
+    // Pour#0: 200 nm sagitta intrusion into C1's circular mask (r = 500_000 nm) at chord midpoint theta = pi/64,
+    // where all 64 vertices of to_polygon(16) stay strictly outside the pour!
+    let theta = std::f64::consts::PI / 64.0;
+    let (nx, ny) = (theta.cos(), theta.sin());
+    let cx = mm(5.0);
+    let cy = mm(10.0);
+    let d_in = 499_800.0; // 200 nm inside r=500_000, outside chord r*cos(pi/64)=499_397.7
+    let p0 = Pt::new(
+        cx + (d_in * nx - 200_000.0 * ny).round() as Nm,
+        cy + (d_in * ny + 200_000.0 * nx).round() as Nm,
+    );
+    let p1 = Pt::new(
+        cx + (d_in * nx + 200_000.0 * ny).round() as Nm,
+        cy + (d_in * ny - 200_000.0 * nx).round() as Nm,
+    );
+    let p2 = Pt::new(
+        p1.x + (500_000.0 * nx).round() as Nm,
+        p1.y + (500_000.0 * ny).round() as Nm,
+    );
+    let p3 = Pt::new(
+        p0.x + (500_000.0 * nx).round() as Nm,
+        p0.y + (500_000.0 * ny).round() as Nm,
+    );
+
+    // Pour#1: Oval O1 at (15, 10) mm has cap b at (15.5, 10) mm, r=500_000; sagitta of 16-seg cap at pi/32 is 2407 nm.
+    // Place pour edge at 498_500 nm from cap b along theta_ov = pi/32 (1500 nm inside true cap, outside 16-gon).
+    let theta_ov = std::f64::consts::PI / 32.0;
+    let (ox, oy) = (theta_ov.cos(), theta_ov.sin());
+    let bx = mm(15.5);
+    let by = mm(10.0);
+    let od_in = 498_500.0;
+    let q0 = Pt::new(
+        bx + (od_in * ox - 200_000.0 * oy).round() as Nm,
+        by + (od_in * oy + 200_000.0 * ox).round() as Nm,
+    );
+    let q1 = Pt::new(
+        bx + (od_in * ox + 200_000.0 * oy).round() as Nm,
+        by + (od_in * oy - 200_000.0 * ox).round() as Nm,
+    );
+    let q2 = Pt::new(
+        q1.x + (500_000.0 * ox).round() as Nm,
+        q1.y + (500_000.0 * oy).round() as Nm,
+    );
+    let q3 = Pt::new(
+        q0.x + (500_000.0 * ox).round() as Nm,
+        q0.y + (500_000.0 * oy).round() as Nm,
+    );
+
+    // Pour#2: Exact 0 nm tangent touch to C1's left edge x = 4.50 mm -> must PASS!
+    // Pour#3: Surrounds C1_HOLE at (35, 10) mm with a circular/square hole of half-side 500 um (0 nm touch) -> PASS,
+    //         while Pour#4 surrounds C2_HOLE at (35, 20) mm with hole half-side 499.8 um (200 nm intrusion) -> FAIL!
+    // P1..P3: Rect pad pair (50 um intrusion vs 0 nm touch).
+    board.footprints.insert(
         "RECT_PAD".into(),
         FootprintSpec::Custom {
             pads: vec![PadDef {
@@ -1471,67 +1753,267 @@ fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
         .resolve("RECT_PAD")
         .unwrap(),
     );
-    zboard.placements = vec![
-        place_pin1("P1", "RECT_PAD", 10.0, 10.0, Side::Top, "A"),
-        // P1 mask is [9.75..10.25]; P2 copper is [10.20..10.60] -> 50um overlap!
-        place_pin1("P2", "RECT_PAD", 10.4, 10.0, Side::Top, "B"),
-        // P3 copper is [9.35..9.75] -> exact 0 nm touch, must pass at req=0.
-        place_pin1("P3", "RECT_PAD", 9.55, 10.0, Side::Top, "C"),
+    board.placements.extend([
+        place_pin1("P1", "RECT_PAD", 25.0, 20.0, Side::Top, "PA"),
+        place_pin1("P2", "RECT_PAD", 25.4, 20.0, Side::Top, "PB"),
+        place_pin1("P3", "RECT_PAD", 24.55, 20.0, Side::Top, "PC"),
+        place_pin1("C_H_OK", "CIRC", 35.0, 10.0, Side::Top, "NH1"),
+        place_pin1("C_H_IN", "CIRC", 35.0, 20.0, Side::Top, "NH2"),
+    ]);
+
+    board.filled_pours = vec![
+        FilledPour {
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            priority: 0,
+            polys: vec![PourPoly {
+                outer: vec![p0, p1, p2, p3],
+                holes: vec![],
+            }],
+        },
+        FilledPour {
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            priority: 0,
+            polys: vec![PourPoly {
+                outer: vec![q0, q1, q2, q3],
+                holes: vec![],
+            }],
+        },
+        FilledPour {
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            priority: 0,
+            polys: vec![PourPoly {
+                outer: rect_pts(3.5, 9.5, 4.5, 10.5),
+                holes: vec![],
+            }],
+        },
+        FilledPour {
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            priority: 0,
+            polys: vec![PourPoly {
+                outer: rect_pts(34.0, 9.0, 36.0, 11.0),
+                holes: vec![rect_pts(34.5, 9.5, 35.5, 10.5)],
+            }],
+        },
+        FilledPour {
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            priority: 0,
+            polys: vec![PourPoly {
+                outer: rect_pts(34.0, 19.0, 36.0, 21.0),
+                holes: vec![vec![
+                    Pt::new(mm(35.0) - 499_800, mm(20.0) - 499_800),
+                    Pt::new(mm(35.0) + 499_800, mm(20.0) - 499_800),
+                    Pt::new(mm(35.0) + 499_800, mm(20.0) + 499_800),
+                    Pt::new(mm(35.0) - 499_800, mm(20.0) + 499_800),
+                ]],
+            }],
+        },
     ];
-    zboard.filled_pours.push(FilledPour {
-        net: "GND".into(),
-        layer: "F.Cu".into(),
-        priority: 0,
-        polys: vec![PourPoly {
-            outer: rect_pts(10.0, 10.20, 12.0, 12.0), // intrudes 50um into P1 mask
-            holes: vec![],
-        }],
-    });
-    let zrep = check_board_drc(&zboard);
-    let zpairs: Vec<(&str, &str)> = zrep
-        .violations
-        .iter()
-        .filter(|v| v.kind == ViolationKind::SolderMaskToCopper)
-        .map(|v| (v.item_a.as_str(), v.item_b.as_deref().unwrap_or("")))
-        .collect();
-    assert!(zpairs.contains(&("P1.1", "P2.1")), "{zpairs:?}");
-    assert!(zpairs.contains(&("P1.1", "pour#0")), "{zpairs:?}");
+
+    let rep = check_board_drc(&board);
+    let mut pairs = mask_pairs(&rep);
+    pairs.sort();
+    // Exact set:
+    // - C1.1 vs track#1 (not track#0), pour#0 (not pour#2)
+    // - C_H_IN.1 vs pour#4 (200 nm into hole edge), C_H_OK.1 vs pour#3 (0 nm tangent) passes
+    // - O1.1 vs pour#1
+    // - P1.1 vs P2.1 (not P3.1)
+    // - RR1.1 vs track#2
+    // - U_NPTH.M1 vs U_NPTH.1 (both "GND" in pin_nets, yet NPTH forces net="")
+    // - U_WIN. (unnamed mask-only) does NOT false-positive against U_WIN.1 (VCC)!
+    assert_eq!(
+        pairs,
+        vec![
+            ("F.Cu", "C1.1", "pour#0"),
+            ("F.Cu", "C1.1", "track#1"),
+            ("F.Cu", "C_H_IN.1", "pour#4"),
+            ("F.Cu", "O1.1", "pour#1"),
+            ("F.Cu", "P1.1", "P2.1"),
+            ("F.Cu", "P2.1", "P1.1"),
+            ("F.Cu", "RR1.1", "track#2"),
+            ("F.Cu", "U_NPTH.M1", "U_NPTH.1"),
+        ],
+        "unexpected mask pairs: {pairs:?}"
+    );
     assert!(
-        !zpairs.contains(&("P1.1", "P3.1")),
-        "exact 0 nm touch should pass when mask_to_copper_nm=0: {zpairs:?}"
+        mask_viols(&rep)
+            .iter()
+            .all(|v| v.message.contains("intrudes on")
+                && v.message.contains("0 nm clearance required")),
+        "req==0 violation message should use intrusion wording"
+    );
+}
+
+#[test]
+fn fill_zones_honors_mask_to_copper_and_kicad_roundtrip() {
+    // 1. fill_zones + DRC passes when mask_expansion_nm + mask_to_copper_nm > clearance_nm
+    //    for SMD pads, NPTH pads with mask openings, and untented vias on F.Cu & B.Cu.
+    let mut board = base_board();
+    board.rules.clearance_nm = um(100.0);
+    board.rules.mask_expansion_nm = um(50.0);
+    board.rules.mask_to_copper_nm = Some(um(80.0));
+    board.footprints.insert(
+        "SMD".into(),
+        single_pad_fp(0.6, PadKind::Smd, vec!["F.Cu", "F.Mask"], None)
+            .resolve("SMD")
+            .unwrap(),
+    );
+    board.footprints.insert(
+        "NPTH_M".into(),
+        single_pad_fp(1.0, PadKind::Npth, vec!["*.Mask"], Some(0.8))
+            .resolve("NPTH_M")
+            .unwrap(),
+    );
+    board.placements = vec![
+        place_pin1("U1", "SMD", 10.0, 10.0, Side::Top, "SIG_TOP"),
+        place_pin1("U2", "SMD", 10.0, 20.0, Side::Bottom, "SIG_BOT"),
+        place_pin1("H1", "NPTH_M", 20.0, 15.0, Side::Top, "GND"),
+        place_pin1("UGND_F", "SMD", 30.0, 10.0, Side::Top, "GND"),
+        place_pin1("UGND_B", "SMD", 30.0, 20.0, Side::Bottom, "GND"),
+    ];
+    board.vias = vec![mk_via(
+        "V_SIG",
+        mm(15.0),
+        mm(15.0),
+        um(450.0),
+        um(200.0),
+        false,
+    )];
+    board.pours = vec![
+        PourSpec {
+            name: "GND_F".into(),
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            outline: rect_pts(1.0, 1.0, 39.0, 29.0),
+            thermal_relief: false,
+            ..Default::default()
+        },
+        PourSpec {
+            name: "GND_B".into(),
+            net: "GND".into(),
+            layer: "B.Cu".into(),
+            outline: rect_pts(1.0, 1.0, 39.0, 29.0),
+            thermal_relief: false,
+            ..Default::default()
+        },
+    ];
+    fill_zones(&mut board);
+    assert_eq!(board.filled_pours.len(), 2);
+    let rep = check_board_drc(&board);
+    assert!(
+        mask_viols(&rep).is_empty(),
+        "fill_zones should clear mask_to_copper_nm cleanly, got {:?}",
+        mask_viols(&rep)
     );
 
-    // 5. Negative mask_to_copper_nm rejected cleanly in BoardSpec and BoardIr validation.
-    spec.rules.mask_to_copper_nm = Some(-1);
-    assert!(BoardIr::from_spec(&spec).is_err());
-
-    let mut bad_ir = board.clone();
-    bad_ir.rules.mask_to_copper_nm = Some(-10);
-    let tmp = std::env::temp_dir().join("boardc_test_neg_mask_ir.json");
-    boardc::ir::save_board_json(&bad_ir, &tmp).unwrap();
-    assert!(boardc::ir::load_board_json(&tmp).is_err());
-    let _ = std::fs::remove_file(&tmp);
-
-    // 6. .kicad_pro export/import roundtrip & KiCad DRC JSON mapping for solder_mask_to_copper.
-    let pro_json = boardc::kicad_export::render_kicad_pro(&board);
-    assert!(pro_json.contains("\"solder_mask_to_copper_clearance\": 0.08"));
-    let reimported = boardc::kicad_io::parse_kicad_pcb(
-        &boardc::kicad_export::render_kicad_pcb(&board),
-        Some(&pro_json),
+    // 2. .kicad_pro roundtrip for None, Some(0), Some(80_000), ignore override,
+    //    plus (pad_to_mask_clearance ...) and footprint-level (solder_mask_margin ...).
+    let mut b_none = board.clone();
+    b_none.rules.mask_to_copper_nm = None;
+    let pro_none = boardc::kicad_export::render_kicad_pro(&b_none);
+    assert!(pro_none.contains("\"solder_mask_bridge\": \"ignore\""));
+    let imp_none = boardc::kicad_io::parse_kicad_pcb(
+        &boardc::kicad_export::render_kicad_pcb(&b_none),
+        Some(&pro_none),
     )
     .unwrap();
-    assert_eq!(reimported.rules.mask_to_copper_nm, Some(um(80.0)));
+    assert_eq!(imp_none.rules.mask_to_copper_nm, None);
 
+    let mut b_zero = board.clone();
+    b_zero.rules.mask_to_copper_nm = Some(0);
+    let pro_zero = boardc::kicad_export::render_kicad_pro(&b_zero);
+    assert!(pro_zero.contains("\"solder_mask_bridge\": \"error\""));
+    let imp_zero = boardc::kicad_io::parse_kicad_pcb(
+        &boardc::kicad_export::render_kicad_pcb(&b_zero),
+        Some(&pro_zero),
+    )
+    .unwrap();
+    assert_eq!(imp_zero.rules.mask_to_copper_nm, Some(0));
+
+    let pro_80 = boardc::kicad_export::render_kicad_pro(&board);
+    assert!(pro_80.contains("\"solder_mask_bridge\": \"error\""));
+    assert!(pro_80.contains("\"solder_mask_to_copper_clearance\": 0.08"));
+    let imp_80 = boardc::kicad_io::parse_kicad_pcb(
+        &boardc::kicad_export::render_kicad_pcb(&board),
+        Some(&pro_80),
+    )
+    .unwrap();
+    assert_eq!(imp_80.rules.mask_to_copper_nm, Some(um(80.0)));
+
+    // Legacy .kicad_pro with 0.0 clearance and no solder_mask_bridge stays None;
+    // explicit "ignore" suppresses even non-zero clearance.
+    let pcb_src = boardc::kicad_export::render_kicad_pcb(&board);
+    let legacy_pro =
+        r#"{"board":{"design_settings":{"rules":{"solder_mask_to_copper_clearance":0.0}}}}"#;
+    assert_eq!(
+        boardc::kicad_io::parse_kicad_pcb(&pcb_src, Some(legacy_pro))
+            .unwrap()
+            .rules
+            .mask_to_copper_nm,
+        None
+    );
+    let ignored_pro = r#"{"board":{"design_settings":{"rule_severities":{"solder_mask_bridge":"ignore"},"rules":{"solder_mask_to_copper_clearance":0.08}}}}"#;
+    assert_eq!(
+        boardc::kicad_io::parse_kicad_pcb(&pcb_src, Some(ignored_pro))
+            .unwrap()
+            .rules
+            .mask_to_copper_nm,
+        None
+    );
+
+    // 3. Import (pad_to_mask_clearance ...) & footprint-level (solder_mask_margin -0.05) accurately.
+    let kpcb = r#"(kicad_pcb (version 20241229)
+        (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+        (setup (pad_to_mask_clearance 0.03))
+        (gr_rect (start 0 0) (end 10 10) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (footprint "Pkg" (layer "F.Cu") (at 5 5 0)
+            (property "Reference" "U1")
+            (solder_mask_margin -0.05)
+            (pad "1" smd rect (at -1 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask"))
+            (pad "2" smd rect (at 1 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask") (solder_mask_margin 0.02))
+        )
+    )"#;
+    let parsed = boardc::kicad_io::parse_kicad_pcb(kpcb, None).unwrap();
+    assert_eq!(parsed.rules.mask_expansion_nm, um(30.0));
+    let fp = &parsed.footprints["Pkg"];
+    assert_eq!(fp.pads[0].mask_margin_nm, Some(-um(50.0)));
+    assert_eq!(fp.pads[1].mask_margin_nm, Some(um(20.0)));
+    let kpcb_zero = kpcb.replace("(pad_to_mask_clearance 0.03)", "(pad_to_mask_clearance 0)");
+    assert_eq!(
+        boardc::kicad_io::parse_kicad_pcb(&kpcb_zero, None)
+            .unwrap()
+            .rules
+            .mask_expansion_nm,
+        0
+    );
+    let kpcb_neg = kpcb.replace(
+        "(pad_to_mask_clearance 0.03)",
+        "(pad_to_mask_clearance -0.02)",
+    );
+    assert_eq!(
+        boardc::kicad_io::parse_kicad_pcb(&kpcb_neg, None)
+            .unwrap()
+            .rules
+            .mask_expansion_nm,
+        -um(20.0)
+    );
+
+    // 4. Real KiCad DRC JSON "type": "solder_mask_bridge" clustering.
     let kdrc = r#"{
         "coordinate_units": "mm",
         "violations": [{
-            "type": "solder_mask_to_copper",
+            "type": "solder_mask_bridge",
             "severity": "error",
-            "description": "Solder mask clearance violation (clearance 0.0800 mm; actual 0.0650 mm)",
-            "items": [{ "description": "Pad A1 [DQ0] of U1 on F.Mask", "pos": { "x": 9.8, "y": -10.2 } }]
+            "description": "Solder mask bridge (clearance 0.0800 mm; actual 0.0650 mm)",
+            "items": [{ "description": "Pad 1 [SIG_TOP] of U1 on F.Mask", "pos": { "x": 10.0, "y": -10.0 } }]
         }]
     }"#;
     let hs = cluster_kicad_drc_json(&board, kdrc).unwrap();
     assert_eq!(hs.len(), 1);
     assert_eq!(hs[0].kinds, vec![ViolationKind::SolderMaskToCopper]);
+    assert_eq!(hs[0].violations[0].item_a, "U1.1");
 }

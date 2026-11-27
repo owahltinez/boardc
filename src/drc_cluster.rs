@@ -314,7 +314,7 @@ fn map_kicad_kind(t: &str) -> ViolationKind {
         "clearance" | "shorting_items" | "tracks_crossing" | "zone_to_zone" => {
             ViolationKind::Clearance
         }
-        "solder_mask_to_copper" => ViolationKind::SolderMaskToCopper,
+        "solder_mask_bridge" | "solder_mask_to_copper" => ViolationKind::SolderMaskToCopper,
         "hole_to_hole" | "hole_near_hole" => ViolationKind::HoleToHole,
         "annular_width" => ViolationKind::MinAnnularRing,
         "track_width" => ViolationKind::MinTraceWidth,

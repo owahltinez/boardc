@@ -72,6 +72,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     let mut layer_thickness: HashMap<String, Nm> = HashMap::new();
     let mut stackup = Stackup::default();
     let mut setup_default_tented: Option<(bool, bool)> = None;
+    let mut setup_mask_expansion: Option<Nm> = None;
 
     for node in items.iter().skip(1) {
         match node.tag() {
@@ -93,6 +94,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                 &mut layer_thickness,
                 &mut stackup,
                 &mut setup_default_tented,
+                &mut setup_mask_expansion,
             ),
             Some("net") => {
                 if let (Some(id), Some(n)) = (f64_at(node, 1).map(|v| v as i64), atom_at(node, 2))
@@ -165,6 +167,9 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
 
     let mut net_classes = BTreeMap::new();
     let mut rules = DesignRules::default();
+    if let Some(m) = setup_mask_expansion {
+        rules.mask_expansion_nm = m;
+    }
     if stackup.pofv {
         rules.via_at_smd = true;
     }
@@ -439,7 +444,14 @@ fn parse_setup(
     thickness: &mut HashMap<String, Nm>,
     stackup: &mut Stackup,
     default_tented: &mut Option<(bool, bool)>,
+    mask_expansion: &mut Option<Nm>,
 ) {
+    if let Some(m) = node
+        .find_child("pad_to_mask_clearance")
+        .and_then(|n| f64_at(n, 1))
+    {
+        *mask_expansion = Some(mm(m));
+    }
     if let Some(t) = parse_setup_tenting(node) {
         *default_tented = Some(t);
     }

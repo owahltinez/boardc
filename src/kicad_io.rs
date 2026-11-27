@@ -74,6 +74,10 @@ pub(crate) fn parse_footprint_node(
     let y_sign: i64 = if unflip_bottom { 1 } else { -1 };
     let layer_norm = unflip_bottom.then_some(Side::Bottom);
 
+    let fp_mask_margin = node
+        .find_child("solder_mask_margin")
+        .and_then(|n| f64_at(n, 1))
+        .map(mm);
     let mut pads = Vec::new();
     let mut pad_nets = Vec::new();
     let mut graphics = Vec::new();
@@ -85,7 +89,7 @@ pub(crate) fn parse_footprint_node(
     for child in node.as_list().into_iter().flatten().skip(1) {
         match child.tag() {
             Some("pad") => {
-                let (pad, net) = parse_pad(
+                let (mut pad, net) = parse_pad(
                     child,
                     y_sign,
                     fp_rot,
@@ -93,6 +97,7 @@ pub(crate) fn parse_footprint_node(
                     is_placed_pcb,
                     net_id_map,
                 )?;
+                pad.mask_margin_nm = pad.mask_margin_nm.or(fp_mask_margin);
                 if !pad.name.is_empty() && !net.is_empty() {
                     pad_nets.push((pad.name.clone(), net));
                 }
