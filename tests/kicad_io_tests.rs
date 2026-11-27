@@ -703,6 +703,7 @@ fn export_and_import_kicad_pcb_roundtrips_title_revision_and_graphic_text() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: BTreeMap::new(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -934,6 +935,7 @@ fn kicad_text_size_order_subnm_placeholders_keep_upright_and_non_sided_mirror() 
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: BTreeMap::new(),
+            pin_names: BTreeMap::new(),
         },
     );
     let dwg_board = BoardIr::from_spec(&BoardSpec {

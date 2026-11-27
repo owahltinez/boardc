@@ -8,6 +8,12 @@ use crate::geom::{
 };
 use crate::ir::{BBoxNm, BoardIr, CapProximityRule, MinViasRule, Nm, Pt};
 
+const NON_PASSIVE_DESIGNATORS: &[&str] = &[
+    "D", "J", "Q", "U", "P", "S", "K", "F", "Y", "X", "M", "T", "H", "W", "Z", "SW", "TP", "BT",
+    "CN", "CR", "VR", "IC", "MH", "ZD", "LED", "CON", "CONN", "TVS", "ESD", "PT", "NT", "LDO",
+    "BAT", "FET", "MOD", "ANT", "OSC", "XTAL",
+];
+
 pub(crate) fn is_passive_component(board: &BoardIr, refdes: &str, fp_name: &str) -> bool {
     let Some(fp) = board.footprints.get(fp_name) else {
         return false;
@@ -16,7 +22,21 @@ pub(crate) fn is_passive_component(board: &BoardIr, refdes: &str, fp_name: &str)
         return false;
     }
     let u = refdes.to_ascii_uppercase();
-    u.starts_with('R') || u.starts_with('C') || u.starts_with('L') || u.starts_with("FB")
+    let segs: Vec<&str> = u.split('_').filter(|s| !s.is_empty()).collect();
+    let Some(&last) = segs.last() else {
+        return false;
+    };
+    let idx = last.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let (last_alpha, last_digits) = (&last[..idx], &last[idx..]);
+    if matches!(last_alpha, "R" | "C" | "L" | "FB") {
+        return true;
+    }
+    if segs.len() >= 2 && matches!(segs[segs.len() - 2], "R" | "C" | "L" | "FB") {
+        let is_non_passive =
+            !last_digits.is_empty() && NON_PASSIVE_DESIGNATORS.contains(&last_alpha);
+        return !is_non_passive;
+    }
+    false
 }
 
 pub(crate) fn cap_proximity_dist(

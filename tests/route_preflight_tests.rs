@@ -46,6 +46,7 @@ fn custom_fp(pads: Vec<PadDef>) -> FootprintSpec {
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: Default::default(),
+        pin_names: BTreeMap::new(),
     }
 }
 
@@ -121,6 +122,7 @@ fn build_2layer_board() -> BoardIr {
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -131,6 +133,7 @@ fn build_2layer_board() -> BoardIr {
             body_nm: mm(4.0),
             ep_nm: 0,
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -221,6 +224,7 @@ fn route_4layer_board_ir_with_inner_planes_clean_drc() {
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     let mut nets = BTreeMap::new();
@@ -440,6 +444,7 @@ fn length_constraints_propagate_to_viahop() {
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     let mut net_classes = BTreeMap::new();
@@ -555,6 +560,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -565,6 +571,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
             pitch_nm: mm(0.5),
             ball_dia_nm: mm(0.3),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert("PAD".into(), term_fp(mm(0.4), &["F.Cu"]));
@@ -1116,6 +1123,7 @@ fn route_bottom_side_bga_and_dense_4layer_bga_with_mask_to_copper() {
             pitch_nm: mm(0.4),
             ball_dia_nm: mm(0.23),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert("TERM".into(), term_fp(mm(0.3), &["F.Cu", "F.Mask"]));

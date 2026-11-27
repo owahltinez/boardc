@@ -480,6 +480,7 @@ fn footprint_lib_errors_precedence_and_path_traversal_guards() {
             FootprintSpec::Sot23 {
                 pin_count: 3,
                 pin_types: Default::default(),
+                pin_names: BTreeMap::new(),
             },
         )]),
         placements: vec![Placement {
@@ -1190,6 +1191,7 @@ fn export_kicad_preserves_kicad_mod_fidelity_across_sides_rotations_and_roundtri
             FootprintSpec::Chip2Pin {
                 package: "0402".into(),
                 pin_types: BTreeMap::new(),
+                pin_names: BTreeMap::new(),
             },
         )]),
         placements,
@@ -1957,6 +1959,7 @@ fn export_kicad_auto_refdes_off_hides_raw_reference_and_preserves_other_modes() 
             FootprintSpec::Chip2Pin {
                 package: "0402".into(),
                 pin_types: BTreeMap::new(),
+                pin_names: BTreeMap::new(),
             },
         )]),
         placements,

@@ -303,6 +303,7 @@ fn erc_partial_annotation_dnp_copper_unconnected_and_order_invariance() {
         keepouts: vec![],
         models: vec![],
         pin_types: BTreeMap::new(),
+        pin_names: BTreeMap::new(),
     };
     let spec = BoardSpec {
         name: "edge_cases".into(),
@@ -562,6 +563,7 @@ pin_types = { "1" = "in" }
                 keepouts: vec![],
                 models: vec![],
                 pin_types: BTreeMap::from([("1".into(), PinType::In)]),
+                pin_names: BTreeMap::new(),
             },
         )]),
         ..Default::default()

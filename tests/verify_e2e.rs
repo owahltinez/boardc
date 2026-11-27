@@ -38,6 +38,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
         FootprintSpec::Chip2Pin {
             package: "0603".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -46,6 +47,7 @@ fn build_2layer_top_bottom_board() -> BoardIr {
             pins: 2,
             pitch_nm: mm(2.54),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 

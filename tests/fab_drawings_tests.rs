@@ -35,6 +35,7 @@ fn make_two_sided_4layer_board() -> BoardIr {
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -45,6 +46,7 @@ fn make_two_sided_4layer_board() -> BoardIr {
             body_nm: mm(3.0),
             ep_nm: mm(1.4),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -53,6 +55,7 @@ fn make_two_sided_4layer_board() -> BoardIr {
             pins: 2,
             pitch_nm: mm(2.54),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -80,6 +83,7 @@ fn make_two_sided_4layer_board() -> BoardIr {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -215,6 +219,7 @@ fn make_one_sided_smd_board() -> BoardIr {
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     let spec = BoardSpec {
@@ -757,6 +762,7 @@ fn roast_regressions_tools_bounds_asymmetric_mirror_and_edge_cases() {
             pins: 2,
             pitch_nm: mm(2.54),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -796,6 +802,7 @@ fn roast_regressions_tools_bounds_asymmetric_mirror_and_edge_cases() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -817,6 +824,7 @@ fn roast_regressions_tools_bounds_asymmetric_mirror_and_edge_cases() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 

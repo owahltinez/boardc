@@ -37,6 +37,7 @@ fn make_4layer_board() -> BoardIr {
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -47,6 +48,7 @@ fn make_4layer_board() -> BoardIr {
             body_nm: mm(3.0),
             ep_nm: mm(1.4),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -55,6 +57,7 @@ fn make_4layer_board() -> BoardIr {
             pins: 2,
             pitch_nm: mm(2.54),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -76,6 +79,7 @@ fn make_4layer_board() -> BoardIr {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -575,6 +579,7 @@ fn regression_cw_poly_mask_expands_and_blind_via_splits_drill_file() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -1266,6 +1271,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -1287,6 +1293,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -1311,6 +1318,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -1852,6 +1860,7 @@ fn footprint_graphic_text_and_rotated_bottom_silk_coordinates() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 

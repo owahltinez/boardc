@@ -48,6 +48,7 @@ fn single_pad_fp(
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: Default::default(),
+        pin_names: BTreeMap::new(),
     }
 }
 
@@ -524,6 +525,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -534,6 +536,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
             pitch_nm: mm(0.8),
             ball_dia_nm: mm(0.4),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -544,6 +547,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
             body_nm: mm(2.0),
             ep_nm: 0,
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -945,6 +949,7 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -1086,6 +1091,7 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     let flush_spec = BoardSpec {
@@ -1222,6 +1228,7 @@ fn solder_mask_to_copper_bga_margin_via_pour_inner_bottom_and_zero_intrusion() {
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     let bga_nets = BTreeMap::from([("A1".into(), "DQ0".into()), ("A2".into(), "DQ1".into())]);
@@ -1524,6 +1531,7 @@ fn solder_mask_zero_clearance_sagitta_shapes_npth_and_mask_only_pads() {
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         }
         .resolve("OVAL_ROT")
         .unwrap(),
@@ -1551,6 +1559,7 @@ fn solder_mask_zero_clearance_sagitta_shapes_npth_and_mask_only_pads() {
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         }
         .resolve("ROUNDRECT_45")
         .unwrap(),
@@ -1587,6 +1596,7 @@ fn solder_mask_zero_clearance_sagitta_shapes_npth_and_mask_only_pads() {
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         }
         .resolve("NPTH_MASK")
         .unwrap(),
@@ -1629,6 +1639,7 @@ fn solder_mask_zero_clearance_sagitta_shapes_npth_and_mask_only_pads() {
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         }
         .resolve("MASK_WIN")
         .unwrap(),
@@ -1759,6 +1770,7 @@ fn solder_mask_zero_clearance_sagitta_shapes_npth_and_mask_only_pads() {
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         }
         .resolve("RECT_PAD")
         .unwrap(),
@@ -2054,6 +2066,7 @@ fn allow_edge_overhang_skips_component_to_edge_but_enforces_pads_courtyard_and_k
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -2199,6 +2212,7 @@ fn allow_edge_overhang_skips_component_to_edge_but_enforces_pads_courtyard_and_k
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     npth_spec.placements[0].footprint = "EDGE_NPTH".into();
@@ -2297,6 +2311,7 @@ fn smd_row_fp(pins: &[(&str, f64)], layers: &[&str]) -> FootprintSpec {
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: Default::default(),
+        pin_names: BTreeMap::new(),
     }
 }
 
@@ -2866,6 +2881,7 @@ fn hotspot_handles_multipin_same_name_and_net_def_pins_fallback() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         }
         .resolve(name)
         .unwrap()
@@ -3325,6 +3341,7 @@ fn custom_fp(
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: Default::default(),
+        pin_names: BTreeMap::new(),
     }
     .resolve(name)
     .unwrap()

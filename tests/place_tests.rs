@@ -75,6 +75,7 @@ fn overlapping_decoupling_caps_legalized_with_cap_proximity_and_zero_overlaps() 
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -85,6 +86,7 @@ fn overlapping_decoupling_caps_legalized_with_cap_proximity_and_zero_overlaps() 
             body_nm: mm(3.0),
             ep_nm: mm(1.6),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -212,6 +214,7 @@ fn movable_cap_pushed_out_of_bga_shadow_and_keepout() {
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -222,6 +225,7 @@ fn movable_cap_pushed_out_of_bga_shadow_and_keepout() {
             pitch_nm: mm(0.8),
             ball_dia_nm: mm(0.4),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -329,6 +333,7 @@ fn power_via_solver_thermal_array_and_plane_drops_clean_drc_and_no_chokes() {
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -339,6 +344,7 @@ fn power_via_solver_thermal_array_and_plane_drops_clean_drc_and_no_chokes() {
             body_nm: mm(4.0),
             ep_nm: mm(2.0),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -492,6 +498,7 @@ fn power_via_solver_does_not_seal_adjacent_bga_pads_and_cli_place_works() {
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -502,6 +509,7 @@ fn power_via_solver_does_not_seal_adjacent_bga_pads_and_cli_place_works() {
             pitch_nm: mm(0.8),
             ball_dia_nm: mm(0.4),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -656,6 +664,7 @@ fn legalize_placement_honors_allow_edge_overhang_while_enforcing_pads_and_courty
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -728,6 +737,7 @@ fn legalize_placement_overhang_enforces_courtyard_keepout_npth_cutout_and_stays_
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -765,6 +775,7 @@ fn legalize_placement_overhang_enforces_courtyard_keepout_npth_cutout_and_stays_
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -776,6 +787,7 @@ fn legalize_placement_overhang_enforces_courtyard_keepout_npth_cutout_and_stays_
             keepouts: vec![],
             models: vec![],
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -783,6 +795,7 @@ fn legalize_placement_overhang_enforces_courtyard_keepout_npth_cutout_and_stays_
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 

@@ -52,6 +52,7 @@ fn pad_fp_layer(dia_mm: f64, layer: &str) -> FootprintSpec {
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: Default::default(),
+        pin_names: BTreeMap::new(),
     }
 }
 
@@ -111,6 +112,7 @@ fn qspi_board() -> BoardIr {
             pins: 6,
             pitch_nm: mm(1.5),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -285,6 +287,7 @@ fn tight_obstacles_flip_side_and_shrink_amplitude_without_drc_violation() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -641,6 +644,7 @@ fn interior_contacts_preserve_connectivity_and_zero_open_net() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
@@ -1286,6 +1290,7 @@ fn tune_match_groups_respects_mask_to_copper() {
             keepouts: Vec::new(),
             models: Vec::new(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
 
