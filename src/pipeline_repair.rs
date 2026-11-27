@@ -9,7 +9,10 @@ use crate::drc_constraints::count_length_violations;
 use crate::geom::{local_to_board, point_to_segment_dist};
 use crate::ir::{BoardIr, Nm, Pt};
 use crate::pipeline_repair_length::{collect_corridor_neighbors, collect_pour_nets};
-use crate::route::{RouteOptions, RouteSummary, apply_match_group_tuning, route_board_ir};
+use crate::route::{
+    RouteOptions, RouteSummary, apply_match_group_tuning, route_board_ir,
+    route_board_ir_with_unconnected,
+};
 
 const BASE_REROUTE_PAD_MM: f64 = 2.0;
 const REROUTE_PAD_STEP_MM: f64 = 2.0;
@@ -30,6 +33,7 @@ fn is_repairable_kind(kind: ViolationKind) -> bool {
             | ViolationKind::ViaDangling
             | ViolationKind::MinTraceWidth
             | ViolationKind::MaxLength
+            | ViolationKind::MaxVias
     )
 }
 
@@ -49,15 +53,40 @@ fn is_unlocked_routed_item(board: &BoardIr, item: &str) -> bool {
     false
 }
 
-struct MaxLengthViol {
-    net: String,
-    excess_nm: Nm,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepairScore {
+    unconnected_pairs: usize,
+    geom_viols: usize,
+    max_length_viols: usize,
+    max_vias_viols: usize,
+    total_excess_nm: Nm,
+    total_excess_vias: Nm,
+}
+
+impl RepairScore {
+    fn is_better_than(&self, cur: &Self) -> bool {
+        let geom_self = (self.unconnected_pairs, self.geom_viols);
+        let geom_cur = (cur.unconnected_pairs, cur.geom_viols);
+        if geom_self != geom_cur {
+            return geom_self < geom_cur;
+        }
+        let cnt_self = self.max_length_viols + self.max_vias_viols;
+        let cnt_cur = cur.max_length_viols + cur.max_vias_viols;
+        if cnt_self != cnt_cur {
+            return cnt_self < cnt_cur;
+        }
+        self.max_length_viols == cur.max_length_viols
+            && self.total_excess_nm <= cur.total_excess_nm
+            && self.total_excess_vias <= cur.total_excess_vias
+            && (self.total_excess_nm < cur.total_excess_nm
+                || self.total_excess_vias < cur.total_excess_vias)
+    }
 }
 
 struct RepairEval {
     repairable: Vec<Violation>,
-    max_lengths: Vec<MaxLengthViol>,
-    score: (usize, usize, usize, Nm),
+    constraint_excess: HashMap<String, (Nm, Nm)>,
+    score: RepairScore,
 }
 
 fn eval_repair_state(
@@ -72,7 +101,11 @@ fn eval_repair_state(
         HashSet::new()
     };
     let mut repairable = Vec::new();
-    let mut max_lengths = Vec::new();
+    let mut constraint_excess: HashMap<String, (Nm, Nm)> = HashMap::new();
+    let mut max_length_viols = 0usize;
+    let mut max_vias_viols = 0usize;
+    let mut total_excess_nm: Nm = 0;
+    let mut total_excess_vias: Nm = 0;
     for v in drc.violations {
         if v.severity != Severity::Error || !is_repairable_kind(v.kind) {
             continue;
@@ -80,10 +113,28 @@ fn eval_repair_state(
         let net_ignored = v.net_a.is_empty() || board.is_net_ignored(&v.net_a, ignored);
         if v.kind == ViolationKind::MaxLength {
             if !net_ignored && net_can_reroute(board, &v.net_a) {
-                max_lengths.push(MaxLengthViol {
-                    net: v.net_a,
-                    excess_nm: (v.measured_nm - v.required_nm).max(0),
-                });
+                let excess = (v.measured_nm - v.required_nm).max(0);
+                max_length_viols += 1;
+                total_excess_nm = total_excess_nm.saturating_add(excess);
+                let e = constraint_excess.entry(v.net_a).or_insert((0, 0));
+                e.0 = e.0.max(excess);
+            }
+            continue;
+        }
+        if v.kind == ViolationKind::MaxVias {
+            if !net_ignored {
+                let excess = (v.measured_nm - v.required_nm).max(0);
+                max_vias_viols += 1;
+                total_excess_vias = total_excess_vias.saturating_add(excess);
+                // Only target nets with at least one unlocked via; locked-via violations stay in score to prevent regressions.
+                if board
+                    .vias
+                    .iter()
+                    .any(|via| !via.locked && via.net == v.net_a)
+                {
+                    let e = constraint_excess.entry(v.net_a).or_insert((0, 0));
+                    e.1 = e.1.max(excess);
+                }
             }
             continue;
         }
@@ -109,18 +160,17 @@ fn eval_repair_state(
             repairable.push(v);
         }
     }
-    let total_excess_nm = max_lengths
-        .iter()
-        .fold(0 as Nm, |acc, m| acc.saturating_add(m.excess_nm));
-    let score = (
+    let score = RepairScore {
         unconnected_pairs,
-        repairable.len(),
-        max_lengths.len(),
+        geom_viols: repairable.len(),
+        max_length_viols,
+        max_vias_viols,
         total_excess_nm,
-    );
+        total_excess_vias,
+    };
     RepairEval {
         repairable,
-        max_lengths,
+        constraint_excess,
         score,
     }
 }
@@ -249,6 +299,12 @@ impl<'a> RepairState<'a> {
                 .is_none_or(|limit| self.start.elapsed().as_secs() < limit)
     }
 
+    fn remaining_timeout_secs(&self) -> Option<u64> {
+        self.cfg
+            .timeout_secs
+            .map(|limit| limit.saturating_sub(self.start.elapsed().as_secs()).max(1))
+    }
+
     fn try_candidate(
         &mut self,
         board: &mut BoardIr,
@@ -263,10 +319,7 @@ impl<'a> RepairState<'a> {
         let saved_vias = board.vias.clone();
         self.pass_cfg.reroute_nets = Some(targets.clone());
         self.pass_cfg.reroute_pad_mm = Some(pad_mm);
-        self.pass_cfg.timeout_secs = self
-            .cfg
-            .timeout_secs
-            .map(|limit| limit.saturating_sub(self.start.elapsed().as_secs()).max(1));
+        self.pass_cfg.timeout_secs = self.remaining_timeout_secs();
 
         let cand_summary = route_board_ir(board, &self.pass_cfg)?;
         self.passes_run += cand_summary.passes_run;
@@ -277,7 +330,7 @@ impl<'a> RepairState<'a> {
             &self.cfg.ignored_nets,
             cand_summary.unconnected_pairs,
         );
-        if cand_eval.score < self.cur_eval.score {
+        if cand_eval.score.is_better_than(&self.cur_eval.score) {
             self.summary = cand_summary;
             self.repaired_nets.extend(targets);
             self.cur_eval = cand_eval;
@@ -288,23 +341,92 @@ impl<'a> RepairState<'a> {
             Ok(false)
         }
     }
-}
 
-fn ordered_over_length_nets(eval: &RepairEval, allowed_nets: &HashSet<String>) -> Vec<String> {
-    let mut by_net: HashMap<&str, Nm> = HashMap::new();
-    for mv in &eval.max_lengths {
-        if !allowed_nets.contains(&mv.net) {
-            continue;
+    // Route a MaxVias net while neighbors are stripped, then route neighbors around it.
+    fn try_prioritized_candidate(
+        &mut self,
+        board: &mut BoardIr,
+        primary_net: &str,
+        neighbors: &HashSet<String>,
+        pad_mm: f64,
+    ) -> Result<bool, String> {
+        if !self.can_step() || neighbors.is_empty() {
+            return Ok(false);
         }
-        let e = by_net.entry(mv.net.as_str()).or_insert(0);
-        *e = (*e).max(mv.excess_nm);
+        let vias_before = board.vias.iter().filter(|v| v.net == primary_net).count();
+        self.repair_passes_run += 1;
+        let saved_tracks = board.tracks.clone();
+        let saved_vias = board.vias.clone();
+
+        board
+            .tracks
+            .retain(|t| t.locked || !neighbors.contains(&t.net));
+        board
+            .vias
+            .retain(|v| v.locked || !neighbors.contains(&v.net));
+
+        self.pass_cfg.reroute_nets = Some(HashSet::from([primary_net.to_string()]));
+        self.pass_cfg.reroute_pad_mm = Some(pad_mm);
+        self.pass_cfg.timeout_secs = self.remaining_timeout_secs();
+        let (net_summary, net_unconnected) =
+            route_board_ir_with_unconnected(board, &self.pass_cfg)?;
+        self.passes_run += net_summary.passes_run;
+        self.starts_run += net_summary.starts_run;
+        self.stopped_early |= net_summary.stopped_early;
+
+        let timed_out = self
+            .cfg
+            .timeout_secs
+            .is_some_and(|limit| self.start.elapsed().as_secs() >= limit);
+        let vias_after = board.vias.iter().filter(|v| v.net == primary_net).count();
+        let bad_unconnected = net_unconnected.contains(primary_net)
+            || (self.cur_eval.score.unconnected_pairs == 0
+                && net_unconnected.iter().any(|n| !neighbors.contains(n)));
+        if bad_unconnected || net_summary.stopped_early || timed_out || vias_after >= vias_before {
+            board.tracks = saved_tracks;
+            board.vias = saved_vias;
+            return Ok(false);
+        }
+
+        self.pass_cfg.reroute_nets = Some(neighbors.clone());
+        self.pass_cfg.reroute_pad_mm = Some(pad_mm);
+        self.pass_cfg.timeout_secs = self.remaining_timeout_secs();
+        let nbr_summary = route_board_ir(board, &self.pass_cfg)?;
+        self.passes_run += nbr_summary.passes_run;
+        self.starts_run += nbr_summary.starts_run;
+        self.stopped_early |= nbr_summary.stopped_early;
+
+        let cand_eval =
+            eval_repair_state(board, &self.cfg.ignored_nets, nbr_summary.unconnected_pairs);
+        if cand_eval.score.is_better_than(&self.cur_eval.score) {
+            self.summary = nbr_summary;
+            self.repaired_nets.insert(primary_net.to_string());
+            self.repaired_nets.extend(neighbors.iter().cloned());
+            self.cur_eval = cand_eval;
+            Ok(true)
+        } else {
+            board.tracks = saved_tracks;
+            board.vias = saved_vias;
+            Ok(false)
+        }
     }
-    let mut ordered: Vec<(&str, Nm)> = by_net.into_iter().collect();
-    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    ordered.into_iter().map(|(n, _)| n.to_string()).collect()
 }
 
-fn repair_max_lengths(
+fn ordered_constraint_violating_nets(
+    eval: &RepairEval,
+    allowed_nets: &HashSet<String>,
+) -> Vec<(String, (Nm, Nm))> {
+    let mut ordered: Vec<(String, (Nm, Nm))> = eval
+        .constraint_excess
+        .iter()
+        .filter(|(n, _)| allowed_nets.contains(n.as_str()))
+        .map(|(n, &ex)| (n.clone(), ex))
+        .collect();
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ordered
+}
+
+fn repair_constraints(
     board: &mut BoardIr,
     state: &mut RepairState<'_>,
     eligible_nets: &HashSet<String>,
@@ -312,28 +434,41 @@ fn repair_max_lengths(
     pad_mm: f64,
 ) -> Result<(), String> {
     let allowed_nets = scope_nets.unwrap_or(eligible_nets);
-    let initial = ordered_over_length_nets(&state.cur_eval, allowed_nets);
+    let initial = ordered_constraint_violating_nets(&state.cur_eval, allowed_nets);
     if initial.is_empty() {
         return Ok(());
     }
-    let batch_solo = (initial.len() == 1).then(|| initial[0].clone());
-    let all_set: HashSet<String> = initial.into_iter().collect();
-    state.try_candidate(board, all_set, pad_mm)?;
+    let batch_solo = if initial.len() > 1 || initial[0].1.1 == 0 {
+        let solo = (initial.len() == 1).then(|| initial[0].0.clone());
+        let all_set: HashSet<String> = initial.into_iter().map(|(n, _)| n).collect();
+        state.try_candidate(board, all_set, pad_mm)?;
+        solo
+    } else {
+        None
+    };
 
     let mut tried = HashSet::new();
     while state.can_step() {
-        let Some(net) = ordered_over_length_nets(&state.cur_eval, allowed_nets)
-            .into_iter()
-            .find(|n| !tried.contains(n))
+        let Some((net, (excess_nm, excess_vias))) =
+            ordered_constraint_violating_nets(&state.cur_eval, allowed_nets)
+                .into_iter()
+                .find(|(n, _)| !tried.contains(n))
         else {
             break;
         };
         tried.insert(net.clone());
-        let mut targets = collect_corridor_neighbors(board, &net, eligible_nets, scope_nets);
-        if !targets.is_empty() {
-            targets.insert(net.clone());
-            let improved = state.try_candidate(board, targets, pad_mm)?;
-            if improved && state.cur_eval.max_lengths.iter().any(|m| m.net == net) {
+        let neighbors = collect_corridor_neighbors(board, &net, eligible_nets, scope_nets);
+        if !neighbors.is_empty() {
+            let mut improved = false;
+            if excess_vias > 0 {
+                improved = state.try_prioritized_candidate(board, &net, &neighbors, pad_mm)?;
+            }
+            if !improved && (excess_vias == 0 || excess_nm > 0) {
+                let mut targets = neighbors;
+                targets.insert(net.clone());
+                improved = state.try_candidate(board, targets, pad_mm)?;
+            }
+            if improved && state.cur_eval.constraint_excess.contains_key(&net) {
                 state.try_candidate(board, HashSet::from([net]), pad_mm)?;
             }
         } else if batch_solo.as_deref() != Some(net.as_str()) {
@@ -483,8 +618,8 @@ pub(crate) fn route_with_repair(
         state.try_candidate(board, targets, pad_mm)?;
     }
 
-    if state.can_step() && !state.cur_eval.max_lengths.is_empty() {
-        repair_max_lengths(
+    if state.can_step() && !state.cur_eval.constraint_excess.is_empty() {
+        repair_constraints(
             board,
             &mut state,
             &eligible_nets,
@@ -524,8 +659,8 @@ pub(crate) fn route_with_repair(
 mod tests {
     use std::collections::HashSet;
 
-    use super::eval_repair_state;
-    use crate::ir::{BoardIr, BoardSpec, MaxLengthRule, Pt, Track, mm};
+    use super::{RepairScore, eval_repair_state};
+    use crate::ir::{BoardIr, BoardSpec, MaxLengthRule, MaxViasRule, Pt, Track, Via, mm};
 
     #[test]
     fn eval_repair_state_prioritizes_geom_drc_over_max_length() {
@@ -587,20 +722,25 @@ edge_clearance_nm = 300000
         ];
         let ignored = HashSet::new();
         let s_long = eval_repair_state(&board, &ignored, 0);
-        assert_eq!(s_long.score.0, 0);
-        assert_eq!(s_long.score.1, 0);
-        assert_eq!(s_long.score.2, 1);
-        assert!(s_long.score.3 > mm(4.0));
+        assert_eq!(s_long.score.unconnected_pairs, 0);
+        assert_eq!(s_long.score.geom_viols, 0);
+        assert_eq!(s_long.score.max_length_viols, 1);
+        assert!(s_long.score.total_excess_nm > mm(4.0));
 
         // Shorter excess length improves score when geom_viols and max_length_count are equal.
         board.tracks[0].b = Pt::new(mm(9.0), mm(13.0));
         board.tracks[1].a = Pt::new(mm(9.0), mm(13.0));
         let s_shorter = eval_repair_state(&board, &ignored, 0);
         assert_eq!(
-            (s_shorter.score.0, s_shorter.score.1, s_shorter.score.2),
+            (
+                s_shorter.score.unconnected_pairs,
+                s_shorter.score.geom_viols,
+                s_shorter.score.max_length_viols,
+            ),
             (0, 0, 1)
         );
-        assert!(s_shorter.score < s_long.score);
+        assert!(s_shorter.score.is_better_than(&s_long.score));
+        assert!(!s_long.score.is_better_than(&s_shorter.score));
 
         // Fixing MaxLength while introducing a geometric violation must score worse.
         board.tracks = vec![
@@ -622,8 +762,103 @@ edge_clearance_nm = 300000
             },
         ];
         let s_geom_bad = eval_repair_state(&board, &ignored, 0);
-        assert!(s_geom_bad.score.1 > 0);
-        assert_eq!(s_geom_bad.score.2, 0);
-        assert!(s_geom_bad.score > s_long.score);
+        assert!(s_geom_bad.score.geom_viols > 0);
+        assert_eq!(s_geom_bad.score.max_length_viols, 0);
+        assert!(s_long.score.is_better_than(&s_geom_bad.score));
+        assert!(!s_geom_bad.score.is_better_than(&s_long.score));
+
+        // MaxVias excess scoring and no blind trade between MaxLength and MaxVias.
+        board.constraints.max_vias.push(MaxViasRule {
+            nets: vec!["SIG_A".into()],
+            max_vias: 0,
+        });
+        board.tracks = vec![Track {
+            net: "SIG_A".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(2.0), mm(10.0)),
+            b: Pt::new(mm(16.0), mm(10.0)),
+            width: mm(0.2),
+            locked: false,
+        }];
+        board.vias = vec![
+            Via {
+                net: "SIG_A".into(),
+                pos: Pt::new(mm(5.0), mm(10.0)),
+                diameter: mm(0.45),
+                drill: mm(0.2),
+                layers: ("F.Cu".into(), "B.Cu".into()),
+                locked: false,
+                tented: true,
+            },
+            Via {
+                net: "SIG_A".into(),
+                pos: Pt::new(mm(12.0), mm(10.0)),
+                diameter: mm(0.45),
+                drill: mm(0.2),
+                layers: ("F.Cu".into(), "B.Cu".into()),
+                locked: false,
+                tented: true,
+            },
+        ];
+        let s_two_vias = eval_repair_state(&board, &ignored, 0);
+        assert_eq!(s_two_vias.score.max_vias_viols, 1);
+        assert_eq!(s_two_vias.score.total_excess_vias, 2);
+
+        board.vias.pop();
+        let s_one_via = eval_repair_state(&board, &ignored, 0);
+        assert_eq!(s_one_via.score.max_vias_viols, 1);
+        assert_eq!(s_one_via.score.total_excess_vias, 1);
+        assert!(s_one_via.score.is_better_than(&s_two_vias.score));
+
+        // Never blindly trade a MaxLength violation for a MaxVias violation (or vice versa).
+        let trade_len = RepairScore {
+            unconnected_pairs: 0,
+            geom_viols: 0,
+            max_length_viols: 1,
+            max_vias_viols: 0,
+            total_excess_nm: mm(2.0),
+            total_excess_vias: 0,
+        };
+        let trade_vias = RepairScore {
+            unconnected_pairs: 0,
+            geom_viols: 0,
+            max_length_viols: 0,
+            max_vias_viols: 1,
+            total_excess_nm: 0,
+            total_excess_vias: 1,
+        };
+        assert!(!trade_vias.is_better_than(&trade_len));
+        assert!(!trade_len.is_better_than(&trade_vias));
+
+        // Locked-via MaxVias stays counted in score (rejects extra unlocked via) without becoming an actionable target.
+        board.vias = vec![Via {
+            net: "SIG_A".into(),
+            pos: Pt::new(mm(5.0), mm(10.0)),
+            diameter: mm(0.45),
+            drill: mm(0.2),
+            layers: ("F.Cu".into(), "B.Cu".into()),
+            locked: true,
+            tented: true,
+        }];
+        let s_locked_only = eval_repair_state(&board, &ignored, 0);
+        assert_eq!(s_locked_only.score.max_vias_viols, 1);
+        assert_eq!(s_locked_only.score.total_excess_vias, 1);
+        assert!(!s_locked_only.constraint_excess.contains_key("SIG_A"));
+
+        board.vias.push(Via {
+            net: "SIG_A".into(),
+            pos: Pt::new(mm(12.0), mm(10.0)),
+            diameter: mm(0.45),
+            drill: mm(0.2),
+            layers: ("F.Cu".into(), "B.Cu".into()),
+            locked: false,
+            tented: true,
+        });
+        let s_locked_plus_unlocked = eval_repair_state(&board, &ignored, 0);
+        assert!(
+            s_locked_only
+                .score
+                .is_better_than(&s_locked_plus_unlocked.score)
+        );
     }
 }

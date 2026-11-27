@@ -1674,3 +1674,79 @@ pos = { x = 20000000, y = 15000000 }
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn subcircuit_max_vias_expansion_resolves_ports_and_private_nets() {
+    let toml_spec = r#"
+name = "subcircuit_max_vias"
+size_nm = [40000000, 30000000]
+
+[footprints.R0402]
+kind = "chip2_pin"
+package = "0402"
+
+[subcircuits.Stage]
+ports = ["OUT"]
+
+[[subcircuits.Stage.placements]]
+refdes = "R1"
+footprint = "R0402"
+pos = { x = 0, y = 0 }
+
+[[subcircuits.Stage.placements]]
+refdes = "R2"
+footprint = "R0402"
+pos = { x = 4000000, y = 0 }
+
+[subcircuits.Stage.nets]
+OUT = ["R1.1"]
+PRIV = ["R1.2", "R2.1"]
+
+[[subcircuits.Stage.constraints.max_vias]]
+nets = ["OUT", "PRIV"]
+max_vias = 1
+
+[[placements]]
+refdes = "R_TOP"
+footprint = "R0402"
+pos = { x = 5000000, y = 15000000 }
+
+[nets]
+BUS_OUT = ["R_TOP.1"]
+
+[[instances]]
+subcircuit = "Stage"
+prefix = "S1"
+ports = { OUT = "BUS_OUT" }
+pos = { x = 15000000, y = 15000000 }
+"#;
+    let spec: BoardSpec = toml::from_str(toml_spec).unwrap();
+    let mut ir = BoardIr::from_spec(&spec).unwrap();
+    assert_eq!(ir.constraints.max_vias.len(), 1);
+    assert_eq!(
+        ir.constraints.max_vias[0].nets,
+        vec!["BUS_OUT".to_string(), "S1_PRIV".to_string()]
+    );
+    assert_eq!(ir.constraints.max_vias[0].max_vias, 1);
+
+    // Trigger MaxVias on expanded private net S1_PRIV.
+    for x in [16.0, 18.0] {
+        ir.vias.push(Via {
+            net: "S1_PRIV".into(),
+            pos: Pt::new(mm(x), mm(15.0)),
+            diameter: 450_000,
+            drill: 200_000,
+            layers: ("F.Cu".into(), "B.Cu".into()),
+            locked: false,
+            tented: true,
+        });
+    }
+    let drc = check_board_drc(&ir);
+    assert!(
+        drc.violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "S1_PRIV"),
+        "expected MaxVias on expanded private net S1_PRIV: {:?}",
+        drc.violations
+    );
+}

@@ -126,6 +126,7 @@ fn build_action_hint(
             format!("Place decoupling capacitor {root_item} closer to target IC")
         }
         ViolationKind::MinVias => format!("Add vias on {root_item}{net_suffix}"),
+        ViolationKind::MaxVias => format!("Reduce vias on {root_item}{net_suffix}"),
         ViolationKind::TrackDangling => {
             format!("Trim or connect dangling track {root_item}{net_suffix}")
         }

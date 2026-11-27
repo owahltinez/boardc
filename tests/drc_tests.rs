@@ -8,8 +8,8 @@ use boardc::drc::{
 use boardc::ir::{
     BgaShadowRule, BoardIr, BoardSpec, CapProximityRule, Constraints, DesignRules, FilledPour,
     FootprintSpec, Keepout, KeepoutKind, LayerDef, LayerKind, MatchGroupRule, MaxLengthRule,
-    MinViasRule, NetClass, NetDef, Nm, PadDef, PadKind, PadShape, Placement, PourPoly, PourSpec,
-    Pt, Side, Track, Via, mm, um,
+    MaxViasRule, MinViasRule, NetClass, NetDef, Nm, PadDef, PadKind, PadShape, Placement, PourPoly,
+    PourSpec, Pt, Side, Track, Via, mm, um,
 };
 use boardc::route::{RouteOptions, route_board_ir};
 use boardc::zones::fill_zones;
@@ -703,6 +703,7 @@ fn constraints_max_length_match_group_cap_proximity_min_vias_bga_shadow() {
                 refdes: None,
                 min_vias: 2,
             }],
+            max_vias: Vec::new(),
             bga_shadows: vec![BgaShadowRule {
                 bga_refdes: "U1".into(),
                 min_clearance_nm: mm(0.5),
@@ -4158,5 +4159,130 @@ fn silk_capsule_mask_dedup_hotspot_isolation_poly_and_upright() {
         silk_viols(&rot_rep, ViolationKind::SilkOverCopper).is_empty(),
         "rotated-180 'L.refdes' must clear P1.1: {:?}",
         rot_rep.violations
+    );
+}
+
+#[test]
+fn constraints_max_vias_toml_drc_and_hotspot_hint() {
+    let toml_spec = r#"
+name = "max_vias_drc"
+size_nm = [30000000, 20000000]
+
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+
+[[constraints.max_vias]]
+nets = ["/Compute & Flash/HSE_IN", "/Compute & Flash/HSE_OUT"]
+max_vias = 2
+
+[[constraints.max_vias]]
+nets = ["NO_VIA_NET"]
+max_vias = 0
+"#;
+    let spec: BoardSpec = toml::from_str(toml_spec).unwrap();
+    assert_eq!(spec.constraints.max_vias.len(), 2);
+    assert_eq!(
+        spec.constraints.max_vias[0],
+        MaxViasRule {
+            nets: vec![
+                "/Compute & Flash/HSE_IN".into(),
+                "/Compute & Flash/HSE_OUT".into(),
+            ],
+            max_vias: 2,
+        }
+    );
+
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    // 0 vias on NO_VIA_NET and 2 vias on HSE_IN both pass (count <= max_vias).
+    for i in 0..2 {
+        board.vias.push(Via {
+            net: "/Compute & Flash/HSE_IN".into(),
+            pos: Pt::new(mm(5.0 + i as f64 * 2.0), mm(10.0)),
+            diameter: um(500.0),
+            drill: um(250.0),
+            layers: ("F.Cu".into(), "B.Cu".into()),
+            locked: false,
+            tented: true,
+        });
+    }
+    let pass_rep = check_board_drc(&board);
+    assert!(
+        pass_rep
+            .violations
+            .iter()
+            .all(|v| v.kind != ViolationKind::MaxVias),
+        "expected no MaxVias violations, got {:?}",
+        pass_rep.violations
+    );
+
+    // 3rd via on HSE_IN and 1 via on NO_VIA_NET exceed their limits; HSE_OUT (0 vias) stays passing.
+    board.vias.push(Via {
+        net: "/Compute & Flash/HSE_IN".into(),
+        pos: Pt::new(mm(9.0), mm(10.0)),
+        diameter: um(500.0),
+        drill: um(250.0),
+        layers: ("F.Cu".into(), "B.Cu".into()),
+        locked: false,
+        tented: true,
+    });
+    board.vias.push(Via {
+        net: "NO_VIA_NET".into(),
+        pos: Pt::new(mm(20.0), mm(10.0)),
+        diameter: um(500.0),
+        drill: um(250.0),
+        layers: ("F.Cu".into(), "B.Cu".into()),
+        locked: false,
+        tented: true,
+    });
+    let fail_rep = check_board_drc(&board);
+    let max_via_viols: Vec<&Violation> = fail_rep
+        .violations
+        .iter()
+        .filter(|v| v.kind == ViolationKind::MaxVias)
+        .collect();
+    assert_eq!(max_via_viols.len(), 2, "{max_via_viols:?}");
+
+    let hse_v = max_via_viols
+        .iter()
+        .find(|v| v.net_a == "/Compute & Flash/HSE_IN")
+        .unwrap();
+    assert_eq!(hse_v.severity, Severity::Error);
+    assert_eq!(hse_v.layer, "");
+    assert_eq!(hse_v.pos_nm, Pt::new(mm(5.0), mm(10.0)));
+    assert_eq!(hse_v.measured_nm, 3);
+    assert_eq!(hse_v.required_nm, 2);
+    assert_eq!(hse_v.item_a, "net:/Compute & Flash/HSE_IN");
+    assert_eq!(hse_v.item_b, None);
+    assert_eq!(hse_v.net_b, "");
+    assert_eq!(
+        hse_v.message,
+        "net /Compute & Flash/HSE_IN has 3 vias > max 2"
+    );
+    assert_eq!(
+        serde_json::to_value(hse_v.kind).unwrap(),
+        serde_json::json!("max_vias")
+    );
+
+    let nv_v = max_via_viols
+        .iter()
+        .find(|v| v.net_a == "NO_VIA_NET")
+        .unwrap();
+    assert_eq!(nv_v.measured_nm, 1);
+    assert_eq!(nv_v.required_nm, 0);
+    assert_eq!(nv_v.pos_nm, Pt::new(mm(20.0), mm(10.0)));
+
+    let hotspots = cluster_hotspots(&[(*hse_v).clone()], mm(2.0));
+    assert_eq!(hotspots.len(), 1);
+    assert!(
+        hotspots[0].action_hint.starts_with("Reduce vias on "),
+        "unexpected action hint: {}",
+        hotspots[0].action_hint
     );
 }

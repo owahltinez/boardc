@@ -302,6 +302,31 @@ pub(crate) fn check_constraints(board: &BoardIr, pads: &[PadItem], out: &mut Vec
         }
     }
 
+    for rule in &board.constraints.max_vias {
+        for net in &rule.nets {
+            let mut vias = board.vias.iter().filter(|v| v.net == *net);
+            let Some(first) = vias.next() else {
+                continue;
+            };
+            let count = 1 + vias.count();
+            if count > rule.max_vias {
+                out.push(Violation {
+                    kind: ViolationKind::MaxVias,
+                    severity: Severity::Error,
+                    layer: String::new(),
+                    pos_nm: first.pos,
+                    measured_nm: count as Nm,
+                    required_nm: rule.max_vias as Nm,
+                    item_a: format!("net:{net}"),
+                    item_b: None,
+                    net_a: net.clone(),
+                    net_b: String::new(),
+                    message: format!("net {net} has {count} vias > max {}", rule.max_vias),
+                });
+            }
+        }
+    }
+
     for rule in &board.constraints.bga_shadows {
         let Some(bga) = board
             .placements
