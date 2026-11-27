@@ -235,6 +235,16 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
     }
     let length_constraints = build_length_constraints(board);
     length_constraints.validate(&vboard)?;
+    for rule in &board.constraints.match_groups {
+        for net in &rule.nets {
+            if !vboard.net_name_to_id.contains_key(net) {
+                return Err(format!(
+                    "match_group '{}' references unknown net '{net}'",
+                    rule.name
+                ));
+            }
+        }
+    }
 
     let use_initial = cfg.resume || cfg.reroute_nets.is_some();
     let initial_routes = use_initial.then(|| build_initial_routes(board, &vboard));
@@ -263,20 +273,20 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
     let mut total_segments = s.total_segments;
     let mut total_wirelength_um = s.total_wirelength_um;
     let mut length_violations = s.length_violations;
+    let mut elapsed_ms = s.elapsed_ms;
     if cfg.tune_match_groups && !board.constraints.match_groups.is_empty() {
-        let segs_before = board.tracks.len() as isize;
         let len_before: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
-        let _tune = tune_match_groups(
+        let tune = tune_match_groups(
             board,
             &TuneOptions {
                 only_nets: cfg.reroute_nets.clone(),
                 ignored_nets: cfg.ignored_nets.clone(),
             },
         );
-        let segs_delta = board.tracks.len() as isize - segs_before;
         let len_after: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
-        total_segments = ((total_segments as isize) + segs_delta).max(0) as usize;
+        total_segments += tune.added_segments;
         total_wirelength_um = (total_wirelength_um + (len_after - len_before) / 1000.0).max(0.0);
+        elapsed_ms += tune.elapsed_ms;
     }
     if !board.constraints.match_groups.is_empty() || !board.constraints.max_lengths.is_empty() {
         length_violations = count_length_violations(board);
@@ -298,6 +308,6 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
         pofv_capable_pads: s.pofv_capable_pads,
         grid_step_um: s.grid_step_um,
         stopped_early: s.stopped_early,
-        elapsed_ms: s.elapsed_ms,
+        elapsed_ms,
     })
 }

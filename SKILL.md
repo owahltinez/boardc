@@ -74,7 +74,7 @@ Run individual stages when debugging one pass in isolation:
 boardc place board.toml -o placed.json --power-vias --json
 boardc route placed.json -o routed.json --ignore GND,VCC --threads 4 --json
 boardc tune routed.json -o tuned.json --json
-boardc zones routed.json -o filled.json --report zones.json
+boardc zones tuned.json -o filled.json --report zones.json
 boardc erc board.toml --json
 boardc drc filled.json --json
 boardc fab filled.json -o fab_out --assembly --drill-map --drill-report --json

@@ -42,7 +42,7 @@ For coding agents, run `boardc skill install` (or read [SKILL.md](SKILL.md) dire
 ## CLI Subcommands
 
 ```text
-boardc build <INPUT> [--out-dir <DIR>] [--cache-dir .boardc-cache] [--no-cache] [--fail-on-preflight] [--reroute-nets NET,...] [--json]
+boardc build <INPUT> [--out-dir <DIR>] [--cache-dir .boardc-cache] [--no-cache] [--fail-on-preflight] [--reroute-nets NET,...] [--no-tune] [--json]
 boardc preflight <INPUT> [--ignore NET,...] [--json]
 boardc place <INPUT> [-o <OUT_BOARD_JSON>] [--power-vias] [--json]
 boardc route <INPUT> [-o <OUT_BOARD_JSON>] [--reroute-nets NET,...] [--via-at-smd] [--no-tune] [--json]

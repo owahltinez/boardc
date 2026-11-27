@@ -142,7 +142,7 @@ pub(crate) fn collect_net_lengths(board: &BoardIr) -> BTreeMap<&str, f64> {
     net_lengths
 }
 
-pub(crate) fn check_length_constraints(
+fn check_length_constraints(
     board: &BoardIr,
     net_lengths: &BTreeMap<&str, f64>,
     net_pos: &BTreeMap<&str, Pt>,

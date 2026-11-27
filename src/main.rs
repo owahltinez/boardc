@@ -23,7 +23,7 @@ use boardc::place::{
 use boardc::preflight::run_preflight;
 use boardc::route::{RouteOptions, route_board_ir};
 use boardc::svg::{SvgOptions, SvgView, render_board_svg, write_board_svgs};
-use boardc::tune::{TuneOptions, tune_match_groups};
+use boardc::tune::{TuneOptions, tune_match_groups, validate_tune_targets};
 use boardc::verify::{VerifyReport, verify_fab_outputs};
 use boardc::zones::fill_zones;
 
@@ -619,6 +619,7 @@ fn run(cli: Cli) -> Result<(), String> {
         } => {
             let mut ir = load_board_input(&input)?;
             let only_set = to_net_set(only);
+            validate_tune_targets(&ir, &only_set)?;
             let report = tune_match_groups(
                 &mut ir,
                 &TuneOptions {

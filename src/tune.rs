@@ -62,90 +62,135 @@ struct NetTarget {
     upper_bound: f64,
 }
 
-fn net_allowed(net: &str, cfg: &TuneOptions) -> bool {
-    if cfg.ignored_nets.contains(net) {
+/// Rejects `--only` targets that match neither a board net nor a `NetClass`.
+pub fn validate_tune_targets(board: &BoardIr, targets: &HashSet<String>) -> Result<(), String> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let nets: HashSet<String> = board.all_net_names().into_iter().collect();
+    for t in targets {
+        let is_net = nets.contains(t);
+        let is_class = t == "Default"
+            || board.net_classes.contains_key(t)
+            || board.nets.values().any(|n| n.class == *t);
+        if !is_net && !is_class {
+            return Err(format!("unknown --only target '{t}'"));
+        }
+    }
+    Ok(())
+}
+
+fn net_allowed(board: &BoardIr, net: &str, cfg: &TuneOptions) -> bool {
+    let nd = board.nets.get(net);
+    if nd.is_some_and(|n| n.ignore_route) {
         return false;
     }
-    cfg.only_nets.as_ref().is_none_or(|only| only.contains(net))
+    let class_name = nd.map_or("Default", |n| n.class.as_str());
+    if cfg.ignored_nets.contains(net) || cfg.ignored_nets.contains(class_name) {
+        return false;
+    }
+    cfg.only_nets
+        .as_ref()
+        .is_none_or(|only| only.contains(net) || only.contains(class_name))
+}
+
+fn relative_group_hi(
+    nets: &[String],
+    lengths: &BTreeMap<String, f64>,
+    desireds: &BTreeMap<String, f64>,
+) -> Option<f64> {
+    nets.iter()
+        .filter_map(|n| {
+            let cur = lengths.get(n).copied().unwrap_or(0.0);
+            (cur > EPS_NM).then(|| cur.max(desireds.get(n).copied().unwrap_or(0.0)))
+        })
+        .reduce(f64::max)
 }
 
 fn compute_net_targets(
     board: &BoardIr,
     lengths: &BTreeMap<String, f64>,
 ) -> BTreeMap<String, NetTarget> {
-    let mut max_cap: BTreeMap<String, f64> = BTreeMap::new();
+    let mut upper_bounds: BTreeMap<String, f64> = BTreeMap::new();
     for rule in &board.constraints.max_lengths {
         for net in &rule.nets {
-            max_cap
+            upper_bounds
                 .entry(net.clone())
                 .and_modify(|v| *v = v.min(rule.max_nm as f64))
                 .or_insert(rule.max_nm as f64);
         }
     }
-
-    let mut upper_bounds: BTreeMap<String, f64> = BTreeMap::new();
-    let mut min_reqs: BTreeMap<String, f64> = BTreeMap::new();
-    let mut desireds: BTreeMap<String, f64> = BTreeMap::new();
-
     for rule in &board.constraints.match_groups {
-        let tol = rule.tolerance_nm.max(0) as f64;
         if let Some(target) = rule.target_nm {
-            let t = target as f64;
-            let req = t - tol;
-            let upper = t + tol;
+            let upper = (target + rule.tolerance_nm.max(0)) as f64;
             for net in &rule.nets {
                 upper_bounds
                     .entry(net.clone())
                     .and_modify(|v| *v = v.min(upper))
                     .or_insert(upper);
-                let cur = lengths.get(net).copied().unwrap_or(0.0);
-                if cur > EPS_NM && cur < req - EPS_NM {
-                    min_reqs
-                        .entry(net.clone())
-                        .and_modify(|v| *v = v.max(req))
-                        .or_insert(req);
-                    desireds
-                        .entry(net.clone())
-                        .and_modify(|v| *v = v.max(t))
-                        .or_insert(t);
-                }
             }
-        } else if rule.nets.len() >= 2 {
-            let Some(max_len) = rule
-                .nets
-                .iter()
-                .filter_map(|n| lengths.get(n).copied().filter(|&l| l > EPS_NM))
-                .reduce(f64::max)
-            else {
+        }
+    }
+
+    let mut min_reqs: BTreeMap<String, f64> = BTreeMap::new();
+    let mut desireds: BTreeMap<String, f64> = BTreeMap::new();
+    for _ in 0..=board.constraints.match_groups.len() {
+        let mut changed = false;
+        for rule in &board.constraints.match_groups {
+            let tol = rule.tolerance_nm.max(0) as f64;
+            let (req, desired_val) = if let Some(target) = rule.target_nm {
+                let t = target as f64;
+                (t - tol, t)
+            } else if rule.nets.len() >= 2 {
+                let Some(group_hi) = relative_group_hi(&rule.nets, lengths, &desireds) else {
+                    continue;
+                };
+                (group_hi - tol, group_hi)
+            } else {
                 continue;
             };
-            let req = max_len - tol;
+            for net in &rule.nets {
+                let cur = lengths.get(net).copied().unwrap_or(0.0);
+                if cur > EPS_NM && cur < req - EPS_NM {
+                    let prev_req = min_reqs.get(net).copied().unwrap_or(0.0);
+                    if req > prev_req + EPS_NM {
+                        min_reqs.insert(net.clone(), req);
+                        changed = true;
+                    }
+                    let d = upper_bounds
+                        .get(net)
+                        .copied()
+                        .map_or(desired_val, |u| desired_val.min(u));
+                    let prev_d = desireds.get(net).copied().unwrap_or(0.0);
+                    if d > prev_d + EPS_NM {
+                        desireds.insert(net.clone(), d);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for rule in &board.constraints.match_groups {
+        if rule.target_nm.is_none()
+            && rule.nets.len() >= 2
+            && let Some(group_hi) = relative_group_hi(&rule.nets, lengths, &desireds)
+        {
             for net in &rule.nets {
                 upper_bounds
                     .entry(net.clone())
-                    .and_modify(|v| *v = v.min(max_len))
-                    .or_insert(max_len);
-                let cur = lengths.get(net).copied().unwrap_or(0.0);
-                if cur > EPS_NM && cur < req - EPS_NM {
-                    min_reqs
-                        .entry(net.clone())
-                        .and_modify(|v| *v = v.max(req))
-                        .or_insert(req);
-                    desireds
-                        .entry(net.clone())
-                        .and_modify(|v| *v = v.max(max_len))
-                        .or_insert(max_len);
-                }
+                    .and_modify(|v| *v = v.min(group_hi))
+                    .or_insert(group_hi);
             }
         }
     }
 
     let mut targets = BTreeMap::new();
     for (net, min_req) in min_reqs {
-        let mut upper = upper_bounds.get(&net).copied().unwrap_or(f64::INFINITY);
-        if let Some(&cap) = max_cap.get(&net) {
-            upper = upper.min(cap);
-        }
+        let upper = upper_bounds.get(&net).copied().unwrap_or(f64::INFINITY);
         let desired = desireds.get(&net).copied().unwrap_or(min_req).min(upper);
         let cur = lengths.get(&net).copied().unwrap_or(0.0);
         if upper > cur + EPS_NM && desired > cur + EPS_NM {
@@ -180,8 +225,10 @@ fn tune_single_net(
             .tracks
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.active && !t.locked && t.net == net && t.a != t.b)
-            .map(|(i, t)| (i, t.a.dist(t.b)))
+            .filter_map(|(i, slot)| {
+                let t = slot.as_ref()?;
+                (!t.locked && t.net == net && t.a != t.b && t.width > 0).then(|| (i, t.a.dist(t.b)))
+            })
             .collect();
         candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
@@ -190,26 +237,27 @@ fn tune_single_net(
             if *cur_len >= target.min_required - EPS_NM {
                 break;
             }
-            let (layer, a, b, width) = {
-                let t = &scene.tracks[orig_idx];
-                if !t.active {
+            let min_needed = (target.min_required - *cur_len).max(0.0);
+            let want = (target.desired_target - *cur_len).max(0.0);
+            let cap = (target.upper_bound - *cur_len).max(0.0);
+            if cap <= 1_000.0 || want <= EPS_NM {
+                break;
+            }
+            let Some(t) = scene.tracks[orig_idx].as_ref() else {
+                continue;
+            };
+            let (layer, a, b, width) = (t.layer.clone(), t.a, t.b, t.width);
+            let step = (width + same_net_clr).max(10_000) as f64;
+            let protected = scene.protected_intervals(orig_idx, net, &layer, a, b, width);
+            let subspans = split_subspans(a, b, &protected);
+
+            for (si, &(span_a, span_b, meanderable)) in subspans.iter().enumerate() {
+                if !meanderable {
                     continue;
                 }
-                (t.layer.clone(), t.a, t.b, t.width)
-            };
-            let step = (width + same_net_clr) as f64;
-            let splits = scene.interior_junctions(orig_idx, net, &layer, a, b, width);
-            let subspans = split_subspans(a, b, &splits);
-
-            for (si, &(span_a, span_b)) in subspans.iter().enumerate() {
                 let span_len = span_a.dist(span_b);
                 if span_len < 3.0 * step {
                     continue;
-                }
-                let want = (target.desired_target - *cur_len).max(0.0);
-                let cap = (target.upper_bound - *cur_len).max(0.0);
-                if cap <= 1_000.0 || want <= EPS_NM {
-                    break;
                 }
 
                 let pad_lead_a =
@@ -231,7 +279,8 @@ fn tune_single_net(
                     span_b,
                     step,
                 };
-                let Some(cand) = find_best_meander_for_span(scene, &ctx, lead_a, lead_b, want, cap)
+                let Some(cand) =
+                    find_best_meander_for_span(scene, &ctx, lead_a, lead_b, min_needed, want, cap)
                 else {
                     continue;
                 };
@@ -247,13 +296,13 @@ fn tune_single_net(
                         locked: false,
                     });
                 };
-                for &(pa, pb) in &subspans[..si] {
+                for &(pa, pb, _) in &subspans[..si] {
                     push_seg(pa, pb);
                 }
                 for w in cand.pts.windows(2) {
                     push_seg(w[0], w[1]);
                 }
-                for &(pa, pb) in &subspans[si + 1..] {
+                for &(pa, pb, _) in &subspans[si + 1..] {
                     push_seg(pa, pb);
                 }
 
@@ -305,35 +354,28 @@ pub fn tune_match_groups(board: &mut BoardIr, cfg: &TuneOptions) -> TuneReport {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-    let targets = compute_net_targets(board, &initial_lengths);
-    let mut current_lengths = initial_lengths.clone();
-    let mut per_net_meanders: BTreeMap<String, usize> = BTreeMap::new();
-    let mut per_net_segs: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ordered: Vec<(String, NetTarget, f64)> = compute_net_targets(board, &initial_lengths)
+        .into_iter()
+        .filter(|(net, _)| net_allowed(board, net, cfg))
+        .map(|(net, tgt)| {
+            let cur = initial_lengths.get(&net).copied().unwrap_or(0.0);
+            let deficit = (tgt.desired_target - cur).max(0.0);
+            (net, tgt, deficit)
+        })
+        .collect();
+    ordered.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-    if !targets.is_empty() {
-        let mut ordered: Vec<(String, NetTarget, f64)> = targets
-            .into_iter()
-            .filter(|(net, _)| net_allowed(net, cfg))
-            .map(|(net, tgt)| {
-                let cur = current_lengths.get(&net).copied().unwrap_or(0.0);
-                let deficit = (tgt.desired_target - cur).max(0.0);
-                (net, tgt, deficit)
-            })
-            .collect();
-        ordered.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-
+    let mut per_net_stats: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    if !ordered.is_empty() {
         let mut scene = TuneScene::new(board);
         for (net, tgt, _) in ordered {
-            let mut len = current_lengths.get(&net).copied().unwrap_or(0.0);
+            let mut len = initial_lengths.get(&net).copied().unwrap_or(0.0);
             let (m, s) = tune_single_net(&mut scene, &net, &mut len, tgt);
-            current_lengths.insert(net.clone(), len);
             if m > 0 {
-                per_net_meanders.insert(net.clone(), m);
-                per_net_segs.insert(net, s);
+                per_net_stats.insert(net, (m, s));
             }
         }
-        let final_tracks = scene.into_tracks();
-        board.tracks = final_tracks;
+        board.tracks = scene.into_tracks();
     }
 
     let final_lengths: BTreeMap<String, f64> = collect_net_lengths(board)
@@ -375,13 +417,15 @@ pub fn tune_match_groups(board: &mut BoardIr, cfg: &TuneOptions) -> TuneReport {
                 group_unmet.push(net.clone());
                 all_unmet.insert(net.clone());
             }
+            let (added_meanders, added_segments) =
+                per_net_stats.get(net).copied().unwrap_or((0, 0));
             net_reports.push(TuneNetReport {
                 net: net.clone(),
                 before_nm: before.round() as Nm,
                 after_nm: after.round() as Nm,
                 target_nm,
-                added_meanders: per_net_meanders.get(net).copied().unwrap_or(0),
-                added_segments: per_net_segs.get(net).copied().unwrap_or(0),
+                added_meanders,
+                added_segments,
                 met,
             });
         }
@@ -405,9 +449,9 @@ pub fn tune_match_groups(board: &mut BoardIr, cfg: &TuneOptions) -> TuneReport {
     TuneReport {
         ok: all_ok,
         groups,
-        tuned_nets: per_net_meanders.len(),
-        added_meanders: per_net_meanders.values().sum(),
-        added_segments: per_net_segs.values().sum(),
+        tuned_nets: per_net_stats.len(),
+        added_meanders: per_net_stats.values().map(|v| v.0).sum(),
+        added_segments: per_net_stats.values().map(|v| v.1).sum(),
         unmet_nets: all_unmet.into_iter().collect(),
         elapsed_ms: t0.elapsed().as_millis(),
     }
