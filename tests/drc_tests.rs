@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::process::Command;
 
 use boardc::drc::{
@@ -11,6 +11,7 @@ use boardc::ir::{
     MinViasRule, NetClass, NetDef, Nm, PadDef, PadKind, PadShape, Placement, PourPoly, PourSpec,
     Pt, Side, Track, Via, mm, um,
 };
+use boardc::route::{RouteOptions, route_board_ir};
 use boardc::zones::fill_zones;
 
 fn rect_pts(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<Pt> {
@@ -2271,5 +2272,748 @@ fn allow_edge_overhang_skips_component_to_edge_but_enforces_pads_courtyard_and_k
             .layout_violations
             .iter()
             .any(|v| v.kind == ViolationKind::EdgeClearance && v.item_a == "J1.H1")
+    );
+}
+
+fn smd_row_fp(pins: &[(&str, f64)], layers: &[&str]) -> FootprintSpec {
+    FootprintSpec::Custom {
+        pads: pins
+            .iter()
+            .map(|&(name, x_mm)| PadDef {
+                name: name.into(),
+                kind: PadKind::Smd,
+                shape: PadShape::Circle { diameter: mm(0.8) },
+                pos: Pt::new(mm(x_mm), 0),
+                rot_deg: 0.0,
+                drill_nm: None,
+                layers: layers.iter().map(|&l| l.into()).collect(),
+                mask_margin_nm: None,
+                paste_margin_nm: None,
+            })
+            .collect(),
+        courtyard: Vec::new(),
+        graphics: Vec::new(),
+        keepouts: Vec::new(),
+        models: Vec::new(),
+        pin_types: Default::default(),
+    }
+}
+
+#[test]
+fn hotspot_filters_unconnected_and_single_pin_nets_and_reroutes_cleanly() {
+    let mut footprints = BTreeMap::new();
+    footprints.insert(
+        "SMD".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu", "F.Mask"], None),
+    );
+    footprints.insert(
+        "U_PKG".into(),
+        smd_row_fp(
+            &[("J1", 0.0), ("J2", 4.0), ("J3", 8.0), ("J4", 12.0)],
+            &["F.Cu", "F.Mask"],
+        ),
+    );
+
+    // U1.J1 & U2.1 form 2-pin VDDSMPS_1V8; U1.J2 is unconnected-(U1-PadJ2);
+    // U1.J3 is generic single-pin NC_UNUSED; U1.J4 & U3.1 form 2-pin UNCONNECTED-(SHARED) (multi-pin!).
+    let u1_pin_nets = BTreeMap::from([
+        ("J1".into(), "VDDSMPS_1V8".into()),
+        ("J2".into(), "unconnected-(U1-PadJ2)".into()),
+        ("J3".into(), "NC_UNUSED".into()),
+        ("J4".into(), "UNCONNECTED-(SHARED)".into()),
+    ]);
+    let spec = BoardSpec {
+        name: "issue_29_hotspot_filter".into(),
+        size_nm: Some([mm(40.0), mm(25.0)]),
+        layers: vec![
+            LayerDef {
+                name: "F.Cu".into(),
+                kind: LayerKind::Signal,
+                side: Some(Side::Top),
+                thickness_nm: None,
+            },
+            LayerDef {
+                name: "B.Cu".into(),
+                kind: LayerKind::Signal,
+                side: Some(Side::Bottom),
+                thickness_nm: None,
+            },
+        ],
+        footprints,
+        placements: vec![
+            Placement {
+                refdes: "U1".into(),
+                footprint: "U_PKG".into(),
+                pos: Pt::new(mm(6.0), mm(10.0)),
+                side: Side::Top,
+                locked: true,
+                pin_nets: u1_pin_nets,
+                ..Default::default()
+            },
+            place_pin1("U2", "SMD", 26.0, 10.0, Side::Top, "VDDSMPS_1V8"),
+            place_pin1("U3", "SMD", 26.0, 16.0, Side::Top, "UNCONNECTED-(SHARED)"),
+            // Distant single-pin pad violating edge clearance alone (no routable net in cluster).
+            place_pin1("U4", "SMD", 0.3, 20.0, Side::Top, "UNCONNECTED-(U4-Pad1)"),
+        ],
+        tracks: vec![
+            // Track#0 on VDDSMPS_1V8 passes straight across U1.J2 (unconnected-(U1-PadJ2)) and U1.J3 (NC_UNUSED).
+            Track {
+                net: "VDDSMPS_1V8".into(),
+                layer: "F.Cu".into(),
+                a: Pt::new(mm(6.0), mm(10.0)),
+                b: Pt::new(mm(26.0), mm(10.0)),
+                width: um(200.0),
+                locked: false,
+            },
+            Track {
+                net: "UNCONNECTED-(SHARED)".into(),
+                layer: "F.Cu".into(),
+                a: Pt::new(mm(18.0), mm(10.0)),
+                b: Pt::new(mm(26.0), mm(16.0)),
+                width: um(200.0),
+                locked: false,
+            },
+        ],
+        rules: DesignRules {
+            clearance_nm: um(150.0),
+            mask_expansion_nm: um(50.0),
+            mask_to_copper_nm: Some(um(80.0)),
+            edge_clearance_nm: um(300.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    let rep = check_board_drc(&board);
+
+    // 1. Atomic violations MUST retain exact net_a / net_b diagnostics.
+    let j2_viol = rep
+        .violations
+        .iter()
+        .find(|v| {
+            v.kind == ViolationKind::Clearance
+                && v.item_a == "track#0"
+                && v.item_b.as_deref() == Some("U1.J2")
+        })
+        .expect("expected clearance violation between track#0 and U1.J2");
+    assert_eq!(j2_viol.net_a, "VDDSMPS_1V8");
+    assert_eq!(j2_viol.net_b, "unconnected-(U1-PadJ2)");
+
+    let j3_viol = rep
+        .violations
+        .iter()
+        .find(|v| {
+            v.kind == ViolationKind::Clearance
+                && v.item_a == "track#0"
+                && v.item_b.as_deref() == Some("U1.J3")
+        })
+        .expect("expected clearance violation between track#0 and U1.J3");
+    assert_eq!(j3_viol.net_a, "VDDSMPS_1V8");
+    assert_eq!(j3_viol.net_b, "NC_UNUSED");
+
+    let j2_mask_viol = rep
+        .violations
+        .iter()
+        .find(|v| {
+            v.kind == ViolationKind::SolderMaskToCopper
+                && v.item_a == "U1.J2"
+                && v.item_b.as_deref() == Some("track#0")
+        })
+        .expect("expected mask violation between U1.J2 and track#0");
+    assert_eq!(j2_mask_viol.net_a, "unconnected-(U1-PadJ2)");
+    assert_eq!(j2_mask_viol.net_b, "VDDSMPS_1V8");
+
+    // 2. Main copper hotspot around U1 omits single-pin unconnected-(...) and NC_UNUSED,
+    //    keeps routable VDDSMPS_1V8 and multi-pin UNCONNECTED-(SHARED), and picks a routable root_cause_net.
+    let main_hs = rep
+        .hotspots
+        .iter()
+        .find(|h| h.affected_nets.contains(&"VDDSMPS_1V8".to_string()))
+        .expect("expected hotspot containing VDDSMPS_1V8");
+    assert!(
+        !main_hs
+            .affected_nets
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("unconnected-(U1-PadJ2)") || n == "NC_UNUSED"),
+        "single-pin / unconnected nets must be omitted from affected_nets: {:?}",
+        main_hs.affected_nets
+    );
+    assert!(
+        main_hs
+            .affected_nets
+            .contains(&"UNCONNECTED-(SHARED)".to_string()),
+        "multi-pin UNCONNECTED-(SHARED) is routable and must stay in affected_nets: {:?}",
+        main_hs.affected_nets
+    );
+    assert!(
+        main_hs.root_cause_net == "VDDSMPS_1V8" || main_hs.root_cause_net == "UNCONNECTED-(SHARED)",
+        "root_cause_net must be a routable net, got {:?}",
+        main_hs.root_cause_net
+    );
+
+    // 3. Isolated non-routable hotspot (U4.1 edge clearance) has empty affected_nets and falls back to its net for root_cause_net.
+    let u4_hs = rep
+        .hotspots
+        .iter()
+        .find(|h| h.violations.iter().any(|v| v.item_a == "U4.1"))
+        .expect("expected U4.1 edge hotspot");
+    assert!(
+        u4_hs.affected_nets.is_empty(),
+        "isolated single-pin unconnected hotspot must have empty affected_nets: {:?}",
+        u4_hs.affected_nets
+    );
+    assert_eq!(u4_hs.root_cause_net, "UNCONNECTED-(U4-Pad1)");
+
+    // Also verify generic single-pin pad net (not unconnected-(...)) is omitted.
+    board.placements[0]
+        .pin_nets
+        .insert("J2".into(), "NC_J2_GENERIC".into());
+    let gen_rep = check_board_drc(&board);
+    let gen_hs = gen_rep
+        .hotspots
+        .iter()
+        .find(|h| h.affected_nets.contains(&"VDDSMPS_1V8".to_string()))
+        .unwrap();
+    assert!(
+        !gen_hs.affected_nets.contains(&"NC_J2_GENERIC".to_string())
+            && !gen_hs.affected_nets.contains(&"NC_UNUSED".to_string()),
+        "generic single-pin pad nets must be omitted: {:?}",
+        gen_hs.affected_nets
+    );
+
+    // 4. Tiebreak case via check_board_drc on a focused 2-pad + 1-unconnected-pad board:
+    //    U1.J2 < track#0 alphabetically, so root_cause_item is U1.J2, yet root_cause_net must be VDDSMPS_1V8.
+    let mut tie_board = base_board();
+    tie_board.footprints.insert(
+        "U_TIE".into(),
+        smd_row_fp(&[("J1", 0.0), ("J2", 4.0)], &["F.Cu", "F.Mask"])
+            .resolve("U_TIE")
+            .unwrap(),
+    );
+    tie_board.footprints.insert(
+        "SMD".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu", "F.Mask"], None)
+            .resolve("SMD")
+            .unwrap(),
+    );
+    tie_board.placements = vec![
+        Placement {
+            refdes: "U1".into(),
+            footprint: "U_TIE".into(),
+            pos: Pt::new(mm(6.0), mm(10.0)),
+            side: Side::Top,
+            locked: true,
+            pin_nets: BTreeMap::from([
+                ("J1".into(), "VDDSMPS_1V8".into()),
+                ("J2".into(), "unconnected-(U1-PadJ2)".into()),
+            ]),
+            ..Default::default()
+        },
+        place_pin1("U2", "SMD", 20.0, 10.0, Side::Top, "VDDSMPS_1V8"),
+    ];
+    tie_board.tracks = vec![Track {
+        net: "VDDSMPS_1V8".into(),
+        layer: "F.Cu".into(),
+        a: Pt::new(mm(6.0), mm(10.0)),
+        b: Pt::new(mm(20.0), mm(10.0)),
+        width: um(200.0),
+        locked: false,
+    }];
+    tie_board.rules.clearance_nm = um(150.0);
+    tie_board.rules.mask_to_copper_nm = None;
+    let tie_rep = check_board_drc(&tie_board);
+    assert_eq!(tie_rep.hotspots.len(), 1);
+    assert_eq!(tie_rep.hotspots[0].root_cause_item, "U1.J2");
+    assert_eq!(tie_rep.hotspots[0].root_cause_net, "VDDSMPS_1V8");
+    assert_eq!(
+        tie_rep.hotspots[0].affected_nets,
+        vec!["VDDSMPS_1V8".to_string()]
+    );
+    assert_eq!(
+        tie_rep.hotspots[0].action_hint,
+        "Reposition or resize U1.J2 to restore clearance to VDDSMPS_1V8"
+    );
+
+    // 5. End-to-end: pass hotspot.affected_nets directly to route_board_ir --reroute-nets.
+    let reroute_targets: HashSet<String> =
+        tie_rep.hotspots[0].affected_nets.iter().cloned().collect();
+    let route_cfg = RouteOptions {
+        reroute_nets: Some(reroute_targets),
+        max_passes: 20,
+        multi_start: 2,
+        ..Default::default()
+    };
+    let summary = route_board_ir(&mut tie_board, &route_cfg).unwrap();
+    assert_eq!(summary.unconnected_pairs, 0);
+    let post_drc = check_board_drc(&tie_board);
+    assert!(
+        post_drc.passed,
+        "rerouting hotspot.affected_nets must resolve DRC cleanly: {:?}",
+        post_drc.violations
+    );
+}
+
+#[test]
+fn cluster_hotspots_and_kicad_drc_json_filter_unconnected_nets() {
+    // 1. Board-less cluster_hotspots filters case-insensitive unconnected-(...) and picks routable root_cause_net.
+    let violations = vec![
+        Violation {
+            kind: ViolationKind::Clearance,
+            severity: Severity::Error,
+            layer: "F.Cu".into(),
+            pos_nm: Pt::new(mm(10.0), mm(10.0)),
+            measured_nm: um(40.0),
+            required_nm: um(150.0),
+            item_a: "U1.J2".into(),
+            item_b: Some("track#0".into()),
+            net_a: "unconnected-(U1-PadJ2)".into(),
+            net_b: "VDDSMPS_1V8".into(),
+            message: "clearance".into(),
+        },
+        Violation {
+            kind: ViolationKind::SolderMaskToCopper,
+            severity: Severity::Error,
+            layer: "F.Cu".into(),
+            pos_nm: Pt::new(mm(10.2), mm(10.0)),
+            measured_nm: um(30.0),
+            required_nm: um(80.0),
+            item_a: "U1.J3".into(),
+            item_b: Some("track#0".into()),
+            net_a: "UNCONNECTED-(U1-PadJ3)".into(),
+            net_b: "VDDSMPS_1V8".into(),
+            message: "mask".into(),
+        },
+        // Isolated cluster with only an unconnected-(...) net.
+        Violation {
+            kind: ViolationKind::EdgeClearance,
+            severity: Severity::Error,
+            layer: "F.Cu".into(),
+            pos_nm: Pt::new(mm(30.0), mm(20.0)),
+            measured_nm: um(50.0),
+            required_nm: um(300.0),
+            item_a: "U9.1".into(),
+            item_b: None,
+            net_a: "unconnected-(U9-Pad1)".into(),
+            net_b: String::new(),
+            message: "edge".into(),
+        },
+    ];
+    let hs = cluster_hotspots(&violations, mm(1.5));
+    assert_eq!(hs.len(), 2);
+    assert_eq!(hs[0].affected_nets, vec!["VDDSMPS_1V8".to_string()]);
+    assert_eq!(hs[0].root_cause_net, "VDDSMPS_1V8");
+    // Atomic violations remain intact.
+    assert_eq!(hs[0].violations[0].net_a, "unconnected-(U1-PadJ2)");
+    assert_eq!(hs[1].affected_nets, Vec::<String>::new());
+    assert_eq!(hs[1].root_cause_net, "unconnected-(U9-Pad1)");
+
+    // 2. cluster_kicad_drc_json filters unconnected-(...), single-pin nets, and [no net],
+    //    while preserving 2-pad routable nets for --reroute-nets.
+    let mut board = base_board();
+    board.footprints.insert(
+        "U_PAD".into(),
+        smd_row_fp(&[("J1", 0.0), ("J2", 4.0), ("J3", 8.0)], &["F.Cu"])
+            .resolve("U_PAD")
+            .unwrap(),
+    );
+    board.footprints.insert(
+        "SMD".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu"], None)
+            .resolve("SMD")
+            .unwrap(),
+    );
+    board.placements = vec![
+        Placement {
+            refdes: "U1".into(),
+            footprint: "U_PAD".into(),
+            pos: Pt::new(mm(10.0), mm(10.0)),
+            side: Side::Top,
+            locked: true,
+            pin_nets: BTreeMap::from([
+                ("J1".into(), "VDDSMPS_1V8".into()),
+                ("J2".into(), "unconnected-(U1-PadJ2)".into()),
+                ("J3".into(), "NC_SINGLE".into()),
+            ]),
+            ..Default::default()
+        },
+        place_pin1("U2", "SMD", 24.0, 10.0, Side::Top, "VDDSMPS_1V8"),
+    ];
+    board.tracks = vec![Track {
+        net: "VDDSMPS_1V8".into(),
+        layer: "F.Cu".into(),
+        a: Pt::new(mm(10.0), mm(10.0)),
+        b: Pt::new(mm(24.0), mm(10.0)),
+        width: um(200.0),
+        locked: false,
+    }];
+
+    let kdrc = r#"{
+        "coordinate_units": "mm",
+        "violations": [
+            {
+                "type": "clearance",
+                "severity": "error",
+                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
+                "items": [
+                    { "description": "Pad J2 [unconnected-(U1-PadJ2)] of U1 on F.Cu", "pos": { "x": 14.0, "y": -10.0 } },
+                    { "description": "Track [VDDSMPS_1V8] on F.Cu", "pos": { "x": 14.0, "y": -10.0 } }
+                ]
+            },
+            {
+                "type": "clearance",
+                "severity": "error",
+                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
+                "items": [
+                    { "description": "Pad J3 [NC_SINGLE] of U1 on F.Cu", "pos": { "x": 18.0, "y": -10.0 } },
+                    { "description": "Track [VDDSMPS_1V8] on F.Cu", "pos": { "x": 18.0, "y": -10.0 } }
+                ]
+            },
+            {
+                "type": "clearance",
+                "severity": "error",
+                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
+                "items": [
+                    { "description": "Track [no net] on F.Cu", "pos": { "x": 14.0, "y": -10.0 } },
+                    { "description": "Track [VDDSMPS_1V8] on F.Cu", "pos": { "x": 14.0, "y": -10.0 } }
+                ]
+            }
+        ]
+    }"#;
+    let kdrc_hs = cluster_kicad_drc_json(&board, kdrc).unwrap();
+    assert_eq!(kdrc_hs.len(), 1);
+    assert_eq!(kdrc_hs[0].affected_nets, vec!["VDDSMPS_1V8".to_string()]);
+    assert_eq!(kdrc_hs[0].root_cause_net, "VDDSMPS_1V8");
+    assert_eq!(kdrc_hs[0].violations[0].net_a, "unconnected-(U1-PadJ2)");
+    assert_eq!(kdrc_hs[0].violations[1].net_a, "NC_SINGLE");
+    assert_eq!(kdrc_hs[0].violations[2].net_a, "");
+
+    let summary = route_board_ir(
+        &mut board,
+        &RouteOptions {
+            reroute_nets: Some(kdrc_hs[0].affected_nets.iter().cloned().collect()),
+            max_passes: 20,
+            multi_start: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(summary.unconnected_pairs, 0);
+    assert!(check_board_drc(&board).passed);
+}
+
+#[test]
+fn hotspot_omits_ignore_route_and_zero_copper_pad_nets() {
+    let mut board = base_board();
+    board.footprints.insert(
+        "SMD".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu", "F.Mask"], None)
+            .resolve("SMD")
+            .unwrap(),
+    );
+    board.footprints.insert(
+        "MASK_ONLY".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Mask"], None)
+            .resolve("MASK_ONLY")
+            .unwrap(),
+    );
+    board.footprints.insert(
+        "NPTH_FP".into(),
+        single_pad_fp(1.0, PadKind::Npth, vec!["*.Cu", "*.Mask"], Some(0.6))
+            .resolve("NPTH_FP")
+            .unwrap(),
+    );
+    board.nets.insert(
+        "PWR_IGNORED".into(),
+        NetDef {
+            ignore_route: true,
+            ..Default::default()
+        },
+    );
+    board.placements = vec![
+        place_pin1("U1", "SMD", 10.0, 10.0, Side::Top, "SIG_REAL"),
+        place_pin1("U2", "SMD", 20.0, 10.0, Side::Top, "SIG_REAL"),
+        place_pin1("U3", "SMD", 15.0, 10.0, Side::Top, "PWR_IGNORED"),
+        place_pin1("U4", "SMD", 15.0, 15.0, Side::Top, "PWR_IGNORED"),
+        place_pin1("M1", "MASK_ONLY", 15.0, 10.5, Side::Top, "MASK_ONLY_NET"),
+        place_pin1("M2", "MASK_ONLY", 25.0, 10.5, Side::Top, "MASK_ONLY_NET"),
+        place_pin1("H1", "NPTH_FP", 15.0, 11.0, Side::Top, "NPTH_NET"),
+        place_pin1("H2", "NPTH_FP", 25.0, 11.0, Side::Top, "NPTH_NET"),
+    ];
+
+    let kdrc = r#"{
+        "coordinate_units": "mm",
+        "violations": [
+            {
+                "type": "clearance",
+                "severity": "error",
+                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
+                "items": [
+                    { "description": "Pad 1 [PWR_IGNORED] of U3 on F.Cu", "pos": { "x": 15.0, "y": -10.0 } },
+                    { "description": "Track [SIG_REAL] on F.Cu", "pos": { "x": 15.0, "y": -10.0 } }
+                ]
+            },
+            {
+                "type": "clearance",
+                "severity": "error",
+                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
+                "items": [
+                    { "description": "Pad 1 [PWR_IGNORED] of U3 on F.Cu", "pos": { "x": 15.0, "y": -10.0 } },
+                    { "description": "Pad 1 [MASK_ONLY_NET] of M1 on F.Mask", "pos": { "x": 15.0, "y": -10.5 } }
+                ]
+            },
+            {
+                "type": "clearance",
+                "severity": "error",
+                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
+                "items": [
+                    { "description": "Pad 1 [NPTH_NET] of H1 on F.Cu", "pos": { "x": 15.0, "y": -11.0 } },
+                    { "description": "Pad 1 [no net] of U3 on F.Cu", "pos": { "x": 15.0, "y": -10.0 } }
+                ]
+            }
+        ]
+    }"#;
+
+    let hs = cluster_kicad_drc_json(&board, kdrc).unwrap();
+    assert_eq!(hs.len(), 1);
+    assert_eq!(hs[0].affected_nets, vec!["SIG_REAL".to_string()]);
+    assert_eq!(hs[0].root_cause_net, "SIG_REAL");
+    assert_eq!(hs[0].violations[2].net_b, "");
+}
+
+#[test]
+fn hotspot_omits_one_pin_track_net_so_reroute_freezes_obstacle() {
+    let mut board = base_board();
+    board.footprints.insert(
+        "SMD".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu", "F.Mask"], None)
+            .resolve("SMD")
+            .unwrap(),
+    );
+    board.placements = vec![
+        place_pin1("U1", "SMD", 15.0, 6.0, Side::Top, "ONE_PIN_STUB"),
+        place_pin1("U2", "SMD", 10.0, 10.0, Side::Top, "TWO_PIN_NET"),
+        place_pin1("U3", "SMD", 20.0, 10.0, Side::Top, "TWO_PIN_NET"),
+    ];
+    board.tracks = vec![
+        Track {
+            net: "ONE_PIN_STUB".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(15.0), mm(6.0)),
+            b: Pt::new(mm(15.0), mm(11.0)),
+            width: um(200.0),
+            locked: false,
+        },
+        Track {
+            net: "TWO_PIN_NET".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(10.0), mm(10.0)),
+            b: Pt::new(mm(20.0), mm(10.0)),
+            width: um(200.0),
+            locked: false,
+        },
+    ];
+
+    let rep = check_board_drc(&board);
+    assert_eq!(rep.hotspots.len(), 1);
+    assert_eq!(
+        rep.hotspots[0].affected_nets,
+        vec!["TWO_PIN_NET".to_string()]
+    );
+    assert_eq!(rep.hotspots[0].root_cause_net, "TWO_PIN_NET");
+
+    let summary = route_board_ir(
+        &mut board,
+        &RouteOptions {
+            reroute_nets: Some(rep.hotspots[0].affected_nets.iter().cloned().collect()),
+            max_passes: 20,
+            multi_start: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(summary.unconnected_pairs, 0);
+    let post = check_board_drc(&board);
+    assert!(
+        post.passed,
+        "freezing 1-pin track obstacle and rerouting 2-pin net must pass DRC: {:?}",
+        post.violations
+    );
+}
+
+#[test]
+fn hotspot_handles_multipin_same_name_and_net_def_pins_fallback() {
+    let mut board = base_board();
+    let pad = |name: &str, x_mm: f64, layers: &[&str]| PadDef {
+        name: name.into(),
+        kind: PadKind::Smd,
+        shape: PadShape::Circle { diameter: mm(0.8) },
+        pos: Pt::new(mm(x_mm), 0),
+        rot_deg: 0.0,
+        drill_nm: None,
+        layers: layers.iter().map(|&l| l.into()).collect(),
+        mask_margin_nm: None,
+        paste_margin_nm: None,
+    };
+    let custom_fp = |pads: Vec<PadDef>, name: &str| {
+        FootprintSpec::Custom {
+            pads,
+            courtyard: Vec::new(),
+            graphics: Vec::new(),
+            keepouts: Vec::new(),
+            models: Vec::new(),
+            pin_types: Default::default(),
+        }
+        .resolve(name)
+        .unwrap()
+    };
+
+    // (a) Paste/mask-only pad preceding copper pad on same pin name.
+    board.footprints.insert(
+        "PASTE_FIRST".into(),
+        custom_fp(
+            vec![
+                pad("1", 0.0, &["F.Paste", "F.Mask"]),
+                pad("1", 0.0, &["F.Cu", "F.Mask"]),
+            ],
+            "PASTE_FIRST",
+        ),
+    );
+    // (b) Two separated copper pads with same pin name.
+    board.footprints.insert(
+        "SPLIT_TAB".into(),
+        custom_fp(
+            vec![pad("1", 0.0, &["F.Cu"]), pad("1", 5.0, &["F.Cu"])],
+            "SPLIT_TAB",
+        ),
+    );
+    // (c) Two overlapping copper pads on single-pin unconnected-(...).
+    board.footprints.insert(
+        "OVERLAP_PAD".into(),
+        custom_fp(
+            vec![pad("1", 0.0, &["F.Cu"]), pad("1", 0.2, &["F.Cu"])],
+            "OVERLAP_PAD",
+        ),
+    );
+    board.footprints.insert(
+        "SMD".into(),
+        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu"], None)
+            .resolve("SMD")
+            .unwrap(),
+    );
+
+    // Empty pl.pin_nets for U1, U2, F1, F2 to also test board.nets[net].pins fallback.
+    let place_bare = |refdes: &str, fp: &str, x_mm: f64, y_mm: f64| Placement {
+        refdes: refdes.into(),
+        footprint: fp.into(),
+        pos: Pt::new(mm(x_mm), mm(y_mm)),
+        side: Side::Top,
+        locked: true,
+        ..Default::default()
+    };
+    board.placements = vec![
+        place_bare("U1", "PASTE_FIRST", 10.0, 10.0),
+        place_bare("U2", "SMD", 16.0, 10.0),
+        place_pin1("S1", "SPLIT_TAB", 10.0, 12.0, Side::Top, "SPLIT_SHIELD"),
+        place_pin1(
+            "O1",
+            "OVERLAP_PAD",
+            10.0,
+            14.0,
+            Side::Top,
+            "unconnected-(O1-Pad1)",
+        ),
+        place_bare("F1", "SMD", 10.0, 16.0),
+        place_bare("F2", "SMD", 16.0, 16.0),
+        place_bare("F3", "SMD", 10.0, 18.0),
+    ];
+    board.nets.insert(
+        "PASTE_FIRST_NET".into(),
+        NetDef {
+            pins: vec![("U1".into(), "1".into()), ("U2".into(), "1".into())],
+            ..Default::default()
+        },
+    );
+    board.nets.insert(
+        "FALLBACK_NET".into(),
+        NetDef {
+            pins: vec![("F1".into(), "1".into()), ("F2".into(), "1".into())],
+            ..Default::default()
+        },
+    );
+    board.nets.insert(
+        "UNCONN_FALLBACK".into(),
+        NetDef {
+            pins: vec![("F3".into(), "1".into())],
+            ..Default::default()
+        },
+    );
+
+    let violations = [
+        Violation {
+            kind: ViolationKind::Clearance,
+            severity: Severity::Error,
+            layer: "F.Cu".into(),
+            pos_nm: Pt::new(mm(10.0), mm(12.0)),
+            measured_nm: um(50.0),
+            required_nm: um(150.0),
+            item_a: "U1.1".into(),
+            item_b: Some("S1.1".into()),
+            net_a: "PASTE_FIRST_NET".into(),
+            net_b: "SPLIT_SHIELD".into(),
+            message: "clearance".into(),
+        },
+        Violation {
+            kind: ViolationKind::Clearance,
+            severity: Severity::Error,
+            layer: "F.Cu".into(),
+            pos_nm: Pt::new(mm(10.0), mm(14.0)),
+            measured_nm: um(50.0),
+            required_nm: um(150.0),
+            item_a: "O1.1".into(),
+            item_b: Some("F1.1".into()),
+            net_a: "unconnected-(O1-Pad1)".into(),
+            net_b: "FALLBACK_NET".into(),
+            message: "clearance".into(),
+        },
+        Violation {
+            kind: ViolationKind::Clearance,
+            severity: Severity::Error,
+            layer: "F.Cu".into(),
+            pos_nm: Pt::new(mm(10.0), mm(15.0)),
+            measured_nm: um(50.0),
+            required_nm: um(150.0),
+            item_a: "F3.1".into(),
+            item_b: Some("F1.1".into()),
+            net_a: "UNCONN_FALLBACK".into(),
+            net_b: "FALLBACK_NET".into(),
+            message: "clearance".into(),
+        },
+    ];
+
+    let hs = boardc::drc::cluster_kicad_drc_json(
+        &board,
+        &serde_json::json!({
+            "coordinate_units": "mm",
+            "violations": violations.iter().map(|v| serde_json::json!({
+                "type": "clearance",
+                "severity": "error",
+                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
+                "items": [
+                    { "description": format!("Pad 1 [{}] of {} on F.Cu", v.net_a, v.item_a.split('.').next().unwrap()), "pos": { "x": v.pos_nm.x as f64 / 1e6, "y": -(v.pos_nm.y as f64) / 1e6 } },
+                    { "description": format!("Pad 1 [{}] of {} on F.Cu", v.net_b, v.item_b.as_deref().unwrap().split('.').next().unwrap()), "pos": { "x": v.pos_nm.x as f64 / 1e6, "y": -(v.pos_nm.y as f64) / 1e6 } }
+                ]
+            })).collect::<Vec<_>>()
+        }).to_string(),
+    )
+    .unwrap();
+    assert_eq!(hs.len(), 1);
+    assert_eq!(
+        hs[0].affected_nets,
+        vec![
+            "FALLBACK_NET".to_string(),
+            "PASTE_FIRST_NET".to_string(),
+            "SPLIT_SHIELD".to_string(),
+        ]
     );
 }

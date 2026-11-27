@@ -149,7 +149,8 @@ pub fn check_board_drc(board: &BoardIr) -> DrcReport {
         .filter(|v| v.severity == Severity::Error)
         .count();
     let warning_count = violations.len() - error_count;
-    let hotspots = cluster_hotspots(&violations, DEFAULT_CLUSTER_RADIUS_NM);
+    let hotspots =
+        drc_cluster::cluster_hotspots(Some(board), &violations, DEFAULT_CLUSTER_RADIUS_NM);
     DrcReport {
         violations,
         hotspots,
@@ -161,7 +162,7 @@ pub fn check_board_drc(board: &BoardIr) -> DrcReport {
 
 /// Groups atomic violations into spatial and shared-object root-cause hotspots.
 pub fn cluster_hotspots(violations: &[Violation], cluster_radius_nm: Nm) -> Vec<Hotspot> {
-    drc_cluster::cluster_hotspots(violations, cluster_radius_nm)
+    drc_cluster::cluster_hotspots(None, violations, cluster_radius_nm)
 }
 
 /// Parses `kicad-cli pcb drc --format json` output, maps coordinates onto `BoardIr` objects, and clusters hotspots.

@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::Deserialize;
 
 use crate::drc::{Hotspot, Severity, Violation, ViolationKind};
-use crate::geom::{UnionFind, local_to_board};
-use crate::ir::{BoardIr, Nm, Pt, mm, um};
+use crate::erc::{is_unconnected_net, net_def_pin_index};
+use crate::geom::{EPS_NM, UnionFind, local_to_board, pad_copper_layers, pad_to_world_shape};
+use crate::ir::{BoardIr, Nm, PadDef, PadKind, Pt, mm, um};
 
 const KICAD_CLUSTER_RADIUS_NM: Nm = 2_000_000;
 
@@ -52,11 +53,12 @@ fn shares_localized_object(a: &Violation, b: &Violation, cluster_radius_nm: Nm) 
 fn build_action_hint(
     root_item: &str,
     root_net: &str,
+    root_item_has_net: bool,
     affected_nets: &[String],
     dominant_kind: ViolationKind,
     count: usize,
 ) -> String {
-    let net_suffix = if root_net.is_empty() {
+    let net_suffix = if root_net.is_empty() || !root_item_has_net {
         String::new()
     } else {
         format!(" (net {root_net})")
@@ -64,7 +66,7 @@ fn build_action_hint(
     let others: Vec<&str> = affected_nets
         .iter()
         .map(String::as_str)
-        .filter(|n| !n.is_empty() && *n != root_net)
+        .filter(|n| !n.is_empty() && (!root_item_has_net || *n != root_net))
         .collect();
     match dominant_kind {
         ViolationKind::Clearance | ViolationKind::DrillToCopper => {
@@ -119,10 +121,94 @@ fn build_action_hint(
     }
 }
 
-pub(crate) fn cluster_hotspots(violations: &[Violation], cluster_radius_nm: Nm) -> Vec<Hotspot> {
+fn routable_board_nets(board: &BoardIr) -> HashSet<&str> {
+    let cu_layers = board.copper_layer_names();
+    let net_def_pins = net_def_pin_index(board);
+    let mut pad_counts: HashMap<&str, usize> = HashMap::new();
+
+    for pl in &board.placements {
+        let Some(fp) = board.footprints.get(&pl.footprint) else {
+            continue;
+        };
+        struct PinCopper<'a> {
+            net: &'a str,
+            pads: Vec<(&'a PadDef, Vec<String>)>,
+        }
+        let mut pin_pads: HashMap<&str, PinCopper<'_>> = HashMap::new();
+        for pad in &fp.pads {
+            if pad.kind == PadKind::Npth || pad.name.is_empty() {
+                continue;
+            }
+            let cu = pad_copper_layers(pad, pl.side, &cu_layers);
+            if cu.is_empty() {
+                continue;
+            }
+            let Some(net) = pl
+                .pin_nets
+                .get(&pad.name)
+                .map(String::as_str)
+                .or_else(|| {
+                    net_def_pins
+                        .get(&(pl.refdes.as_str(), pad.name.as_str()))
+                        .copied()
+                })
+                .filter(|s| !s.trim().is_empty())
+            else {
+                continue;
+            };
+            pin_pads
+                .entry(pad.name.as_str())
+                .or_insert_with(|| PinCopper {
+                    net,
+                    pads: Vec::new(),
+                })
+                .pads
+                .push((pad, cu));
+        }
+        for PinCopper { net, pads } in pin_pads.into_values() {
+            let count = if pads.len() <= 1 {
+                1
+            } else {
+                let shapes: Vec<_> = pads
+                    .iter()
+                    .map(|(pad, _)| pad_to_world_shape(pad, pl, 16))
+                    .collect();
+                let separated = (0..pads.len()).any(|i| {
+                    ((i + 1)..pads.len()).any(|j| {
+                        !pads[i].1.iter().any(|l| pads[j].1.contains(l))
+                            || shapes[i].dist_to_shape(&shapes[j]) > EPS_NM
+                    })
+                });
+                if separated { 2 } else { 1 }
+            };
+            *pad_counts.entry(net).or_insert(0) += count;
+        }
+    }
+
+    pad_counts
+        .into_iter()
+        .filter(|(net, count)| {
+            *count >= 2 && !board.nets.get(*net).is_some_and(|nd| nd.ignore_route)
+        })
+        .map(|(net, _)| net)
+        .collect()
+}
+
+pub(crate) fn cluster_hotspots(
+    board: Option<&BoardIr>,
+    violations: &[Violation],
+    cluster_radius_nm: Nm,
+) -> Vec<Hotspot> {
     if violations.is_empty() {
         return Vec::new();
     }
+    let routable = board.map(routable_board_nets);
+    let is_routable = |net: &str| -> bool {
+        match &routable {
+            Some(set) => set.contains(net),
+            None => !net.is_empty() && !is_unconnected_net(net),
+        }
+    };
     let n = violations.len();
     let mut uf = UnionFind::new(n);
     let r_f = cluster_radius_nm.max(0) as f64;
@@ -150,7 +236,6 @@ pub(crate) fn cluster_hotspots(violations: &[Violation], cluster_radius_nm: Nm) 
         let mut sum_y: i128 = 0;
         let mut err_count = 0usize;
         let mut warn_count = 0usize;
-        let mut nets: BTreeSet<String> = BTreeSet::new();
         let mut layers: BTreeSet<String> = BTreeSet::new();
         let mut kinds_set: BTreeSet<ViolationKind> = BTreeSet::new();
         let mut kind_counts: BTreeMap<ViolationKind, usize> = BTreeMap::new();
@@ -182,7 +267,6 @@ pub(crate) fn cluster_hotspots(violations: &[Violation], cluster_radius_nm: Nm) 
             }
             for net in [&v.net_a, &v.net_b] {
                 if !net.is_empty() {
-                    nets.insert(net.clone());
                     *net_counts.entry(net.clone()).or_insert(0) += 1;
                 }
             }
@@ -197,38 +281,37 @@ pub(crate) fn cluster_hotspots(violations: &[Violation], cluster_radius_nm: Nm) 
             .fold(0.0_f64, f64::max)
             .round() as Nm;
 
-        let (root_cause_item, root_cause_net) = item_counts
+        let (root_cause_item, item_nets) = item_counts
             .into_iter()
             .max_by(|(ka, (ca, _)), (kb, (cb, _))| {
                 (is_local_item(ka), *ca)
                     .cmp(&(is_local_item(kb), *cb))
                     .then_with(|| kb.cmp(ka))
             })
-            .map(|(item, (_, n_map))| {
-                let net = n_map
-                    .into_iter()
-                    .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-                    .map(|(n, _)| n)
-                    .or_else(|| {
-                        net_counts
-                            .iter()
-                            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-                            .map(|(n, _)| n.clone())
-                    })
-                    .unwrap_or_default();
-                (item, net)
-            })
+            .map(|(item, (_, n_map))| (item, n_map))
             .unwrap_or_default();
+        let root_cause_net = item_nets
+            .iter()
+            .map(|(n, &c)| (n, c, true))
+            .chain(net_counts.iter().map(|(n, &c)| (n, c, false)))
+            .max_by_key(|&(n, c, from_item)| {
+                (is_routable(n), from_item, c, std::cmp::Reverse(n.as_str()))
+            })
+            .map(|(n, _, _)| n.clone())
+            .unwrap_or_default();
+        let root_item_has_net = item_nets.contains_key(&root_cause_net);
 
         let dominant_kind = kind_counts
             .into_iter()
             .max_by_key(|&(_, c)| c)
             .map(|(k, _)| k)
             .unwrap_or(ViolationKind::Other);
-        let affected_nets: Vec<String> = nets.into_iter().collect();
+        let affected_nets: Vec<String> =
+            net_counts.into_keys().filter(|n| is_routable(n)).collect();
         let action_hint = build_action_hint(
             &root_cause_item,
             &root_cause_net,
+            root_item_has_net,
             &affected_nets,
             dominant_kind,
             cluster_violations.len(),
@@ -331,7 +414,11 @@ fn extract_bracket_net(desc: &str) -> String {
     if let (Some(l), Some(r)) = (desc.find('['), desc.find(']'))
         && r > l
     {
-        return desc[l + 1..r].trim().to_string();
+        let net = desc[l + 1..r].trim();
+        if net.eq_ignore_ascii_case("no net") {
+            return String::new();
+        }
+        return net.to_string();
     }
     String::new()
 }
@@ -529,5 +616,9 @@ pub(crate) fn cluster_kicad_drc_json(
             message: kv.description,
         });
     }
-    Ok(cluster_hotspots(&violations, KICAD_CLUSTER_RADIUS_NM))
+    Ok(cluster_hotspots(
+        Some(board),
+        &violations,
+        KICAD_CLUSTER_RADIUS_NM,
+    ))
 }
