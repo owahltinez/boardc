@@ -291,6 +291,7 @@ fn sample_spec() -> BoardSpec {
             FootprintSpec::Chip2Pin {
                 package: "0402".into(),
                 pin_types: BTreeMap::new(),
+                pin_names: BTreeMap::new(),
             },
         ),
         (
@@ -301,6 +302,7 @@ fn sample_spec() -> BoardSpec {
                 body_nm: mm(3.0),
                 ep_nm: mm(1.6),
                 pin_types: BTreeMap::new(),
+                pin_names: BTreeMap::new(),
             },
         ),
     ]);

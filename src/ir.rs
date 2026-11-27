@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::spec::{BoardSpec, FootprintSpec, load_board_json, load_spec_file, save_board_json};
+pub use crate::spec::{
+    BoardSpec, FootprintSpec, SubcircuitInstance, SubcircuitSpec, load_board_json, load_spec_file,
+    save_board_json,
+};
 
 pub fn same_named_net(a: &str, b: &str) -> bool {
     !a.is_empty() && a == b

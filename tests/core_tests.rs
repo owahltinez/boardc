@@ -160,6 +160,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
         FootprintSpec::Chip2Pin {
             package: "0402".into(),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -170,6 +171,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             pitch_nm: mm(0.8),
             ball_dia_nm: mm(0.4),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -180,6 +182,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             body_nm: mm(3.0),
             ep_nm: mm(1.5),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -187,6 +190,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
         FootprintSpec::Sot23 {
             pin_count: 5,
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     footprints.insert(
@@ -195,6 +199,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             pins: 3,
             pitch_nm: mm(2.54),
             pin_types: Default::default(),
+            pin_names: BTreeMap::new(),
         },
     );
     let mut net_classes = BTreeMap::new();
@@ -290,6 +295,8 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
         vias: vec![],
         net_classes,
         nets,
+        subcircuits: Default::default(),
+        instances: Default::default(),
         rules: DesignRules {
             track_width_nm: mm(0.15),
             clearance_nm: mm(0.15),
@@ -598,6 +605,7 @@ pos = { x = 10_000_000, y = 12_000_000 }
                 keepouts: Vec::new(),
                 models: Vec::new(),
                 pin_types: BTreeMap::new(),
+                pin_names: BTreeMap::new(),
             },
         );
         assert!(BoardIr::from_spec(&bad_fp_spec).is_err());
