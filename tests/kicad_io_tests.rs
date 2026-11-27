@@ -43,6 +43,7 @@ fn parse_kicad_mod_covers_pads_drills_courtyard_and_silkscreen() {
     assert_eq!(fp.pads[0].shape, PadShape::Circle { diameter: mm(0.4) });
     assert_eq!(fp.pads[0].mask_margin_nm, Some(mm(0.03)));
     assert_eq!(fp.pads[0].paste_margin_nm, Some(mm(-0.02)));
+    assert_eq!(fp.pads[1].mask_margin_nm, Some(mm(0.05)));
 
     assert_eq!(fp.pads[1].rot_deg, 90.0);
     assert_eq!(

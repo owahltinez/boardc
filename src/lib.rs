@@ -6,6 +6,7 @@ mod drc_connect;
 mod drc_constraints;
 mod drc_copper;
 mod drc_layout;
+mod drc_mask;
 mod drc_rules;
 mod drc_scene;
 pub mod erc;

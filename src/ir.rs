@@ -871,6 +871,8 @@ pub struct DesignRules {
     pub via_to_track_nm: Option<Nm>,
     pub via_at_smd: bool,
     pub mask_expansion_nm: Nm,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_to_copper_nm: Option<Nm>,
     pub paste_margin_nm: Nm,
 }
 
@@ -893,6 +895,7 @@ impl Default for DesignRules {
             via_to_track_nm: None,
             via_at_smd: false,
             mask_expansion_nm: 50_000,
+            mask_to_copper_nm: None,
             paste_margin_nm: 0,
         }
     }

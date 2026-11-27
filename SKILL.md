@@ -103,5 +103,6 @@ kicad-cli pcb render out/board.kicad_pcb -o out/render_bot.png --side bottom --q
 - Stackup (`[stackup]`): `thickness_nm`, `finish`, `pofv` (via plugging + filling + capping), and `dielectric_nm` (emitted to `<name>-job.gbrjob` and KiCad `(general)`/`(setup (stackup ...))`).
 - Fabrication silkscreen (`[fab]`): `auto_refdes` (`true`/`"rotate"` default, `"upright"` to avoid upside-down labels on both sides, or `false`/`"off"` to suppress auto-generated refdes and pin-1 dots while keeping explicit silkscreen graphics) and `refdes_stroke_nm` (default `120000`, must be `>= 10000`); override via `boardc fab --no-auto-refdes`, `--auto-refdes <mode>`, or `--refdes-stroke-nm <nm>`.
 - Constraints (`[constraints]`): `max_lengths`, `match_groups`, `cap_proximity`, `min_vias`, and `bga_shadows`.
+- Mask-to-copper DRC (`[rules]`): set optional `mask_to_copper_nm` (imported/exported via `.kicad_pro` `solder_mask_to_copper_clearance`) to flag `solder_mask_to_copper` violations where outer copper encroaches on another net's solder mask opening.
 - Keepout kinds: `all`, `track`, `via`, `copper` (pours only, allows tracks), `placement`, or `custom` (`tracks`/`vias`/`copper`/`placement` booleans).
 - `boardc` embeds `viahop` statically; you do not need `viahop` installed separately unless you specifically need Specctra `.dsn`/`.ses` Freerouting compatibility.
