@@ -102,6 +102,7 @@ pub fn chip_2pin(package: &str) -> Result<FootprintDef, String> {
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: BTreeMap::new(),
+        kicad_raw: None,
     })
 }
 
@@ -172,6 +173,7 @@ pub fn bga(
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: BTreeMap::new(),
+        kicad_raw: None,
     })
 }
 
@@ -272,6 +274,7 @@ pub fn qfn(
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: BTreeMap::new(),
+        kicad_raw: None,
     })
 }
 
@@ -347,6 +350,7 @@ pub fn sot23(pin_count: usize) -> Result<FootprintDef, String> {
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: BTreeMap::new(),
+        kicad_raw: None,
     })
 }
 
@@ -415,5 +419,6 @@ pub fn pin_header(pins: usize, pitch_nm: Nm) -> Result<FootprintDef, String> {
         keepouts: Vec::new(),
         models: Vec::new(),
         pin_types: BTreeMap::new(),
+        kicad_raw: None,
     })
 }

@@ -516,6 +516,8 @@ pub struct FootprintDef {
     pub models: Vec<Model3d>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pin_types: BTreeMap<String, PinType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kicad_raw: Option<String>,
 }
 
 /// KiCad schematic parity metadata preserved across `.kicad_net`/`.kicad_pcb` and `export-kicad`.

@@ -180,6 +180,7 @@ impl FootprintSpec {
                         keepouts: keepouts.clone(),
                         models: models.clone(),
                         pin_types: BTreeMap::new(),
+                        kicad_raw: None,
                     },
                     pin_types,
                 )

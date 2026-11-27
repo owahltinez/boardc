@@ -47,6 +47,20 @@ pub fn local_to_board(pt: Pt, cx: Nm, cy: Nm, rot_deg: f64, side: Side) -> Pt {
     Pt::new(x, y)
 }
 
+/// Maps canonical board coordinates back into footprint-local Y-up coordinates (inverse of `local_to_board`).
+pub fn board_to_local(pt: Pt, cx: Nm, cy: Nm, rot_deg: f64, side: Side) -> Pt {
+    let (s, c) = sin_cos_deg(rot_deg);
+    let dx = (pt.x - cx) as f64;
+    let dy = (pt.y - cy) as f64;
+    let lx = (dx * c + dy * s).round() as Nm;
+    let ly_rot = (-dx * s + dy * c).round() as Nm;
+    let ly = match side {
+        Side::Top => ly_rot,
+        Side::Bottom => -ly_rot,
+    };
+    Pt::new(lx, ly)
+}
+
 /// Remaps Top <-> Bottom layer names for `Side::Bottom` placements.
 pub fn remap_layer_for_side(layer: &str, side: Side) -> String {
     if side == Side::Top {

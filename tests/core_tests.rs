@@ -621,6 +621,7 @@ pos = { x = 10_000_000, y = 12_000_000 }
                 keepouts: Vec::new(),
                 models: Vec::new(),
                 pin_types: BTreeMap::new(),
+                kicad_raw: None,
             },
         );
         assert!(boardc::spec::validate_board_ir_pins(&bad_fp_ir, &ir_path).is_err());
