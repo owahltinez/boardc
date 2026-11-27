@@ -301,6 +301,7 @@ fn erc_partial_annotation_dnp_copper_unconnected_and_order_invariance() {
         courtyard: vec![],
         graphics: vec![],
         keepouts: vec![],
+        models: vec![],
         pin_types: BTreeMap::new(),
     };
     let spec = BoardSpec {
@@ -559,6 +560,7 @@ pin_types = { "1" = "in" }
                 courtyard: vec![],
                 graphics: vec![],
                 keepouts: vec![],
+                models: vec![],
                 pin_types: BTreeMap::from([("1".into(), PinType::In)]),
             },
         )]),

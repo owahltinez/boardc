@@ -10,8 +10,8 @@ use boardc::drc::{Severity, check_board_drc, cluster_kicad_drc_json};
 use boardc::erc::check_board_erc;
 use boardc::fab::{FabOptions, export_fab};
 use boardc::ir::{
-    BoardIr, BoardSpec, Constraints, FootprintSpec, LayerDef, LayerKind, MaxLengthRule, Placement,
-    PourSpec, Pt, Side, load_spec_file, mm, nm_to_mm, save_board_json,
+    AutoRefdes, BoardIr, BoardSpec, Constraints, FootprintSpec, LayerDef, LayerKind, MaxLengthRule,
+    Nm, Placement, PourSpec, Pt, Side, load_spec_file, mm, nm_to_mm, save_board_json,
 };
 use boardc::kicad_export::export_kicad_pcb;
 use boardc::kicad_io::import_kicad_pcb;
@@ -37,6 +37,23 @@ struct Cli {
 enum SpecFormat {
     Json,
     Toml,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AutoRefdesArg {
+    Rotate,
+    Upright,
+    Off,
+}
+
+impl From<AutoRefdesArg> for AutoRefdes {
+    fn from(v: AutoRefdesArg) -> Self {
+        match v {
+            AutoRefdesArg::Rotate => Self::Rotate,
+            AutoRefdesArg::Upright => Self::Upright,
+            AutoRefdesArg::Off => Self::Off,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -173,6 +190,15 @@ enum Command {
         subtract_soldermask: bool,
         #[arg(long)]
         no_clip_silk: bool,
+        /// Suppress auto-generated component refdes text and pin-1 dots on silkscreen.
+        #[arg(long, conflicts_with = "auto_refdes")]
+        no_auto_refdes: bool,
+        /// Auto-generated refdes silkscreen mode (rotate, upright, off).
+        #[arg(long, value_enum)]
+        auto_refdes: Option<AutoRefdesArg>,
+        /// Stroke width in nanometers for auto-generated refdes silkscreen text (>= 10000).
+        #[arg(long, allow_negative_numbers = true)]
+        refdes_stroke_nm: Option<Nm>,
         /// Emit top (and mirrored bottom for 2-sided boards) assembly drawing SVGs.
         #[arg(long)]
         assembly: bool,
@@ -699,12 +725,20 @@ fn run(cli: Cli) -> Result<(), String> {
             out,
             subtract_soldermask: _,
             no_clip_silk,
+            no_auto_refdes,
+            auto_refdes,
+            refdes_stroke_nm,
             assembly,
             drill_map,
             drill_report,
             json,
         } => {
             let ir = load_board_input(&input)?;
+            let resolved_auto_refdes = if no_auto_refdes {
+                Some(AutoRefdes::Off)
+            } else {
+                auto_refdes.map(Into::into)
+            };
             let manifest = export_fab(
                 &ir,
                 &out,
@@ -713,6 +747,8 @@ fn run(cli: Cli) -> Result<(), String> {
                     assembly,
                     drill_map,
                     drill_report,
+                    auto_refdes: resolved_auto_refdes,
+                    refdes_stroke_nm,
                 },
             )?;
             if json {

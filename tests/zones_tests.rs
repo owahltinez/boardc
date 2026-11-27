@@ -49,6 +49,7 @@ fn single_pad_fp(size_mm: f64, kind: PadKind, layers: Vec<&str>) -> FootprintSpe
         courtyard: Vec::new(),
         graphics: Vec::new(),
         keepouts: Vec::new(),
+        models: Vec::new(),
         pin_types: Default::default(),
     }
 }

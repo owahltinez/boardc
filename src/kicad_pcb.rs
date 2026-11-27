@@ -235,6 +235,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
         constraints: Constraints::default(),
         graphics,
         stackup,
+        fab: Default::default(),
     })
 }
 
@@ -647,6 +648,7 @@ fn parse_placed_footprint(
         rot_deg: rot_deg.rem_euclid(360.0),
         side,
         locked: has_flag(node, "locked"),
+        allow_edge_overhang: false,
         pin_nets,
         pin_types: BTreeMap::new(),
         mpn,
