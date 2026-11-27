@@ -1,4 +1,5 @@
 use crate::drc_layout::keepout_matches_layer;
+use crate::drc_mask::{collect_mask_openings, shape_violates_mask};
 use crate::drc_scene::{
     DrillItem, KeepoutItem, PadItem, PourItem, ViaItem, collect_drills, collect_keepouts,
     collect_pads, collect_pours, collect_vias, compute_max_clearance,
@@ -6,7 +7,7 @@ use crate::drc_scene::{
 use crate::geom::{
     EPS_NM, SpatialGrid, point_in_polygon, point_to_segment_dist, segment_to_segment_dist,
 };
-use crate::ir::{BBoxNm, BoardIr, Nm, PadKind, Pt, Track, same_named_net};
+use crate::ir::{BBoxNm, BoardIr, Nm, PadKind, Pt, Side, Track, same_named_net};
 use crate::poly_index::{IndexedRing, indexed_shape_edge_clearance};
 use crate::shapes::ResolvedShape;
 use crate::tune_geom::{
@@ -24,6 +25,33 @@ pub(crate) struct SpanContext<'a> {
     pub(crate) step: f64,
 }
 
+struct MaskLayerIndex {
+    items: Vec<(String, ResolvedShape, BBoxNm)>,
+    grid: SpatialGrid,
+}
+
+fn build_mask_layer_index(
+    board: &BoardIr,
+    cu_layers: &[String],
+    pads: &[PadItem],
+    vias: &[ViaItem],
+    side: Side,
+) -> Option<MaskLayerIndex> {
+    if !cu_layers.iter().any(|l| l == side.cu_layer()) {
+        return None;
+    }
+    let items: Vec<(String, ResolvedShape, BBoxNm)> =
+        collect_mask_openings(board, cu_layers, pads, vias, side)
+            .into_iter()
+            .map(|op| (op.net.to_string(), op.shape, op.bbox))
+            .collect();
+    if items.is_empty() {
+        return None;
+    }
+    let grid = SpatialGrid::from_bboxes(items.iter().map(|(_, _, bb)| *bb), 2_000_000);
+    Some(MaskLayerIndex { items, grid })
+}
+
 pub(crate) struct TuneScene<'a> {
     pub(crate) board: &'a BoardIr,
     outline_idx: Option<IndexedRing>,
@@ -39,6 +67,9 @@ pub(crate) struct TuneScene<'a> {
     pours: Vec<PourItem<'a>>,
     pub(crate) tracks: Vec<Option<Track>>,
     track_grid: SpatialGrid,
+    mask_to_copper: Option<Nm>,
+    top_masks: Option<MaskLayerIndex>,
+    bot_masks: Option<MaskLayerIndex>,
     max_clr: Nm,
     candidates: Vec<usize>,
 }
@@ -63,6 +94,15 @@ impl<'a> TuneScene<'a> {
         let pours = collect_pours(board);
         let keepouts = collect_keepouts(board);
         let max_clr = compute_max_clearance(board, &pours);
+        let mask_to_copper = board.rules.mask_to_copper_nm.filter(|&v| v >= 0);
+        let (top_masks, bot_masks) = if mask_to_copper.is_some() {
+            (
+                build_mask_layer_index(board, &cu_layers, &pads, &vias, Side::Top),
+                build_mask_layer_index(board, &cu_layers, &pads, &vias, Side::Bottom),
+            )
+        } else {
+            (None, None)
+        };
 
         Self {
             board,
@@ -79,6 +119,9 @@ impl<'a> TuneScene<'a> {
             pours,
             track_grid: SpatialGrid::from_bboxes(board.tracks.iter().map(track_bbox), 2_000_000),
             tracks: board.tracks.iter().cloned().map(Some).collect(),
+            mask_to_copper,
+            top_masks,
+            bot_masks,
             max_clr,
             candidates: Vec::new(),
         }
@@ -252,7 +295,8 @@ impl<'a> TuneScene<'a> {
         }
         let n_segs = pts.len() - 1;
         let same_net_clr = self.board.net_clearance(ctx.net).max(1);
-        let query_pad = self.max_clr.max(same_net_clr) + ctx.width / 2;
+        let m2c_pad = self.mask_to_copper.unwrap_or(0);
+        let query_pad = self.max_clr.max(same_net_clr).max(m2c_pad) + ctx.width / 2;
         for (i, w) in pts.windows(2).enumerate() {
             let is_excursion = i > 0 && i + 1 < n_segs;
             if !self.single_segment_clean(ctx, same_net_clr, query_pad, w[0], w[1], is_excursion) {
@@ -400,6 +444,27 @@ impl<'a> TuneScene<'a> {
                 .pour_pair_clearance(pour.net, pour.clearance_override, net);
             if pour.indexed.dist_to_shape_bounded(&shape, req) < req as f64 - EPS_NM {
                 return false;
+            }
+        }
+
+        if let Some(m2c) = self.mask_to_copper {
+            let masks = match layer {
+                "F.Cu" => self.top_masks.as_mut(),
+                "B.Cu" => self.bot_masks.as_mut(),
+                _ => None,
+            };
+            if let Some(masks) = masks {
+                let mq = seg_bbox.expand(m2c);
+                masks.grid.query(mq, &mut self.candidates);
+                for &mi in &self.candidates {
+                    let (m_net, m_shape, m_bbox) = &masks.items[mi];
+                    if !same_named_net(net, m_net)
+                        && m_bbox.intersects(mq)
+                        && shape_violates_mask(m_shape, &shape, m2c).is_some()
+                    {
+                        return false;
+                    }
+                }
             }
         }
         true

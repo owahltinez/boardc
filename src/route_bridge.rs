@@ -9,6 +9,7 @@ use viahop::geometry::{BBox, Point, Shape};
 
 use crate::geom::{local_to_board, pad_copper_layers, pad_to_world_shape, remap_layer_for_side};
 use crate::ir::{BoardIr, KeepoutKind, LayerKind, Nm, PadKind, Pt, nm_to_um, um};
+use crate::route_mask::collect_mask_guards;
 use crate::shapes::ResolvedShape;
 
 #[inline]
@@ -21,7 +22,7 @@ pub(crate) fn pt_from_viahop(p: Point) -> Pt {
     Pt::new(um(p.x), um(p.y))
 }
 
-fn shape_to_viahop(shape: &ResolvedShape) -> Shape {
+pub(crate) fn shape_to_viahop(shape: &ResolvedShape) -> Shape {
     match shape {
         ResolvedShape::Circle { center, radius } => Shape::Circle {
             center: pt_to_viahop(*center),
@@ -383,6 +384,24 @@ pub fn to_viahop_board(
         });
     }
 
+    let mut nets = Vec::with_capacity(net_names.len());
+    for (id, name) in net_names.into_iter().enumerate() {
+        let net_def = board.nets.get(&name);
+        let class_name = net_def
+            .map(|d| d.class.clone())
+            .unwrap_or_else(|| "Default".into());
+        let rules = build_net_rules(board, &class_name, num_layers);
+        let ignored = is_net_ignored(&name);
+        nets.push(NetInfo {
+            id,
+            name,
+            class_name,
+            pad_ids: std::mem::take(&mut net_pad_ids[id]),
+            rules,
+            ignored,
+        });
+    }
+
     // Only dedicated plane layers map to FixedPlane so signal-layer dynamic pours don't block routing.
     let mut planes = Vec::new();
     let make_plane = |layer_name: &str, net: &str, pts: &[Pt]| -> Option<FixedPlane> {
@@ -412,24 +431,16 @@ pub fn to_viahop_board(
             }
         }
     }
-
-    let mut nets = Vec::with_capacity(net_names.len());
-    for (id, name) in net_names.into_iter().enumerate() {
-        let net_def = board.nets.get(&name);
-        let class_name = net_def
-            .map(|d| d.class.clone())
-            .unwrap_or_else(|| "Default".into());
-        let rules = build_net_rules(board, &class_name, num_layers);
-        let ignored = is_net_ignored(&name);
-        nets.push(NetInfo {
-            id,
-            name,
-            class_name,
-            pad_ids: std::mem::take(&mut net_pad_ids[id]),
-            rules,
-            ignored,
-        });
-    }
+    let (mask_planes, mask_keepouts) = collect_mask_guards(
+        board,
+        &layer_names,
+        &signal_layers,
+        &net_name_to_id,
+        &pin_to_net,
+        &nets,
+    );
+    planes.extend(mask_planes);
+    keepouts.extend(mask_keepouts);
 
     let boundary: Vec<Point> = board.outline.iter().map(|&p| pt_to_viahop(p)).collect();
     let mut bounds = if boundary.len() >= 3 {
@@ -445,6 +456,14 @@ pub fn to_viahop_board(
     };
     for p in &pads {
         bounds = bounds.union(p.bbox);
+    }
+    for pl in &planes {
+        if signal_layers.contains(&pl.layer) {
+            bounds = bounds.union(pl.bbox);
+        }
+    }
+    for ko in &keepouts {
+        bounds = bounds.union(ko.bbox);
     }
 
     let pad_index = build_grid(bounds, &pads, |p| Some(p.bbox));

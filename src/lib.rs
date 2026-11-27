@@ -35,6 +35,7 @@ mod poly_index;
 pub mod preflight;
 pub mod route;
 mod route_bridge;
+mod route_mask;
 pub mod shapes;
 pub mod spec;
 mod spec_kicad;
