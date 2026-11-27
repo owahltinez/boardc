@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::geom::local_to_board;
 use crate::ir::{
-    BgaShadowRule, CapProximityRule, Constraints, MatchGroupRule, MaxLengthRule, MinViasRule,
-    NetDef, Placement, Pt, Side,
+    BgaShadowRule, CapProximityRule, Constraints, MatchGroupRule, MaxLengthRule, MaxViasRule,
+    MinViasRule, NetDef, Placement, Pt, Side,
 };
 use crate::spec::BoardSpec;
 use crate::spec_serde::deserialize_nets;
@@ -110,6 +110,17 @@ impl NetScope {
             }
         }
         Ok(resolved)
+    }
+
+    fn resolve_all(
+        &mut self,
+        nets: &[String],
+        prefix: &str,
+        ports: &BTreeMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        nets.iter()
+            .map(|n| self.resolve(n, prefix, ports))
+            .collect()
     }
 }
 
@@ -280,11 +291,7 @@ fn expand_constraints(
     ctx: &mut ExpandCtx,
 ) -> Result<(), String> {
     for r in &sub_constraints.max_lengths {
-        let nets = r
-            .nets
-            .iter()
-            .map(|n| ctx.nets.resolve(n, eff_prefix, scope_ports))
-            .collect::<Result<_, _>>()?;
+        let nets = ctx.nets.resolve_all(&r.nets, eff_prefix, scope_ports)?;
         ctx.out.constraints.max_lengths.push(MaxLengthRule {
             nets,
             max_nm: r.max_nm,
@@ -295,11 +302,7 @@ fn expand_constraints(
         if !ctx.match_group_names.insert(mg_name.clone()) {
             return Err(format!("duplicate match_group name '{mg_name}'"));
         }
-        let nets = r
-            .nets
-            .iter()
-            .map(|n| ctx.nets.resolve(n, eff_prefix, scope_ports))
-            .collect::<Result<_, _>>()?;
+        let nets = ctx.nets.resolve_all(&r.nets, eff_prefix, scope_ports)?;
         ctx.out.constraints.match_groups.push(MatchGroupRule {
             name: mg_name,
             nets,
@@ -326,6 +329,13 @@ fn expand_constraints(
             net,
             refdes: r.refdes.as_ref().map(|rf| join_prefix(eff_prefix, rf)),
             min_vias: r.min_vias,
+        });
+    }
+    for r in &sub_constraints.max_vias {
+        let nets = ctx.nets.resolve_all(&r.nets, eff_prefix, scope_ports)?;
+        ctx.out.constraints.max_vias.push(MaxViasRule {
+            nets,
+            max_vias: r.max_vias,
         });
     }
     for r in &sub_constraints.bga_shadows {

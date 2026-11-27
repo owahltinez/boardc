@@ -325,6 +325,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
                 refdes: None,
                 min_vias: 2,
             }],
+            max_vias: Vec::new(),
             bga_shadows: vec![BgaShadowRule {
                 bga_refdes: "U1".into(),
                 min_clearance_nm: mm(0.5),

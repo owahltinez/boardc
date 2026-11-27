@@ -14,8 +14,8 @@ use crate::geom::point_in_polygon;
 use crate::ir::{
     BgaShadowRule, BoardIr, CapProximityRule, Constraints, DesignRules, FabConfig, FilledPour,
     FootprintDef, Graphic, Keepout, LayerDef, LayerKind, MatchGroupRule, MaxLengthRule,
-    MinViasRule, NetClass, NetDef, Nm, PadKind, Placement, PourSpec, Pt, Track, Via, fnv1a_128,
-    safe_slug, save_board_json,
+    MaxViasRule, MinViasRule, NetClass, NetDef, Nm, PadKind, Placement, PourSpec, Pt, Track, Via,
+    fnv1a_128, safe_slug, save_board_json,
 };
 use crate::pipeline_repair::route_with_repair;
 use crate::place::{
@@ -31,7 +31,7 @@ use crate::shapes::transform_pad_local_pt;
 use crate::svg::write_board_svgs;
 use crate::zones::{ZoneChoke, ZoneReport, fill_zones};
 
-const CACHE_SCHEMA: &str = "v8";
+const CACHE_SCHEMA: &str = "v9";
 static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Pipeline stage identifier in execution order.
@@ -282,25 +282,16 @@ struct PreflightKeyInput<'a> {
 }
 
 #[derive(Serialize)]
-struct RouteBaseKeyInput<'a> {
-    schema: &'static str,
-    power_via_key: &'a str,
-    max_lengths: &'a [MaxLengthRule],
-    match_groups: &'a [MatchGroupRule],
-    filled_pours: &'a [FilledPour],
-    cfg: &'a RouteOptions,
-    repair_passes: usize,
-}
-
-#[derive(Serialize)]
 struct RouteKeyInput<'a> {
     schema: &'static str,
     power_via_key: &'a str,
     max_lengths: &'a [MaxLengthRule],
+    max_vias: &'a [MaxViasRule],
     match_groups: &'a [MatchGroupRule],
     filled_pours: &'a [FilledPour],
     cfg: &'a RouteOptions,
     repair_passes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     seed_hash: Option<&'a str>,
 }
 
@@ -551,18 +542,20 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
     } else {
         &[]
     };
-    let base_route_key_for = |passes: usize| {
-        content_hash_hex(&RouteBaseKeyInput {
+    let route_key_for = |route_cfg: &RouteOptions, passes: usize, seed_hash: Option<&str>| {
+        content_hash_hex(&RouteKeyInput {
             schema: CACHE_SCHEMA,
             power_via_key: &power_via_key,
             max_lengths: &board.constraints.max_lengths,
+            max_vias: &board.constraints.max_vias,
             match_groups: &board.constraints.match_groups,
             filled_pours: route_filled_pours,
-            cfg: &base_route_cfg,
+            cfg: route_cfg,
             repair_passes: passes,
+            seed_hash,
         })
     };
-    let base_route_key = base_route_key_for(cfg.repair_passes)?;
+    let base_route_key = route_key_for(&base_route_cfg, cfg.repair_passes, None)?;
     let seed_path = cfg
         .cache_dir
         .join(format!("route_seed_{base_route_key}.json"));
@@ -571,7 +564,7 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
     let loaded_seed = if eff_route_cfg.reroute_nets.is_some() && cfg.use_cache && !has_unlocked {
         let fallback_0 = || {
             (cfg.repair_passes > 0)
-                .then(|| base_route_key_for(0).ok())
+                .then(|| route_key_for(&base_route_cfg, 0, None).ok())
                 .flatten()
                 .and_then(|k0| {
                     load_cached::<RouteSeed>(&cfg.cache_dir.join(format!("route_seed_{k0}.json")))
@@ -582,16 +575,7 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
         None
     };
     let seed_hash = loaded_seed.as_ref().map(content_hash_hex).transpose()?;
-    let route_key = content_hash_hex(&RouteKeyInput {
-        schema: CACHE_SCHEMA,
-        power_via_key: &power_via_key,
-        max_lengths: &board.constraints.max_lengths,
-        match_groups: &board.constraints.match_groups,
-        filled_pours: route_filled_pours,
-        cfg: &eff_route_cfg,
-        repair_passes: cfg.repair_passes,
-        seed_hash: seed_hash.as_deref(),
-    })?;
+    let route_key = route_key_for(&eff_route_cfg, cfg.repair_passes, seed_hash.as_deref())?;
     let route_cache = run_cached_stage(
         cfg,
         StageKind::Route,

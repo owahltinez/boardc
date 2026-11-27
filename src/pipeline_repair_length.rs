@@ -121,6 +121,13 @@ pub(crate) fn collect_corridor_neighbors(
             .max_lengths
             .iter()
             .flat_map(|r| r.nets.iter().map(String::as_str))
+            .chain(
+                board
+                    .constraints
+                    .max_vias
+                    .iter()
+                    .flat_map(|r| r.nets.iter().map(String::as_str)),
+            )
             .filter(|&n| !scope.contains(n))
             .collect()
     });

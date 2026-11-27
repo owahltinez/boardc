@@ -956,6 +956,12 @@ pub struct MinViasRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaxViasRule {
+    pub nets: Vec<String>,
+    pub max_vias: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BgaShadowRule {
     pub bga_refdes: String,
     #[serde(default)]
@@ -971,6 +977,7 @@ pub struct Constraints {
     pub match_groups: Vec<MatchGroupRule>,
     pub cap_proximity: Vec<CapProximityRule>,
     pub min_vias: Vec<MinViasRule>,
+    pub max_vias: Vec<MaxViasRule>,
     pub bga_shadows: Vec<BgaShadowRule>,
 }
 

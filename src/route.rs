@@ -447,6 +447,13 @@ pub(crate) fn apply_match_group_tuning(
 
 /// Routes all non-ignored (or `--reroute-nets` targeted) nets in memory using `viahop`.
 pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSummary, String> {
+    route_board_ir_with_unconnected(board, cfg).map(|(summary, _)| summary)
+}
+
+pub(crate) fn route_board_ir_with_unconnected(
+    board: &mut BoardIr,
+    cfg: &RouteOptions,
+) -> Result<(RouteSummary, HashSet<String>), String> {
     if let Some(pad_mm) = cfg.reroute_pad_mm
         && (!pad_mm.is_finite() || pad_mm <= 0.0)
     {
@@ -464,6 +471,15 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
                 return Err(format!(
                     "match_group '{}' references unknown net '{net}'",
                     rule.name
+                ));
+            }
+        }
+    }
+    for rule in &board.constraints.max_vias {
+        for net in &rule.nets {
+            if !vboard.net_name_to_id.contains_key(net) {
+                return Err(format!(
+                    "max_vias constraint references unknown net '{net}'"
                 ));
             }
         }
@@ -490,6 +506,12 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
     };
 
     let result = route_board(&vboard, &rcfg);
+    let unconnected_nets: HashSet<String> = result
+        .routes
+        .iter()
+        .filter(|nr| !vboard.nets[nr.net_id].ignored && nr.unconnected_pairs > 0)
+        .map(|nr| vboard.nets[nr.net_id].name.clone())
+        .collect();
     write_routes_to_board(board, &vboard, &result.routes);
     let (pruned_tracks, pruned_len_nm, pruned_vias) = prune_dead_end_stubs(board, &vboard, cfg);
 
@@ -525,5 +547,5 @@ pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSu
     {
         summary.length_violations = count_length_violations(board);
     }
-    Ok(summary)
+    Ok((summary, unconnected_nets))
 }

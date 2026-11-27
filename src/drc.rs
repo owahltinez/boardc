@@ -41,6 +41,7 @@ pub enum ViolationKind {
     MatchGroup,
     CapProximity,
     MinVias,
+    MaxVias,
     BgaShadow,
     TrackDangling,
     ViaDangling,

@@ -5,10 +5,11 @@ use std::process::Command;
 
 use boardc::drc::ViolationKind;
 use boardc::ir::{
-    BoardIr, BoardSpec, FilledPour, MatchGroupRule, MaxLengthRule, PourPoly, Pt, Track, Via,
-    load_spec_file, mm,
+    BoardIr, BoardSpec, FilledPour, Keepout, KeepoutKind, MatchGroupRule, MaxLengthRule,
+    MaxViasRule, PourPoly, Pt, Track, Via, load_spec_file, mm,
 };
 use boardc::pipeline::{BuildOptions, StageKind, compile_board, content_hash_hex};
+use boardc::route::{RouteOptions, route_board_ir};
 
 fn four_layer_bga_toml() -> &'static str {
     r#"
@@ -330,6 +331,39 @@ fn cache_hits_and_route_constraint_invalidation_preserve_place_and_power_via() {
     assert!(!r3.stage_hit(StageKind::Zones), "zones must invalidate");
     assert!(!r3.stage_hit(StageKind::Drc), "drc must invalidate");
     assert_eq!(r3.board.constraints.max_lengths[0].max_nm, 30_000_000);
+
+    // Run 3b: tighten max_vias -> `place` + `power_via` + `preflight` stay cached, `route` + downstream invalidate.
+    let mut board3b = BoardIr::from_spec(&spec).unwrap();
+    board3b.constraints.max_lengths = r3.board.constraints.max_lengths.clone();
+    board3b.constraints.max_vias = vec![MaxViasRule {
+        nets: vec!["SIG0".into()],
+        max_vias: 2,
+    }];
+    let r3b = compile_board(board3b, &cfg).unwrap();
+    assert!(
+        r3b.stage_hit(StageKind::Place),
+        "place should remain cached"
+    );
+    assert!(
+        r3b.stage_hit(StageKind::PowerVia),
+        "power_via should remain cached"
+    );
+    assert!(
+        r3b.stage_hit(StageKind::Preflight),
+        "preflight should remain cached"
+    );
+    assert!(
+        !r3b.stage_hit(StageKind::Route),
+        "route must invalidate when max_vias changes"
+    );
+    assert!(
+        !r3b.stage_hit(StageKind::Zones),
+        "zones must invalidate when max_vias changes"
+    );
+    assert!(
+        !r3b.stage_hit(StageKind::Drc),
+        "drc must invalidate when max_vias changes"
+    );
 
     // Run 4: `--reroute-nets SIG0` reuses cached routes for SIG1/SIG2/SIG3 while re-routing SIG0.
     let mut reroute_cfg = cfg.clone();
@@ -2832,4 +2866,586 @@ max_nm = 15000000
     assert!(r1.drc.passed);
     assert_eq!(r1.route.length_violations, 0);
     assert_eq!(r1.route.repair_passes_run, 1);
+}
+
+fn two_layer_pad_board(
+    name: &str,
+    size_mm: (f64, f64),
+    pads: &[(&str, &str, f64, f64, &str)],
+    extra_toml: &str,
+) -> BoardIr {
+    let mut toml = format!(
+        r#"name = "{name}"
+size_nm = [{}, {}]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD_TOP]
+kind = "custom"
+[[footprints.PAD_TOP.pads]]
+name = "1"
+kind = "smd"
+shape = {{ shape = "circle", diameter = 600000 }}
+pos = {{ x = 0, y = 0 }}
+layers = ["F.Cu"]
+[footprints.PAD_BOT]
+kind = "custom"
+[[footprints.PAD_BOT.pads]]
+name = "1"
+kind = "smd"
+shape = {{ shape = "circle", diameter = 600000 }}
+pos = {{ x = 0, y = 0 }}
+layers = ["B.Cu"]
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+edge_clearance_nm = 300000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+"#,
+        mm(size_mm.0),
+        mm(size_mm.1),
+    );
+    for &(refdes, fp, x, y, net) in pads {
+        toml.push_str(&format!(
+            "[[placements]]\nrefdes = \"{refdes}\"\nfootprint = \"{fp}\"\npos = {{ x = {}, y = {} }}\nlocked = true\npin_nets = {{ \"1\" = \"{net}\" }}\n",
+            mm(x),
+            mm(y)
+        ));
+    }
+    toml.push_str(extra_toml);
+    let spec: BoardSpec = toml::from_str(&toml).unwrap();
+    BoardIr::from_spec(&spec).unwrap()
+}
+
+type SegSpec<'a> = (&'a str, &'a str, (f64, f64), (f64, f64), bool);
+
+fn push_tracks(board: &mut BoardIr, segs: &[SegSpec<'_>]) {
+    for &(net, layer, a, b, locked) in segs {
+        board.tracks.push(Track {
+            net: net.into(),
+            layer: layer.into(),
+            a: Pt::new(mm(a.0), mm(a.1)),
+            b: Pt::new(mm(b.0), mm(b.1)),
+            width: mm(0.2),
+            locked,
+        });
+    }
+}
+
+fn push_vias(board: &mut BoardIr, vias: &[(&str, (f64, f64), bool)]) {
+    for &(net, pos, locked) in vias {
+        board.vias.push(Via {
+            net: net.into(),
+            pos: Pt::new(mm(pos.0), mm(pos.1)),
+            diameter: mm(0.45),
+            drill: mm(0.2),
+            layers: ("F.Cu".into(), "B.Cu".into()),
+            locked,
+            tented: true,
+        });
+    }
+}
+
+#[test]
+fn repair_max_vias_reroutes_blocker_to_pass() {
+    let mut board = two_layer_pad_board(
+        "max_vias_repair",
+        (30.0, 22.0),
+        &[
+            ("A1", "PAD_TOP", 6.0, 11.0, "SIG_A"),
+            ("A2", "PAD_TOP", 20.0, 11.0, "SIG_A"),
+            ("N1", "PAD_TOP", 10.0, 14.0, "SIG_N1"),
+            ("N2", "PAD_TOP", 16.0, 14.0, "SIG_N1"),
+        ],
+        "[[constraints.max_vias]]\nnets = [\"SIG_A\"]\nmax_vias = 0\n",
+    );
+    // Unlocked U-shaped detour on F.Cu blocks SIG_A on F.Cu, forcing initial SIG_A routing onto B.Cu with 2 vias.
+    push_tracks(
+        &mut board,
+        &[
+            ("SIG_N1", "F.Cu", (10.0, 14.0), (10.0, 10.0), false),
+            ("SIG_N1", "F.Cu", (10.0, 10.0), (16.0, 10.0), false),
+            ("SIG_N1", "F.Cu", (16.0, 10.0), (16.0, 14.0), false),
+            ("SIG_A", "F.Cu", (6.0, 11.0), (8.0, 11.0), false),
+            ("SIG_A", "B.Cu", (8.0, 11.0), (18.0, 11.0), false),
+            ("SIG_A", "F.Cu", (18.0, 11.0), (20.0, 11.0), false),
+        ],
+    );
+    push_vias(
+        &mut board,
+        &[
+            ("SIG_A", (8.0, 11.0), false),
+            ("SIG_A", (18.0, 11.0), false),
+        ],
+    );
+
+    let mut cfg0 = boxed_cfg(0, true);
+    cfg0.route.resume = true;
+    cfg0.route.reroute_pad_mm = None;
+    let r0 = compile_board(board.clone(), &cfg0).unwrap();
+    assert!(!r0.ok);
+    assert!(!r0.drc.passed);
+    assert_eq!(r0.route.repair_passes_run, 0);
+    assert!(
+        r0.drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "SIG_A"),
+        "expected MaxVias violation with repair_passes=0: {:?}",
+        r0.drc.violations
+    );
+
+    let mut cfg3 = cfg0;
+    cfg3.repair_passes = 3;
+    let r3 = compile_board(board, &cfg3).unwrap();
+    assert!(
+        r3.ok,
+        "expected repair_passes=3 to eliminate MaxVias: {:?}",
+        r3.drc
+    );
+    assert!(r3.drc.passed);
+    assert!(r3.route.repair_passes_run >= 1);
+    assert!(
+        !r3.drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias),
+        "expected 0 MaxVias violations, got {:?}",
+        r3.drc.violations
+    );
+}
+
+#[test]
+fn repair_max_vias_fresh_build_fixes_crossing_net() {
+    // Longer-span max_vias=0 net SIG_A (14 mm) crosses shorter-span unconstrained SIG_N1 (8 mm) on F.Cu.
+    let board = two_layer_pad_board(
+        "max_vias_fresh_crossing",
+        (30.0, 22.0),
+        &[
+            ("A1", "PAD_TOP", 6.0, 11.0, "SIG_A"),
+            ("A2", "PAD_TOP", 20.0, 11.0, "SIG_A"),
+            ("N1", "PAD_TOP", 13.0, 15.0, "SIG_N1"),
+            ("N2", "PAD_TOP", 13.0, 7.0, "SIG_N1"),
+        ],
+        "[[constraints.max_vias]]\nnets = [\"SIG_A\"]\nmax_vias = 0\n",
+    );
+    let cfg0 = boxed_cfg(0, false);
+    let r0 = compile_board(board.clone(), &cfg0).unwrap();
+    assert!(!r0.ok);
+    assert!(
+        r0.drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "SIG_A"),
+        "expected MaxVias on SIG_A in fresh build with repair_passes=0: {:?}",
+        r0.drc.violations
+    );
+
+    let cfg1 = boxed_cfg(1, false);
+    let r1 = compile_board(board, &cfg1).unwrap();
+    assert!(
+        r1.ok,
+        "expected prioritized MaxVias repair on fresh build to pass: {:?}",
+        r1.drc
+    );
+    assert!(r1.drc.passed);
+    assert_eq!(r1.route.repair_passes_run, 1);
+    assert!(
+        !r1.drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias)
+    );
+    assert_eq!(r1.board.vias.iter().filter(|v| v.net == "SIG_A").count(), 0);
+}
+
+#[test]
+fn repair_max_vias_rollback_no_trade_and_reroute_scope() {
+    // 1. Strict rollback when max_vias = 0 between F.Cu and B.Cu pads is physically unfixable.
+    let u_board = two_layer_pad_board(
+        "max_vias_unfixable",
+        (26.0, 16.0),
+        &[
+            ("A1", "PAD_TOP", 6.0, 8.0, "SIG_A"),
+            ("A2", "PAD_BOT", 20.0, 8.0, "SIG_A"),
+        ],
+        "[[constraints.max_vias]]\nnets = [\"SIG_A\"]\nmax_vias = 0\n",
+    );
+    let mut cfg0 = boxed_cfg(0, true);
+    cfg0.route.reroute_pad_mm = None;
+    let r0 = compile_board(u_board.clone(), &cfg0).unwrap();
+    assert!(!r0.ok);
+    assert!(
+        r0.drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "SIG_A")
+    );
+
+    let mut cfg2 = cfg0;
+    cfg2.repair_passes = 2;
+    let r2 = compile_board(u_board, &cfg2).unwrap();
+    assert!(!r2.ok);
+    assert_eq!(r2.route.repair_passes_run, 1);
+    assert_eq!(r2.board.tracks, r0.board.tracks);
+    assert_eq!(r2.board.vias, r0.board.vias);
+
+    // 2. Repair must not trade a MaxLength violation for a new MaxVias violation.
+    let mut t_board = two_layer_pad_board(
+        "max_vias_no_trade",
+        (30.0, 22.0),
+        &[
+            ("A1", "PAD_TOP", 6.0, 11.0, "SIG_A"),
+            ("A2", "PAD_TOP", 20.0, 11.0, "SIG_A"),
+            ("L1", "PAD_TOP", 13.0, 16.0, "SIG_LOCK"),
+            ("L2", "PAD_TOP", 13.0, 6.0, "SIG_LOCK"),
+        ],
+        "[[constraints.max_lengths]]\nnets = [\"SIG_A\"]\nmax_nm = 16000000\n[[constraints.max_vias]]\nnets = [\"SIG_A\"]\nmax_vias = 0\n",
+    );
+    push_tracks(
+        &mut t_board,
+        &[
+            ("SIG_LOCK", "F.Cu", (13.0, 16.0), (13.0, 6.0), true),
+            ("SIG_A", "F.Cu", (6.0, 11.0), (13.0, 18.0), false),
+            ("SIG_A", "F.Cu", (13.0, 18.0), (20.0, 11.0), false),
+        ],
+    );
+    let mut t_cfg = boxed_cfg(2, false);
+    t_cfg.route.resume = true;
+    t_cfg.route.optimize = false;
+    t_cfg.route.max_passes = 0;
+    t_cfg.route.reroute_pad_mm = None;
+    let t_rep = compile_board(t_board.clone(), &t_cfg).unwrap();
+    assert!(!t_rep.ok);
+    assert_eq!(t_rep.route.repair_passes_run, 1);
+    assert!(
+        !t_rep
+            .drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias),
+        "must not regress passing max_vias net to fix max_length: {:?}",
+        t_rep.drc.violations
+    );
+    assert_eq!(t_rep.board.tracks, t_board.tracks);
+    assert_eq!(t_rep.board.vias, t_board.vias);
+
+    // 2b. Symmetrically, repair must not regress a passing MaxLength net (SIG_N1) to fix MaxVias (SIG_A).
+    let mut t2_board = two_layer_pad_board(
+        "max_vias_no_trade_vv",
+        (30.0, 22.0),
+        &[
+            ("A1", "PAD_TOP", 6.0, 11.0, "SIG_A"),
+            ("A2", "PAD_TOP", 20.0, 11.0, "SIG_A"),
+            ("N1", "PAD_TOP", 13.0, 15.0, "SIG_N1"),
+            ("N2", "PAD_TOP", 13.0, 7.0, "SIG_N1"),
+        ],
+        "[[constraints.max_vias]]\nnets = [\"SIG_A\"]\nmax_vias = 0\n[[constraints.max_lengths]]\nnets = [\"SIG_N1\"]\nmax_nm = 9000000\n",
+    );
+    // Keepout on B.Cu over N1/N2 forces SIG_N1 > 9 mm if SIG_A claims F.Cu at y=11, creating a real trade-off.
+    t2_board.keepouts.push(Keepout {
+        kind: KeepoutKind::All,
+        layers: vec!["B.Cu".into()],
+        poly: vec![
+            Pt::new(mm(10.0), mm(6.0)),
+            Pt::new(mm(16.0), mm(6.0)),
+            Pt::new(mm(16.0), mm(16.5)),
+            Pt::new(mm(10.0), mm(16.5)),
+        ],
+    });
+    push_tracks(
+        &mut t2_board,
+        &[
+            ("SIG_N1", "F.Cu", (13.0, 15.0), (13.0, 7.0), false),
+            ("SIG_A", "F.Cu", (6.0, 11.0), (8.0, 11.0), false),
+            ("SIG_A", "B.Cu", (8.0, 11.0), (8.0, 4.5), false),
+            ("SIG_A", "B.Cu", (8.0, 4.5), (18.0, 4.5), false),
+            ("SIG_A", "B.Cu", (18.0, 4.5), (18.0, 11.0), false),
+            ("SIG_A", "F.Cu", (18.0, 11.0), (20.0, 11.0), false),
+        ],
+    );
+    push_vias(
+        &mut t2_board,
+        &[
+            ("SIG_A", (8.0, 11.0), false),
+            ("SIG_A", (18.0, 11.0), false),
+        ],
+    );
+    let mut t2_cfg0 = t_cfg.clone();
+    t2_cfg0.repair_passes = 0;
+    let t2_r0 = compile_board(t2_board.clone(), &t2_cfg0).unwrap();
+    let t2_rep = compile_board(t2_board, &t_cfg).unwrap();
+    assert!(!t2_rep.ok);
+    assert_eq!(t2_rep.route.repair_passes_run, 1);
+    assert!(
+        !t2_rep
+            .drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxLength),
+        "must not regress passing max_length net to fix max_vias: {:?}",
+        t2_rep.drc.violations
+    );
+    assert_eq!(t2_rep.board.tracks, t2_r0.board.tracks);
+    assert_eq!(t2_rep.board.vias, t2_r0.board.vias);
+
+    // 3. Respects --reroute-nets scope: out-of-scope MaxVias net and detoured max_vias blocker stay untouched.
+    let mut s_board = two_layer_pad_board(
+        "max_vias_scope",
+        (30.0, 22.0),
+        &[
+            ("A1", "PAD_TOP", 4.0, 18.0, "SIG_A"),
+            ("A2", "PAD_TOP", 10.0, 18.0, "SIG_A"),
+            ("B1", "PAD_TOP", 6.0, 10.0, "SIG_B"),
+            ("B2", "PAD_TOP", 20.0, 10.0, "SIG_B"),
+            ("N1", "PAD_TOP", 13.0, 15.0, "SIG_N1"),
+            ("N2", "PAD_TOP", 13.0, 5.0, "SIG_N1"),
+        ],
+        "[[constraints.max_vias]]\nnets = [\"SIG_B\", \"SIG_N1\"]\nmax_vias = 0\n",
+    );
+    // Give SIG_N1 an unlocked detoured route so any unauthorized reroute changes its geometry.
+    push_tracks(
+        &mut s_board,
+        &[
+            ("SIG_A", "F.Cu", (4.0, 18.0), (10.0, 18.0), false),
+            ("SIG_N1", "F.Cu", (13.0, 15.0), (15.0, 10.0), false),
+            ("SIG_N1", "F.Cu", (15.0, 10.0), (13.0, 5.0), false),
+            ("SIG_B", "F.Cu", (6.0, 10.0), (8.0, 10.0), false),
+            ("SIG_B", "B.Cu", (8.0, 10.0), (18.0, 10.0), false),
+            ("SIG_B", "F.Cu", (18.0, 10.0), (20.0, 10.0), false),
+        ],
+    );
+    push_vias(
+        &mut s_board,
+        &[
+            ("SIG_B", (8.0, 10.0), false),
+            ("SIG_B", (18.0, 10.0), false),
+        ],
+    );
+
+    let mut scope_a_cfg = boxed_cfg(3, true);
+    scope_a_cfg.route.resume = true;
+    scope_a_cfg.route.reroute_pad_mm = None;
+    let rep_a = compile_board(s_board.clone(), &scope_a_cfg).unwrap();
+    assert!(!rep_a.ok);
+    assert_eq!(rep_a.route.repair_passes_run, 0);
+    assert!(
+        rep_a
+            .drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "SIG_B")
+    );
+
+    let expected_sig_n1: Vec<Track> = s_board
+        .tracks
+        .iter()
+        .filter(|t| t.net == "SIG_N1")
+        .cloned()
+        .collect();
+    let mut scope_b_cfg = scope_a_cfg;
+    scope_b_cfg.route.reroute_nets = Some(HashSet::from(["SIG_B".into()]));
+    let rep_b = compile_board(s_board, &scope_b_cfg).unwrap();
+    assert_eq!(rep_b.route.repair_passes_run, 1);
+    assert_eq!(
+        rep_b
+            .board
+            .tracks
+            .iter()
+            .filter(|t| t.net == "SIG_N1")
+            .cloned()
+            .collect::<Vec<_>>(),
+        expected_sig_n1
+    );
+    assert!(
+        !rep_b
+            .drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "SIG_N1")
+    );
+    assert!(
+        rep_b
+            .drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "SIG_B")
+    );
+}
+
+#[test]
+fn plane_net_with_max_vias_stays_ignored_unknown_errors_and_locked_vias_do_not_starve() {
+    // 1. Resolved Plane net with constraints.max_vias stays auto-ignored (no signal tracks), while stage-6 DRC checks the cap.
+    let plane_toml = r#"
+name = "plane_max_vias"
+size_nm = [24000000, 18000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "In1.Cu"
+kind = "plane"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD_TOP]
+kind = "custom"
+[[footprints.PAD_TOP.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[[placements]]
+refdes = "G1"
+footprint = "PAD_TOP"
+pos = { x = 6000000, y = 9000000 }
+locked = true
+pin_nets = { "1" = "GND" }
+[[placements]]
+refdes = "G2"
+footprint = "PAD_TOP"
+pos = { x = 18000000, y = 9000000 }
+locked = true
+pin_nets = { "1" = "GND" }
+[[pours]]
+name = "GND_PLANE"
+net = "GND"
+layer = "In1.Cu"
+outline = [
+  { x = 500000, y = 500000 },
+  { x = 23500000, y = 500000 },
+  { x = 23500000, y = 17500000 },
+  { x = 500000, y = 17500000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+edge_clearance_nm = 300000
+via_at_smd = true
+[[constraints.max_vias]]
+nets = ["GND"]
+max_vias = 2
+"#;
+    let plane_spec: BoardSpec = toml::from_str(plane_toml).unwrap();
+    let mut plane_board = BoardIr::from_spec(&plane_spec).unwrap();
+    let p_rep = compile_board(plane_board.clone(), &boxed_cfg(0, false)).unwrap();
+    assert!(
+        p_rep.ok,
+        "expected plane net with max_vias=2 to pass cleanly: {:?}",
+        p_rep.drc
+    );
+    assert!(p_rep.board.tracks.iter().all(|t| t.net != "GND"));
+    assert_eq!(
+        p_rep.board.vias.iter().filter(|v| v.net == "GND").count(),
+        2
+    );
+
+    plane_board.constraints.max_vias[0].max_vias = 1;
+    let p_fail = compile_board(plane_board, &boxed_cfg(0, false)).unwrap();
+    assert!(!p_fail.ok);
+    assert!(
+        p_fail
+            .drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "GND")
+    );
+
+    // 2. Unknown net in constraints.max_vias errors in route_board_ir and compile_board.
+    let mut unk_board = two_layer_pad_board(
+        "unknown_max_vias",
+        (24.0, 18.0),
+        &[
+            ("A1", "PAD_TOP", 6.0, 9.0, "SIG_A"),
+            ("A2", "PAD_TOP", 18.0, 9.0, "SIG_A"),
+        ],
+        "",
+    );
+    unk_board.constraints.max_vias.push(MaxViasRule {
+        nets: vec!["NO_SUCH_NET".into()],
+        max_vias: 0,
+    });
+    let err_route = route_board_ir(&mut unk_board.clone(), &RouteOptions::default()).unwrap_err();
+    assert!(
+        err_route.contains("max_vias constraint references unknown net 'NO_SUCH_NET'"),
+        "unexpected route_board_ir error: {err_route}"
+    );
+    let err_compile = compile_board(unk_board, &boxed_cfg(0, false)).unwrap_err();
+    assert!(err_compile.contains("max_vias constraint references unknown net 'NO_SUCH_NET'"));
+
+    // 3. Locked-via MaxVias violation (zero unlocked vias) must not starve a fixable MaxVias net.
+    let mut starve_board = two_layer_pad_board(
+        "locked_max_vias_no_starve",
+        (30.0, 22.0),
+        &[
+            ("L1", "PAD_TOP", 4.0, 18.0, "SIG_LOCK"),
+            ("L2", "PAD_TOP", 10.0, 18.0, "SIG_LOCK"),
+            ("A1", "PAD_TOP", 6.0, 11.0, "SIG_A"),
+            ("A2", "PAD_TOP", 20.0, 11.0, "SIG_A"),
+            ("N1", "PAD_TOP", 13.0, 15.0, "SIG_N1"),
+            ("N2", "PAD_TOP", 13.0, 7.0, "SIG_N1"),
+        ],
+        "[[constraints.max_vias]]\nnets = [\"SIG_LOCK\", \"SIG_A\"]\nmax_vias = 0\n",
+    );
+    push_tracks(
+        &mut starve_board,
+        &[
+            ("SIG_LOCK", "F.Cu", (4.0, 18.0), (5.5, 18.0), true),
+            ("SIG_LOCK", "B.Cu", (5.5, 18.0), (8.5, 18.0), true),
+            ("SIG_LOCK", "F.Cu", (8.5, 18.0), (10.0, 18.0), true),
+            ("SIG_N1", "F.Cu", (13.0, 15.0), (13.0, 7.0), false),
+            ("SIG_A", "F.Cu", (6.0, 11.0), (8.0, 11.0), false),
+            ("SIG_A", "B.Cu", (8.0, 11.0), (18.0, 11.0), false),
+            ("SIG_A", "F.Cu", (18.0, 11.0), (20.0, 11.0), false),
+        ],
+    );
+    push_vias(
+        &mut starve_board,
+        &[
+            ("SIG_LOCK", (5.5, 18.0), true),
+            ("SIG_LOCK", (8.5, 18.0), true),
+            ("SIG_A", (8.0, 11.0), false),
+            ("SIG_A", (18.0, 11.0), false),
+        ],
+    );
+    let mut starve_cfg = boxed_cfg(1, false);
+    starve_cfg.route.resume = true;
+    starve_cfg.route.reroute_pad_mm = None;
+    let s_rep = compile_board(starve_board, &starve_cfg).unwrap();
+    assert_eq!(s_rep.route.repair_passes_run, 1);
+    assert!(
+        !s_rep
+            .drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "SIG_A"),
+        "expected SIG_A to be fixed without starvation by SIG_LOCK: {:?}",
+        s_rep.drc.violations
+    );
+    assert!(
+        s_rep
+            .drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "SIG_LOCK")
+    );
 }
