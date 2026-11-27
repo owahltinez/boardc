@@ -12,7 +12,7 @@ use crate::ir::{BBoxNm, Nm, PadDef, PourPoly, Pt, Side};
 
 pub(crate) const EPS_NM: f64 = 0.5;
 
-fn sin_cos_deg(rot_deg: f64) -> (f64, f64) {
+pub(crate) fn sin_cos_deg(rot_deg: f64) -> (f64, f64) {
     let rem = rot_deg.rem_euclid(360.0);
     let q = (rem / 90.0).round();
     if (rem - q * 90.0).abs() < 1e-9 {
@@ -45,6 +45,20 @@ pub fn local_to_board(pt: Pt, cx: Nm, cy: Nm, rot_deg: f64, side: Side) -> Pt {
     let x = cx + (lx * c - ly * s).round() as Nm;
     let y = cy + (lx * s + ly * c).round() as Nm;
     Pt::new(x, y)
+}
+
+/// Maps canonical board coordinates back into footprint-local Y-up coordinates (inverse of `local_to_board`).
+pub fn board_to_local(pt: Pt, cx: Nm, cy: Nm, rot_deg: f64, side: Side) -> Pt {
+    let (s, c) = sin_cos_deg(rot_deg);
+    let dx = (pt.x - cx) as f64;
+    let dy = (pt.y - cy) as f64;
+    let lx = (dx * c + dy * s).round() as Nm;
+    let ly_rot = (-dx * s + dy * c).round() as Nm;
+    let ly = match side {
+        Side::Top => ly_rot,
+        Side::Bottom => -ly_rot,
+    };
+    Pt::new(lx, ly)
 }
 
 /// Remaps Top <-> Bottom layer names for `Side::Bottom` placements.

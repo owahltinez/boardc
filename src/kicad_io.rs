@@ -6,7 +6,7 @@ use std::path::Path;
 use clipper2_rust::{FillRule, union_subjects_64};
 use viahop::sexp::SExp;
 
-use crate::geom::{ensure_ccw, polygon_area, remap_layer_for_side};
+use crate::geom::{board_to_local, ensure_ccw, polygon_area, remap_layer_for_side};
 use crate::ir::{
     BoardIr, FootprintDef, Keepout, KeepoutKind, Model3d, Nm, PadDef, PadKind, PadShape, Pt, Side,
     mm,
@@ -39,7 +39,11 @@ pub fn parse_kicad_mod(src: &str) -> Result<FootprintDef, String> {
         return Err(format!("expected '(footprint ...)', got '({tag} ...)'"));
     }
     let empty_nets = HashMap::new();
-    let (fp, _) = parse_footprint_node(&root, false, &empty_nets)?;
+    let (mut fp, _) = parse_footprint_node(&root, false, &empty_nets)?;
+    // Legacy KiCad 5 `(module ...)` syntax can fail KiCad 9/10 board parsing; passthrough KiCad 6+ only.
+    if tag == "footprint" {
+        fp.kicad_raw = Some(src.to_string());
+    }
     Ok(fp)
 }
 
@@ -64,16 +68,19 @@ pub(crate) fn parse_footprint_node(
     } else {
         Side::Top
     };
-    let fp_rot = node
+    let (fp_pos, fp_rot) = node
         .find_child("at")
         .and_then(|at| parse_at(at, -1))
-        .map(|(_, r)| r)
-        .unwrap_or(0.0);
+        .unwrap_or((Pt::new(0, 0), 0.0));
     // In .kicad_pcb, B.Cu footprints already store Y-flipped local coords and B.* layers.
     let unflip_bottom = is_placed_pcb && side == Side::Bottom;
     let y_sign: i64 = if unflip_bottom { 1 } else { -1 };
     let layer_norm = unflip_bottom.then_some(Side::Bottom);
 
+    let fp_mask_margin = node
+        .find_child("solder_mask_margin")
+        .and_then(|n| f64_at(n, 1))
+        .map(mm);
     let mut pads = Vec::new();
     let mut pad_nets = Vec::new();
     let mut graphics = Vec::new();
@@ -85,7 +92,7 @@ pub(crate) fn parse_footprint_node(
     for child in node.as_list().into_iter().flatten().skip(1) {
         match child.tag() {
             Some("pad") => {
-                let (pad, net) = parse_pad(
+                let (mut pad, net) = parse_pad(
                     child,
                     y_sign,
                     fp_rot,
@@ -93,13 +100,14 @@ pub(crate) fn parse_footprint_node(
                     is_placed_pcb,
                     net_id_map,
                 )?;
+                pad.mask_margin_nm = pad.mask_margin_nm.or(fp_mask_margin);
                 if !pad.name.is_empty() && !net.is_empty() {
                     pad_nets.push((pad.name.clone(), net));
                 }
                 pads.push(pad);
             }
             Some("fp_line") | Some("fp_arc") | Some("fp_rect") | Some("fp_circle")
-            | Some("fp_poly") => {
+            | Some("fp_poly") | Some("fp_text") => {
                 let raw_layer = child_atom(child, "layer").unwrap_or("");
                 let norm_layer = match layer_norm {
                     Some(s) => remap_layer_for_side(raw_layer, s),
@@ -108,11 +116,23 @@ pub(crate) fn parse_footprint_node(
                 if norm_layer == "F.CrtYd" || norm_layer == "B.CrtYd" {
                     collect_poly_or_segment(child, y_sign, &mut crtyd_open, &mut crtyd_closed);
                 } else if norm_layer != "Edge.Cuts" {
-                    graphics.extend(parse_graphic_node(child, y_sign, layer_norm));
+                    graphics.extend(parse_graphic_node(
+                        child,
+                        y_sign,
+                        layer_norm,
+                        is_placed_pcb.then_some(fp_rot),
+                    ));
                 }
             }
             Some("zone") => {
-                if let Some(ko) = parse_keepout_zone(child, y_sign, layer_norm) {
+                let z_sign = if is_placed_pcb { -1 } else { y_sign };
+                if let Some(mut ko) = parse_keepout_zone(child, z_sign, layer_norm) {
+                    if is_placed_pcb {
+                        for p in &mut ko.poly {
+                            *p = board_to_local(*p, fp_pos.x, fp_pos.y, fp_rot, side);
+                        }
+                        ensure_ccw(&mut ko.poly);
+                    }
                     keepouts.push(ko);
                 }
             }
@@ -140,6 +160,7 @@ pub(crate) fn parse_footprint_node(
             keepouts,
             models,
             pin_types: BTreeMap::new(),
+            kicad_raw: None,
         },
         pad_nets,
     ))

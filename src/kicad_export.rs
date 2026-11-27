@@ -8,8 +8,9 @@ use serde_json::json;
 use crate::geom::{ensure_ccw, polygon_signed_area_2};
 use crate::ir::{BoardIr, LayerKind, Nm, PourPoly, Pt, SOLDER_MASK_THICKNESS_NM, Side, nm_to_mm};
 use crate::kicad_export_items::{
-    UuidGen, esc, write_closed_poly_lines, write_footprint, write_graphic, write_keepout, write_pts,
+    UuidGen, esc, write_closed_poly_lines, write_graphic, write_keepout, write_pts,
 };
+use crate::kicad_raw_fp::write_footprint;
 use crate::zone_scene::match_pour_specs;
 
 fn collect_net_ids(board: &BoardIr) -> BTreeMap<String, usize> {
@@ -275,11 +276,12 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
         nm_to_mm(board.effective_board_thickness_nm())
     );
     out.push_str("\t(paper \"A4\")\n");
-    let _ = writeln!(
-        out,
-        "\t(title_block\n\t\t(title \"{}\")\n\t)",
-        esc(&board.name)
-    );
+    out.push_str("\t(title_block\n");
+    let _ = writeln!(out, "\t\t(title \"{}\")", esc(board.effective_title()));
+    if let Some(rev) = board.revision_trimmed() {
+        let _ = writeln!(out, "\t\t(rev \"{}\")", esc(rev));
+    }
+    out.push_str("\t)\n");
     write_layers(&mut out, board);
     write_setup(&mut out, board);
     out.push_str("\t(net 0 \"\")\n");
@@ -308,7 +310,7 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
         );
     }
     for g in &board.graphics {
-        write_graphic(&mut out, "gr", g, -1, Side::Top, "\t", &mut uuids);
+        write_graphic(&mut out, g, None, &mut uuids);
     }
 
     for pl in &board.placements {
@@ -490,6 +492,7 @@ pub fn render_kicad_pro(board: &BoardIr) -> String {
                     "keepout": "error",
                     "rule_area": "error",
                     "shorting_items": "error",
+                    "solder_mask_bridge": if r.mask_to_copper_nm.is_some() { "error" } else { "ignore" },
                     "track_dangling": "error",
                     "track_width": "error",
                     "tracks_crossing": "error",
@@ -509,7 +512,7 @@ pub fn render_kicad_pro(board: &BoardIr) -> String {
                     "min_silk_clearance": nm_to_mm(r.silk_clearance_nm),
                     "min_connection": 0.0,
                     "min_resolved_spokes": 1,
-                    "solder_mask_to_copper_clearance": 0.0
+                    "solder_mask_to_copper_clearance": r.mask_to_copper_nm.map(nm_to_mm).unwrap_or(0.0)
                 }
             }
         },

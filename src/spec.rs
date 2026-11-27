@@ -5,10 +5,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::footprints;
+use crate::geom::polygon_signed_area_2;
 use crate::ir::{
-    BoardIr, Constraints, DesignRules, FootprintDef, Graphic, Keepout, LayerDef, NetClass, NetDef,
-    Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup, Track, Via,
-    default_two_layer_stackup,
+    BoardIr, Constraints, DesignRules, FabConfig, FootprintDef, Graphic, Keepout, LayerDef,
+    Model3d, NetClass, NetDef, Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup,
+    Track, Via, default_two_layer_stackup, trim_nonempty,
 };
 use crate::kicad_io::load_kicad_net;
 use crate::spec_kicad::{
@@ -17,7 +18,7 @@ use crate::spec_kicad::{
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FootprintSpec {
     Chip2Pin {
         package: String,
@@ -60,11 +61,15 @@ pub enum FootprintSpec {
         graphics: Vec<Graphic>,
         #[serde(default)]
         keepouts: Vec<Keepout>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        models: Vec<Model3d>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pin_types: BTreeMap<String, PinType>,
     },
-    /// Pin-type overlay for a `.kicad_mod` footprint loaded from `footprint_libs`.
+    /// Pin-type and/or courtyard overlay for a `.kicad_mod` footprint loaded from `footprint_libs`.
     Lib {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        courtyard: Option<Vec<Pt>>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pin_types: BTreeMap<String, PinType>,
     },
@@ -76,28 +81,48 @@ fn deserialize_footprints<'de, D: serde::Deserializer<'de>>(
     let raw = BTreeMap::<String, serde_json::Value>::deserialize(de)?;
     let mut out = BTreeMap::new();
     for (name, mut val) in raw {
-        if let Some(map) = val.as_object_mut() {
-            if !map.contains_key("kind") && map.contains_key("pin_types") {
-                if map.len() > 1 {
-                    return Err(serde::de::Error::custom(format!(
-                        "footprint '{name}' missing 'kind' field"
-                    )));
-                }
-                map.insert("kind".into(), serde_json::Value::String("lib".into()));
-            }
-            if map.get("kind").and_then(|v| v.as_str()) == Some("lib")
-                && map.keys().any(|k| k != "kind" && k != "pin_types")
-            {
-                return Err(serde::de::Error::custom(format!(
-                    "footprint '{name}' with kind='lib' only accepts 'pin_types'"
-                )));
-            }
+        if let Some(map) = val.as_object_mut()
+            && !map.contains_key("kind")
+            && !map.is_empty()
+            && map.keys().all(|k| k == "pin_types" || k == "courtyard")
+        {
+            map.insert("kind".into(), serde_json::Value::String("lib".into()));
         }
         let fp: FootprintSpec = serde_json::from_value(val)
             .map_err(|e| serde::de::Error::custom(format!("footprint '{name}': {e}")))?;
         out.insert(name, fp);
     }
     Ok(out)
+}
+
+fn validate_courtyard(owner: &str, pts: &[Pt]) -> Result<(), String> {
+    if pts.len() < 3 {
+        return Err(format!("{owner} courtyard must have at least 3 vertices"));
+    }
+    if polygon_signed_area_2(pts) == 0 {
+        return Err(format!("{owner} courtyard polygon must have non-zero area"));
+    }
+    Ok(())
+}
+
+fn validate_models(owner: &str, models: &[Model3d]) -> Result<(), String> {
+    for (i, m) in models.iter().enumerate() {
+        if m.path.trim().is_empty() {
+            return Err(format!("{owner} model#{i} has empty path"));
+        }
+        if m.offset_mm.iter().any(|v| !v.is_finite())
+            || m.scale.iter().any(|v| !v.is_finite())
+            || m.rotate_deg.iter().any(|v| !v.is_finite())
+        {
+            return Err(format!("{owner} model#{i} has non-finite transform value"));
+        }
+        if m.scale.contains(&0.0) {
+            return Err(format!(
+                "{owner} model#{i} scale components must be non-zero"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl FootprintSpec {
@@ -138,22 +163,31 @@ impl FootprintSpec {
                 courtyard,
                 graphics,
                 keepouts,
+                models,
                 pin_types,
-            } => (
-                FootprintDef {
-                    name: String::new(),
-                    pads: pads.clone(),
-                    courtyard: courtyard.clone(),
-                    graphics: graphics.clone(),
-                    keepouts: keepouts.clone(),
-                    models: Vec::new(),
-                    pin_types: BTreeMap::new(),
-                },
-                pin_types,
-            ),
+            } => {
+                let owner = format!("footprint '{name}'");
+                if !courtyard.is_empty() {
+                    validate_courtyard(&owner, courtyard)?;
+                }
+                validate_models(&owner, models)?;
+                (
+                    FootprintDef {
+                        name: String::new(),
+                        pads: pads.clone(),
+                        courtyard: courtyard.clone(),
+                        graphics: graphics.clone(),
+                        keepouts: keepouts.clone(),
+                        models: models.clone(),
+                        pin_types: BTreeMap::new(),
+                        kicad_raw: None,
+                    },
+                    pin_types,
+                )
+            }
             Self::Lib { .. } => {
                 return Err(format!(
-                    "footprint '{name}' is a library pin_types overlay and requires footprint_libs"
+                    "footprint '{name}' is a library overlay and requires footprint_libs"
                 ));
             }
         };
@@ -189,9 +223,70 @@ pub(crate) fn validate_pin_types_for_footprint(
     Ok(())
 }
 
+fn validate_graphics(owner: &str, graphics: &[Graphic]) -> Result<(), String> {
+    for g in graphics {
+        if let Graphic::Text {
+            height_nm,
+            stroke_nm,
+            rot_deg,
+            ..
+        } = g
+        {
+            if *height_nm <= 0 {
+                return Err(format!("{owner} text graphic height_nm must be > 0"));
+            }
+            if *stroke_nm <= 0 {
+                return Err(format!("{owner} text graphic stroke_nm must be > 0"));
+            }
+            if !rot_deg.is_finite() {
+                return Err(format!("{owner} text graphic rot_deg must be finite"));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_net_names(nets: &BTreeMap<String, NetDef>) -> Result<(), String> {
+    for (key, nd) in nets {
+        if !nd.name.trim().is_empty() && nd.name != *key {
+            return Err(format!("net '{key}' has mismatched name '{}'", nd.name));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn backfill_net_names(nets: &mut BTreeMap<String, NetDef>) {
+    for (key, nd) in nets {
+        if nd.name.trim().is_empty() {
+            nd.name = key.clone();
+        }
+    }
+}
+
 pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
+    if ir.rules.mask_to_copper_nm.is_some_and(|v| v < 0) {
+        return Err(format!(
+            "board IR '{}': design rules mask_to_copper_nm must be >= 0",
+            path.display()
+        ));
+    }
+    validate_net_names(&ir.nets).map_err(|e| format!("board IR '{}': {e}", path.display()))?;
+    ir.fab
+        .validate()
+        .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
+    validate_graphics("board", &ir.graphics)
+        .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     for (name, fp) in &ir.footprints {
+        let owner = format!("footprint '{name}'");
+        if !fp.courtyard.is_empty() {
+            validate_courtyard(&owner, &fp.courtyard)
+                .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
+        }
+        validate_models(&owner, &fp.models)
+            .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
         validate_pin_types_for_footprint("footprint", name, fp, &fp.pin_types)
+            .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
+        validate_graphics(&format!("footprint '{name}'"), &fp.graphics)
             .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     }
     for p in &ir.placements {
@@ -215,6 +310,10 @@ pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BoardSpec {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     #[serde(default)]
     pub outline: Vec<Pt>,
     #[serde(default)]
@@ -251,6 +350,8 @@ pub struct BoardSpec {
     pub graphics: Vec<Graphic>,
     #[serde(default)]
     pub stackup: Stackup,
+    #[serde(default, skip_serializing_if = "FabConfig::is_default")]
+    pub fab: FabConfig,
 }
 
 impl BoardIr {
@@ -304,6 +405,7 @@ impl BoardIr {
                 return Err(format!("duplicate placement refdes '{}'", p.refdes));
             }
         }
+        validate_net_names(&spec.nets)?;
         let mut nets = spec.nets.clone();
 
         if let Some(ref nl) = netlist {
@@ -323,7 +425,7 @@ impl BoardIr {
                 if let Some(mut fp) =
                     resolve_footprint_from_libs(&p.footprint, qual_fallback, &resolved_libs)?
                 {
-                    if let Some((key, pin_types)) = [
+                    if let Some((key, courtyard, pin_types)) = [
                         Some(p.footprint.as_str()),
                         qual_fallback,
                         Some(bare_footprint_name(&p.footprint)),
@@ -331,12 +433,19 @@ impl BoardIr {
                     .into_iter()
                     .flatten()
                     .find_map(|k| match spec.footprints.get_key_value(k) {
-                        Some((key, FootprintSpec::Lib { pin_types })) => {
-                            Some((key.as_str(), pin_types))
-                        }
+                        Some((
+                            key,
+                            FootprintSpec::Lib {
+                                courtyard,
+                                pin_types,
+                            },
+                        )) => Some((key.as_str(), courtyard, pin_types)),
                         _ => None,
                     }) {
                         matched_overlays.insert(key);
+                        if let Some(cy) = courtyard {
+                            fp.courtyard = cy.clone();
+                        }
                         fp.pin_types = pin_types.clone();
                         validate_pin_types_for_footprint(
                             "footprint",
@@ -359,14 +468,31 @@ impl BoardIr {
             }
         }
         for (name, fp_spec) in &spec.footprints {
-            if matches!(fp_spec, FootprintSpec::Lib { .. })
-                && !matched_overlays.contains(name.as_str())
+            if let FootprintSpec::Lib {
+                courtyard,
+                pin_types,
+            } = fp_spec
             {
-                return Err(format!(
-                    "footprint '{name}' pin_types overlay did not match any library footprint placement"
-                ));
+                if courtyard.is_none() && pin_types.is_empty() {
+                    return Err(format!(
+                        "footprint '{name}' library overlay must specify courtyard and/or pin_types"
+                    ));
+                }
+                if let Some(cy) = courtyard {
+                    validate_courtyard(&format!("footprint '{name}'"), cy)?;
+                }
+                if !matched_overlays.contains(name.as_str()) {
+                    return Err(format!(
+                        "footprint '{name}' library overlay did not match any library footprint placement"
+                    ));
+                }
             }
         }
+
+        for fp in footprints.values() {
+            validate_graphics(&format!("footprint '{}'", fp.name), &fp.graphics)?;
+        }
+        validate_graphics("board", &spec.graphics)?;
 
         sync_spec_and_netlist_nets(&mut placements, &mut nets, netlist.as_ref());
         if spec.rules.track_width_nm <= 0
@@ -376,6 +502,9 @@ impl BoardIr {
             return Err(
                 "design rules track_width_nm, via_dia_nm, and via_drill_nm must be > 0".into(),
             );
+        }
+        if spec.rules.mask_to_copper_nm.is_some_and(|v| v < 0) {
+            return Err("design rules mask_to_copper_nm must be >= 0".into());
         }
         if spec.stackup.thickness_nm <= 0 {
             return Err("stackup.thickness_nm must be > 0".into());
@@ -392,6 +521,7 @@ impl BoardIr {
                 spec.stackup.dielectric_nm.len()
             ));
         }
+        spec.fab.validate()?;
         let mut rules = spec.rules.clone();
         let mut stackup = spec.stackup.clone();
         // Keep stackup POFV and via-in-pad DRC/routing flags consistent across the pipeline and fab exports.
@@ -401,6 +531,8 @@ impl BoardIr {
         }
         Ok(Self {
             name: spec.name.clone(),
+            title: trim_nonempty(spec.title.as_deref()).map(str::to_string),
+            revision: trim_nonempty(spec.revision.as_deref()).map(str::to_string),
             outline,
             cutouts: spec.cutouts.clone(),
             layers,
@@ -417,6 +549,7 @@ impl BoardIr {
             constraints: spec.constraints.clone(),
             graphics: spec.graphics.clone(),
             stackup,
+            fab: spec.fab,
         })
     }
 }
@@ -448,8 +581,9 @@ pub fn save_board_json(board: &BoardIr, path: &Path) -> Result<(), String> {
 pub fn load_board_json(path: &Path) -> Result<BoardIr, String> {
     let text = fs::read_to_string(path)
         .map_err(|e| format!("failed to read board IR '{}': {e}", path.display()))?;
-    let ir: BoardIr = serde_json::from_str(&text)
+    let mut ir: BoardIr = serde_json::from_str(&text)
         .map_err(|e| format!("failed to parse board IR '{}': {e}", path.display()))?;
     validate_board_ir_pins(&ir, path)?;
+    backfill_net_names(&mut ir.nets);
     Ok(ir)
 }

@@ -8,7 +8,7 @@ use crate::geom::{ensure_ccw, local_to_board, polygon_area};
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FilledPour, FootprintDef, Keepout, LayerDef, LayerKind,
     NetDef, Nm, Placement, PourPoly, PourSpec, Pt, SchematicMeta, Side, Stackup, Track, Via,
-    default_net_class, default_two_layer_stackup, mm,
+    default_net_class, default_two_layer_stackup, mm, trim_nonempty,
 };
 use crate::kicad_geom::{
     atom_at, chain_segments, child_atom, collect_poly_or_segment, discretize_arc, f64_at,
@@ -56,7 +56,8 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     }
     let items = root.as_list().ok_or("invalid kicad_pcb list")?;
 
-    let mut name = String::new();
+    let mut title: Option<String> = None;
+    let mut revision: Option<String> = None;
     let mut layers = Vec::new();
     let mut net_id_map: HashMap<i64, String> = HashMap::new();
     let mut footprints: BTreeMap<String, FootprintDef> = BTreeMap::new();
@@ -72,6 +73,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     let mut layer_thickness: HashMap<String, Nm> = HashMap::new();
     let mut stackup = Stackup::default();
     let mut setup_default_tented: Option<(bool, bool)> = None;
+    let mut setup_mask_expansion: Option<Nm> = None;
 
     for node in items.iter().skip(1) {
         match node.tag() {
@@ -81,10 +83,11 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                 }
             }
             Some("title_block") => {
-                if let Some(t) = child_atom(node, "title")
-                    && !t.is_empty()
-                {
-                    name = t.to_string();
+                if let Some(t) = trim_nonempty(child_atom(node, "title")) {
+                    title = Some(t.to_string());
+                }
+                if let Some(r) = trim_nonempty(child_atom(node, "rev")) {
+                    revision = Some(r.to_string());
                 }
             }
             Some("layers") => layers = parse_layers_block(node),
@@ -93,6 +96,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                 &mut layer_thickness,
                 &mut stackup,
                 &mut setup_default_tented,
+                &mut setup_mask_expansion,
             ),
             Some("net") => {
                 if let (Some(id), Some(n)) = (f64_at(node, 1).map(|v| v as i64), atom_at(node, 2))
@@ -120,11 +124,11 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                 &mut filled_pours,
             ),
             Some("gr_line") | Some("gr_arc") | Some("gr_rect") | Some("gr_circle")
-            | Some("gr_poly") => {
+            | Some("gr_poly") | Some("gr_text") => {
                 if child_atom(node, "layer") == Some("Edge.Cuts") {
                     collect_poly_or_segment(node, -1, &mut edge_open, &mut edge_closed);
                 } else {
-                    graphics.extend(parse_graphic_node(node, -1, None));
+                    graphics.extend(parse_graphic_node(node, -1, None, None));
                 }
             }
             _ => {}
@@ -165,6 +169,9 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
 
     let mut net_classes = BTreeMap::new();
     let mut rules = DesignRules::default();
+    if let Some(m) = setup_mask_expansion {
+        rules.mask_expansion_nm = m;
+    }
     if stackup.pofv {
         rules.via_at_smd = true;
     }
@@ -187,8 +194,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                     .get(net_name)
                     .cloned()
                     .unwrap_or_else(default_net_class),
-                pins: Vec::new(),
-                ignore_route: false,
+                ..Default::default()
             });
             let pair = (pl.refdes.clone(), pin.clone());
             if !entry.pins.contains(&pair) {
@@ -209,18 +215,15 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                     .get(net_name)
                     .cloned()
                     .unwrap_or_else(default_net_class),
-                pins: Vec::new(),
-                ignore_route: false,
+                ..Default::default()
             });
         }
     }
 
     Ok(BoardIr {
-        name: if name.is_empty() {
-            "kicad_board".into()
-        } else {
-            name
-        },
+        name: title.clone().unwrap_or_else(|| "kicad_board".into()),
+        title,
+        revision,
         outline,
         cutouts,
         layers,
@@ -237,6 +240,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
         constraints: Constraints::default(),
         graphics,
         stackup,
+        fab: Default::default(),
     })
 }
 
@@ -439,7 +443,14 @@ fn parse_setup(
     thickness: &mut HashMap<String, Nm>,
     stackup: &mut Stackup,
     default_tented: &mut Option<(bool, bool)>,
+    mask_expansion: &mut Option<Nm>,
 ) {
+    if let Some(m) = node
+        .find_child("pad_to_mask_clearance")
+        .and_then(|n| f64_at(n, 1))
+    {
+        *mask_expansion = Some(mm(m));
+    }
     if let Some(t) = parse_setup_tenting(node) {
         *default_tented = Some(t);
     }
@@ -649,6 +660,7 @@ fn parse_placed_footprint(
         rot_deg: rot_deg.rem_euclid(360.0),
         side,
         locked: has_flag(node, "locked"),
+        allow_edge_overhang: false,
         pin_nets,
         pin_types: BTreeMap::new(),
         mpn,

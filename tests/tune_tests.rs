@@ -50,6 +50,7 @@ fn pad_fp_layer(dia_mm: f64, layer: &str) -> FootprintSpec {
         courtyard: Vec::new(),
         graphics: Vec::new(),
         keepouts: Vec::new(),
+        models: Vec::new(),
         pin_types: Default::default(),
     }
 }
@@ -282,6 +283,7 @@ fn tight_obstacles_flip_side_and_shrink_amplitude_without_drc_violation() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -631,6 +633,7 @@ fn interior_contacts_preserve_connectivity_and_zero_open_net() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -1007,6 +1010,7 @@ fn net_class_filters_and_ignore_route_respected() {
                     class: "HS".into(),
                     pins: Vec::new(),
                     ignore_route: false,
+                    power_driven: false,
                 },
             ),
             (
@@ -1016,6 +1020,7 @@ fn net_class_filters_and_ignore_route_respected() {
                     class: "HS".into(),
                     pins: Vec::new(),
                     ignore_route: false,
+                    power_driven: false,
                 },
             ),
             (
@@ -1025,6 +1030,7 @@ fn net_class_filters_and_ignore_route_respected() {
                     class: "Default".into(),
                     pins: Vec::new(),
                     ignore_route: true,
+                    power_driven: false,
                 },
             ),
         ]),

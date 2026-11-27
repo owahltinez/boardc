@@ -4,7 +4,7 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 use viahop::sexp::SExp;
 
 use crate::geom::{ensure_ccw, remap_layer_for_side};
-use crate::ir::{Graphic, Nm, Pt, Side, mm};
+use crate::ir::{DEFAULT_TEXT_HEIGHT_NM, DEFAULT_TEXT_STROKE_NM, Graphic, Nm, Pt, Side, mm};
 use crate::shapes::circle_poly;
 
 const CHAIN_TOL_NM: Nm = 10_000;
@@ -131,8 +131,12 @@ pub(crate) fn is_ignored_kicad_field(name: &str) -> bool {
         || name.starts_with("ki_")
 }
 
+pub(crate) fn is_exportable_kicad_field(k: &str, v: &str) -> bool {
+    !(is_ignored_kicad_field(k) || v.is_empty() || (k == "Datasheet" && v == "~"))
+}
+
 pub(crate) fn insert_kicad_field(fields: &mut BTreeMap<String, String>, k: &str, v: &str) {
-    if is_ignored_kicad_field(k) || v.is_empty() || (k == "Datasheet" && v == "~") {
+    if !is_exportable_kicad_field(k, v) {
         return;
     }
     fields.insert(k.to_string(), v.to_string());
@@ -202,6 +206,27 @@ pub(crate) fn parse_fill(node: &SExp) -> bool {
             .find_child("fill")
             .is_some_and(|f| f.as_list().is_some_and(|l| l.len() == 1)),
     }
+}
+
+fn parse_text_font(node: &SExp) -> (Nm, Nm) {
+    let font = node
+        .find_child("effects")
+        .and_then(|e| e.find_child("font"));
+    let height_nm = font
+        .and_then(|f| f.find_child("size"))
+        .and_then(|s| f64_at(s, 1))
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .map(mm)
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_TEXT_HEIGHT_NM);
+    let stroke_nm = font
+        .and_then(|f| f.find_child("thickness"))
+        .and_then(|t| f64_at(t, 1))
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .map(mm)
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_TEXT_STROKE_NM);
+    (height_nm, stroke_nm)
 }
 
 pub(crate) fn parse_pts(node: &SExp, y_sign: i64) -> Vec<Pt> {
@@ -308,6 +333,7 @@ pub(crate) fn parse_graphic_node(
     node: &SExp,
     y_sign: i64,
     layer_norm: Option<Side>,
+    placed_rot: Option<f64>,
 ) -> Vec<Graphic> {
     let raw_layer = child_atom(node, "layer").unwrap_or("");
     let layer = match layer_norm {
@@ -379,6 +405,57 @@ pub(crate) fn parse_graphic_node(
                         width,
                     })
                     .collect();
+            }
+        }
+        "gr_text" | "fp_text" => {
+            let is_fp = node.tag() == Some("fp_text");
+            let text = if is_fp {
+                if atom_at(node, 1) != Some("user") {
+                    return Vec::new();
+                }
+                atom_at(node, 2).filter(|t| !t.contains("${"))
+            } else {
+                atom_at(node, 1)
+            };
+            let hidden = has_flag(node, "hide")
+                || node
+                    .find_child("effects")
+                    .is_some_and(|e| has_flag(e, "hide"));
+            if let Some(text) = text
+                && !hidden
+                && let Some((pos, raw_rot)) =
+                    node.find_child("at").and_then(|n| parse_at(n, y_sign))
+            {
+                let (height_nm, stroke_nm) = parse_text_font(node);
+                // Match KiCad KeepUpright on locked fp_text by flipping (90, 270] deg by 180 deg.
+                let eff_rot = if is_fp && !has_flag(node, "unlocked") {
+                    let norm = raw_rot.rem_euclid(360.0);
+                    if norm > 90.0 + 1e-6 && norm <= 270.0 + 1e-6 {
+                        raw_rot - 180.0
+                    } else {
+                        raw_rot
+                    }
+                } else {
+                    raw_rot
+                };
+                let r = match (placed_rot, layer_norm) {
+                    (Some(fp_rot), Some(Side::Bottom)) => fp_rot - eff_rot + 180.0,
+                    (Some(fp_rot), _) => eff_rot - fp_rot,
+                    (None, _) => eff_rot,
+                };
+                let rot_deg = if r.is_finite() {
+                    r.rem_euclid(360.0)
+                } else {
+                    0.0
+                };
+                return vec![Graphic::Text {
+                    layer,
+                    text: text.to_string(),
+                    pos,
+                    height_nm,
+                    stroke_nm,
+                    rot_deg,
+                }];
             }
         }
         _ => {}

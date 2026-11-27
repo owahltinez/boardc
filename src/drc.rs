@@ -8,6 +8,7 @@ use crate::drc_copper::{
     check_via_to_via_and_pad,
 };
 use crate::drc_layout::{check_courtyards_and_component_edges, check_keepouts};
+use crate::drc_mask::check_mask_to_copper;
 use crate::drc_rules::{check_drill_rules, check_edge_clearances};
 use crate::drc_scene::{
     collect_drills, collect_keepouts, collect_pads, collect_pours, collect_tracks, collect_vias,
@@ -21,6 +22,7 @@ pub const DEFAULT_CLUSTER_RADIUS_NM: Nm = 2_000_000;
 #[serde(rename_all = "snake_case")]
 pub enum ViolationKind {
     Clearance,
+    SolderMaskToCopper,
     HoleToHole,
     DrillToCopper,
     MinAnnularRing,
@@ -107,6 +109,7 @@ pub fn check_board_drc(board: &BoardIr) -> DrcReport {
             check_track_rules_and_clearances(board, &tracks, &pads, &vias, max_clr, &mut v);
             check_pad_to_pad_clearances(board, &pads, max_clr, &mut v);
             check_via_to_via_and_pad(board, &pads, &vias, &cu_layers, max_clr, &mut v);
+            check_mask_to_copper(board, &cu_layers, &tracks, &pads, &vias, &pours, &mut v);
             v
         });
         let h_pours = s.spawn(|| {

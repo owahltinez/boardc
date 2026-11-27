@@ -18,7 +18,8 @@ use crate::fab_job::emit_gbrjob;
 use crate::fab_silk::{emit_silk_layer, push_graphic_mask_shapes};
 use crate::geom::{pad_copper_layers, pad_world_layers, polygon_area, remap_layer_for_side};
 use crate::ir::{
-    BoardIr, FootprintDef, LayerKind, PadKind, Placement, PourPoly, Side, nm_to_mm, safe_slug,
+    AutoRefdes, BoardIr, FabConfig, FootprintDef, LayerKind, Nm, PadKind, Placement, PourPoly,
+    Side, nm_to_mm, safe_slug,
 };
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
 use crate::svg::DEFAULT_SVG_MARGIN_MM;
@@ -30,6 +31,10 @@ pub struct FabOptions {
     pub assembly: bool,
     pub drill_map: bool,
     pub drill_report: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_refdes: Option<AutoRefdes>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refdes_stroke_nm: Option<Nm>,
 }
 
 impl Default for FabOptions {
@@ -39,6 +44,8 @@ impl Default for FabOptions {
             assembly: false,
             drill_map: false,
             drill_report: false,
+            auto_refdes: None,
+            refdes_stroke_nm: None,
         }
     }
 }
@@ -374,6 +381,11 @@ pub fn export_fab(
     out_dir: &Path,
     cfg: &FabOptions,
 ) -> Result<FabManifest, String> {
+    let fab = FabConfig {
+        auto_refdes: cfg.auto_refdes.unwrap_or(board.fab.auto_refdes),
+        refdes_stroke_nm: cfg.refdes_stroke_nm.unwrap_or(board.fab.refdes_stroke_nm),
+    };
+    fab.validate()?;
     fs::create_dir_all(out_dir)
         .map_err(|e| format!("failed to create fab dir '{}': {e}", out_dir.display()))?;
     let cu_layers = board.copper_layer_names();
@@ -416,7 +428,7 @@ pub fn export_fab(
             pos: fn_pos,
             index: None,
         });
-        emit_silk_layer(&mut silk_b, board, side, &mask_openings);
+        emit_silk_layer(&mut silk_b, board, side, &mask_openings, fab);
         silk_b.write_file(&silk_path)?;
         gerber_files.push(silk_path);
     }
