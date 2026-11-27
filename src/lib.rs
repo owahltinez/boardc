@@ -31,6 +31,7 @@ mod kicad_pro;
 mod kicad_raw_fp;
 pub mod pipeline;
 mod pipeline_repair;
+mod pipeline_repair_length;
 pub mod place;
 mod place_legalize;
 mod place_vias;
