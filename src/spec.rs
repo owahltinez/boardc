@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::footprints;
 use crate::ir::{
-    BoardIr, Constraints, DesignRules, FootprintDef, Graphic, Keepout, LayerDef, NetClass, NetDef,
-    Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup, Track, Via,
+    BoardIr, Constraints, DesignRules, FabConfig, FootprintDef, Graphic, Keepout, LayerDef,
+    NetClass, NetDef, Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup, Track, Via,
     default_two_layer_stackup,
 };
 use crate::kicad_io::load_kicad_net;
@@ -189,7 +189,15 @@ pub(crate) fn validate_pin_types_for_footprint(
     Ok(())
 }
 
+pub(crate) fn validate_fab_config(fab: &FabConfig) -> Result<(), String> {
+    if fab.refdes_stroke_nm <= 0 {
+        return Err("fab.refdes_stroke_nm must be > 0".into());
+    }
+    Ok(())
+}
+
 pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
+    validate_fab_config(&ir.fab).map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     for (name, fp) in &ir.footprints {
         validate_pin_types_for_footprint("footprint", name, fp, &fp.pin_types)
             .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
@@ -251,6 +259,8 @@ pub struct BoardSpec {
     pub graphics: Vec<Graphic>,
     #[serde(default)]
     pub stackup: Stackup,
+    #[serde(default, skip_serializing_if = "FabConfig::is_default")]
+    pub fab: FabConfig,
 }
 
 impl BoardIr {
@@ -392,6 +402,7 @@ impl BoardIr {
                 spec.stackup.dielectric_nm.len()
             ));
         }
+        validate_fab_config(&spec.fab)?;
         let mut rules = spec.rules.clone();
         let mut stackup = spec.stackup.clone();
         // Keep stackup POFV and via-in-pad DRC/routing flags consistent across the pipeline and fab exports.
@@ -417,6 +428,7 @@ impl BoardIr {
             constraints: spec.constraints.clone(),
             graphics: spec.graphics.clone(),
             stackup,
+            fab: spec.fab.clone(),
         })
     }
 }

@@ -255,6 +255,94 @@ impl Stackup {
     }
 }
 
+pub const DEFAULT_REFDES_STROKE_NM: Nm = 120_000;
+
+/// Mode controlling auto-generated component refdes text in silkscreen output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AutoRefdes {
+    #[default]
+    Rotate,
+    Upright,
+    Off,
+}
+
+impl AutoRefdes {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rotate => "rotate",
+            Self::Upright => "upright",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl Serialize for AutoRefdes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoRefdes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AutoRefdesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for AutoRefdesVisitor {
+            type Value = AutoRefdes;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a boolean or one of \"rotate\", \"auto\", \"upright\", \"off\"")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(if v {
+                    AutoRefdes::Rotate
+                } else {
+                    AutoRefdes::Off
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "rotate" | "auto" => Ok(AutoRefdes::Rotate),
+                    "upright" => Ok(AutoRefdes::Upright),
+                    "off" => Ok(AutoRefdes::Off),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(AutoRefdesVisitor)
+    }
+}
+
+fn default_refdes_stroke_nm() -> Nm {
+    DEFAULT_REFDES_STROKE_NM
+}
+
+/// Fabrication silkscreen settings (`[fab]` in `BoardSpec` and `BoardIr`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FabConfig {
+    pub auto_refdes: AutoRefdes,
+    #[serde(default = "default_refdes_stroke_nm")]
+    pub refdes_stroke_nm: Nm,
+}
+
+impl Default for FabConfig {
+    fn default() -> Self {
+        Self {
+            auto_refdes: AutoRefdes::default(),
+            refdes_stroke_nm: DEFAULT_REFDES_STROKE_NM,
+        }
+    }
+}
+
+impl FabConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PadKind {
@@ -863,6 +951,8 @@ pub struct BoardIr {
     pub graphics: Vec<Graphic>,
     #[serde(default)]
     pub stackup: Stackup,
+    #[serde(default, skip_serializing_if = "FabConfig::is_default")]
+    pub fab: FabConfig,
 }
 
 impl BoardIr {

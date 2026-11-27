@@ -10,7 +10,7 @@ use crate::geom::{
     EPS_NM, ensure_ccw, local_to_board, polygon_area, polygon_violates_clearance, pts_to_path64,
     remap_layer_for_side,
 };
-use crate::ir::{BBoxNm, BoardIr, Graphic, Nm, Placement, PourPoly, Pt, Side};
+use crate::ir::{AutoRefdes, BBoxNm, BoardIr, Graphic, Nm, Placement, PourPoly, Pt, Side};
 use crate::shapes::{ResolvedShape, circle_poly};
 use crate::zone_scene::{paths_to_pour_polys, pour_poly_area, shape_inflated_poly};
 
@@ -360,6 +360,48 @@ pub(crate) fn refdes_local_pos(board: &BoardIr, pl: &Placement) -> Pt {
     Pt::new((b.min_x + b.max_x) / 2, b.max_y + 450_000)
 }
 
+fn needs_upright_flip(rot_deg: f64, side: Side) -> bool {
+    let view_rot = match side {
+        Side::Top => rot_deg.rem_euclid(360.0),
+        Side::Bottom => (180.0 - rot_deg).rem_euclid(360.0),
+    };
+    view_rot > 90.0 + 1e-6 && view_rot <= 270.0 + 1e-6
+}
+
+pub(crate) fn refdes_world_segments(
+    board: &BoardIr,
+    pl: &Placement,
+    mode: AutoRefdes,
+) -> Vec<(Pt, Pt)> {
+    if mode == AutoRefdes::Off || pl.refdes.is_empty() {
+        return Vec::new();
+    }
+    let text_center = refdes_local_pos(board, pl);
+    if mode == AutoRefdes::Upright && needs_upright_flip(pl.rot_deg, pl.side) {
+        let world_center = local_to_board(text_center, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
+        let eff_rot = pl.rot_deg + 180.0;
+        text_stroke_segments(&pl.refdes, Pt::new(0, 0), 700_000)
+            .into_iter()
+            .map(|(a, b)| {
+                (
+                    local_to_board(a, world_center.x, world_center.y, eff_rot, pl.side),
+                    local_to_board(b, world_center.x, world_center.y, eff_rot, pl.side),
+                )
+            })
+            .collect()
+    } else {
+        text_stroke_segments(&pl.refdes, text_center, 700_000)
+            .into_iter()
+            .map(|(a, b)| {
+                (
+                    local_to_board(a, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side),
+                    local_to_board(b, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side),
+                )
+            })
+            .collect()
+    }
+}
+
 fn point_hits_mask(p: Pt, radius: Nm, openings: &[ResolvedShape], clr: Nm) -> bool {
     let pad = radius + clr;
     let sb = BBoxNm::from_pt(p, pad);
@@ -510,6 +552,8 @@ pub(crate) fn emit_silk_layer(
     board: &BoardIr,
     side: Side,
     mask_openings: &[ResolvedShape],
+    auto_refdes: AutoRefdes,
+    refdes_stroke_nm: Nm,
 ) {
     let clr = board.rules.silk_clearance_nm.max(0);
     let mut raw_segs: Vec<(Pt, Pt, Nm)> = Vec::new();
@@ -552,13 +596,8 @@ pub(crate) fn emit_silk_layer(
                     dot_local, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side,
                 ));
             }
-            if !pl.refdes.is_empty() {
-                let text_center = refdes_local_pos(board, pl);
-                for (a, b) in text_stroke_segments(&pl.refdes, text_center, 700_000) {
-                    let wa = local_to_board(a, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
-                    let wb = local_to_board(b, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
-                    raw_segs.push((wa, wb, 120_000));
-                }
+            for (wa, wb) in refdes_world_segments(board, pl, auto_refdes) {
+                raw_segs.push((wa, wb, refdes_stroke_nm));
             }
         }
     }
