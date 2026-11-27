@@ -2199,3 +2199,201 @@ fn opportunistic_kicad_cli_auto_refdes_off_zero_mismatch_and_zero_silk_drc() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn parse_kicad_net_libparts_maps_pin_electrical_types_and_duplicates() {
+    use boardc::ir::PinType;
+
+    let src = r#"(export
+  (version "D")
+  (components
+    (comp (ref "U1") (value "ALL_TYPES") (footprint "lib:FP")
+      (libsource (lib " draco ") (part " ALL_TYPES "))
+      (sheetpath (names "/") (tstamps "/")) (tstamps "u1"))
+    (comp (ref "U2") (value "LEGACY") (footprint "lib:FP")
+      (libsource (lib "legacy") (part "LEGACY_PART"))
+      (sheetpath (names "/") (tstamps "/")) (tstamps "u2"))
+    (comp (ref "U3") (value "NOLIB") (footprint "lib:FP")
+      (libsource (part "LOCAL_PART"))
+      (sheetpath (names "/") (tstamps "/")) (tstamps "u3"))
+    (comp (ref "U4") (value "AP1117-33") (footprint "lib:FP")
+      (libsource (lib "Regulator") (part "AP1117-33"))
+      (sheetpath (names "/") (tstamps "/")) (tstamps "u4"))
+    (comp (ref "U5") (value "AP1117-50") (footprint "lib:FP")
+      (libsource (lib "Regulator") (part "AP1117-50"))
+      (sheetpath (names "/") (tstamps "/")) (tstamps "u5"))
+  )
+  (libparts
+    (libpart (lib "draco") (part "ALL_TYPES")
+      (pins
+        (pin (num "1") (name "IN") (type "input"))
+        (pin (num "2") (name "OUT") (type "output"))
+        (pin (num "3") (name "IO") (type "bidirectional"))
+        (pin (num "4") (name "TRI") (type "tri_state"))
+        (pin (num "5") (name "PAS") (type "passive"))
+        (pin (num "6") (name "VDD") (type "power_in"))
+        (pin (num "7") (name "VOUT") (type "power_out"))
+        (pin (num "8") (name "OC") (type "open_collector"))
+        (pin (num "9") (name "OD") (type "open_drain"))
+        (pin (num "10") (name "OE") (type "open_emitter"))
+        (pin (num "11") (name "OS") (type "open_source"))
+        (pin (num "12") (name "NC") (type "no_connect"))
+        (pin (num "13") (name "UNSP") (type "unspecified"))
+        (pin (num "14") (name "FREE") (type "free"))
+      ))
+    (libpart (lib "legacy") (part "LEGACY_PART")
+      (pins
+        (pin (num "1") (name "IN") (type "INPUT"))
+        (pin (num "2") (name "BD") (type "BiDi"))
+        (pin (num "3") (name "TS") (type "3state"))
+        (pin (num "4") (name "TS2") (type "TRISTATE"))
+        (pin (num "5") (name "OC") (type "openCol"))
+        (pin (num "6") (name "OE") (type "openEm"))
+        (pin (num "7") (name "OE2") (type "openemitter"))
+        (pin (num "8") (name "NC1") (type "NotConnected"))
+        (pin (num "9") (name "NC2") (type "not_connected"))
+        (pin (num "10") (name "NC3") (type "unconnected"))
+        (pin (num "11") (name "NC4") (type "NC"))
+        (pin (num "12") (name "UN") (type "unspc"))
+        (pin (num "13") (name "S1") (type "passive"))
+        (pin (num "13") (name "S1") (type "power_out"))
+        (pin (num "14") (name "S2") (type "power_out"))
+        (pin (num "14") (name "S2") (type "passive"))
+        (pin (num "15") (name "S3") (type "passive"))
+        (pin (num "15") (name "S3") (type "power_in"))
+        (pin (num "16") (name "S4") (type "passive"))
+        (pin (num "16") (name "S4") (type "output"))
+        (pin (num "17") (name "S5") (type "output"))
+        (pin (num "17") (name "S5") (type "input"))
+        (pin (num "18") (name "S6") (type "unspecified"))
+        (pin (num "18") (name "S6") (type "power_in"))
+      ))
+    (libpart (part "LOCAL_PART")
+      (pins
+        (pin (num "1") (name "A") (type "bidi"))
+      ))
+    (libpart (lib "Regulator") (part "AP1117-15")
+      (aliases
+        (alias "AP1117-33")
+        (alias "AP1117-50"))
+      (pins
+        (pin (num "1") (name "GND") (type "power_in"))
+        (pin (num "2") (name "VO") (type "power_out"))
+      ))
+    (libpart (lib "Regulator") (part "AP1117-50")
+      (pins
+        (pin (num "1") (name "GND") (type "passive"))
+        (pin (num "2") (name "VO") (type "output"))
+      ))
+  )
+)"#;
+
+    let nl = parse_kicad_net(src).expect("parse libparts");
+    assert_eq!(
+        nl.components["U1"].pin_types,
+        BTreeMap::from([
+            ("1".into(), PinType::In),
+            ("2".into(), PinType::Out),
+            ("3".into(), PinType::Bidir),
+            ("4".into(), PinType::Tri),
+            ("5".into(), PinType::Passive),
+            ("6".into(), PinType::PowerIn),
+            ("7".into(), PinType::PowerOut),
+            ("8".into(), PinType::OpenCollector),
+            ("9".into(), PinType::OpenCollector),
+            ("10".into(), PinType::OpenEmitter),
+            ("11".into(), PinType::OpenEmitter),
+            ("12".into(), PinType::Nc),
+            ("14".into(), PinType::Free),
+        ])
+    );
+    assert_eq!(
+        nl.components["U2"].pin_types,
+        BTreeMap::from([
+            ("1".into(), PinType::In),
+            ("2".into(), PinType::Bidir),
+            ("3".into(), PinType::Tri),
+            ("4".into(), PinType::Tri),
+            ("5".into(), PinType::OpenCollector),
+            ("6".into(), PinType::OpenEmitter),
+            ("7".into(), PinType::OpenEmitter),
+            ("8".into(), PinType::Nc),
+            ("9".into(), PinType::Nc),
+            ("10".into(), PinType::Nc),
+            ("11".into(), PinType::Nc),
+            ("13".into(), PinType::PowerOut),
+            ("14".into(), PinType::PowerOut),
+            ("15".into(), PinType::PowerIn),
+            ("16".into(), PinType::Out),
+            ("17".into(), PinType::Out),
+            ("18".into(), PinType::PowerIn),
+        ])
+    );
+    assert_eq!(
+        nl.components["U3"].pin_types,
+        BTreeMap::from([("1".into(), PinType::Bidir)])
+    );
+    assert_eq!(
+        nl.components["U4"].pin_types,
+        BTreeMap::from([
+            ("1".into(), PinType::PowerIn),
+            ("2".into(), PinType::PowerOut)
+        ])
+    );
+    assert_eq!(
+        nl.components["U5"].pin_types,
+        BTreeMap::from([("1".into(), PinType::Passive), ("2".into(), PinType::Out)])
+    );
+}
+
+#[test]
+fn parse_kicad_net_node_pintype_overrides_libparts_and_works_without_libparts() {
+    use boardc::ir::PinType;
+
+    let with_libparts = r#"(export (version "E")
+  (components
+    (comp (ref "U1") (value "MCU") (footprint "lib:FP") (libsource (lib "mcu") (part "MCU_A")))
+  )
+  (libparts
+    (libpart (lib "mcu") (part "MCU_A")
+      (pins
+        (pin (num "1") (name "PA0") (type "input"))
+        (pin (num "2") (name "PA1") (type "power_in"))
+        (pin (num "3") (name "PA2") (type "bidirectional"))
+      ))
+  )
+  (nets
+    (net (code "1") (name "TX")
+      (node (ref "U1") (pin "1") (pintype "output")))
+    (net (code "2") (name "ALT")
+      (node (ref "U1") (pin "2") (pintype "unspecified")))
+    (net (code "3") (name "KEEP")
+      (node (ref "U1") (pin "3")))
+  )
+)"#;
+    let nl1 = parse_kicad_net(with_libparts).expect("parse node pintype overrides");
+    assert_eq!(
+        nl1.components["U1"].pin_types,
+        BTreeMap::from([("1".into(), PinType::Out), ("3".into(), PinType::Bidir)])
+    );
+
+    let minimal_e = r#"(export (version "E")
+  (components
+    (comp (ref "U1") (value "BUF") (footprint "lib:FP"))
+  )
+  (nets
+    (net (code "1") (name "N1")
+      (node (ref "U1") (pin "1") (pintype "open_source"))
+      (node (ref "U1") (pin "2") (pintype "free"))
+      (node (ref "U1") (pin "3") (pintype "unspc")))
+  )
+)"#;
+    let nl2 = parse_kicad_net(minimal_e).expect("parse minimal vE without libparts");
+    assert_eq!(
+        nl2.components["U1"].pin_types,
+        BTreeMap::from([
+            ("1".into(), PinType::OpenEmitter),
+            ("2".into(), PinType::Free),
+        ])
+    );
+}

@@ -177,7 +177,7 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
                 }
                 None => {
                     if let Some(pt) = pin_type
-                        && pt != PinType::Nc
+                        && !matches!(pt, PinType::Nc | PinType::Free)
                     {
                         let pos_nm = transform_pad_local_pt(Pt::new(0, 0), pad, pl);
                         let label = format!("{refdes}.{pin_name}");
@@ -229,6 +229,7 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
         let mut power_outs = Vec::new();
         let mut tris = Vec::new();
         let mut open_collectors = Vec::new();
+        let mut open_emitters = Vec::new();
         let mut ins = Vec::new();
         let mut power_ins = Vec::new();
         let mut has_signal_driver = power_driven;
@@ -252,11 +253,16 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
                     open_collectors.push(p);
                     has_signal_driver = true;
                 }
+                Some(PinType::OpenEmitter) => {
+                    open_emitters.push(p);
+                    has_signal_driver = true;
+                }
                 Some(PinType::Bidir | PinType::Passive) => {
                     has_signal_driver = true;
                 }
                 Some(PinType::In) => ins.push(p),
                 Some(PinType::PowerIn) => power_ins.push(p),
+                Some(PinType::Free) => {}
                 Some(PinType::Nc) => {
                     violations.push(ErcViolation {
                         kind: ErcViolationKind::ConnectedNcPin,
@@ -283,15 +289,18 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
         }
 
         if (!power_outs.is_empty() || power_driven)
-            && (!outs.is_empty() || !tris.is_empty() || !open_collectors.is_empty())
+            && (!outs.is_empty()
+                || !tris.is_empty()
+                || !open_collectors.is_empty()
+                || !open_emitters.is_empty())
         {
             let prefix = if power_outs.is_empty() {
                 format_args!(
-                    "driven output/tri-state/open-collector conflicts with power_driven rail '{net_name}'"
+                    "driven output/tri-state/open-collector/open-emitter conflicts with power_driven rail '{net_name}'"
                 )
             } else {
                 format_args!(
-                    "driven output/tri-state/open-collector conflicts with power_out on net '{net_name}'"
+                    "driven output/tri-state/open-collector/open-emitter conflicts with power_out on net '{net_name}'"
                 )
             };
             push_group(
@@ -304,23 +313,34 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
                     .chain(&outs)
                     .chain(&tris)
                     .chain(&open_collectors)
+                    .chain(&open_emitters)
                     .copied(),
                 prefix,
             );
         } else {
-            // Push-pull out conflicts with open_collector (crowbar short when out drives high and open_collector sinks low).
-            if !outs.is_empty() && (outs.len() >= 2 || !open_collectors.is_empty()) {
-                let prefix = if open_collectors.is_empty() {
+            // Push-pull out conflicts with open_collector/open_emitter; open_collector conflicts with open_emitter (crowbar short).
+            let has_out_conflict = outs.len() >= 2
+                || (!outs.is_empty() && (!open_collectors.is_empty() || !open_emitters.is_empty()))
+                || (!open_collectors.is_empty() && !open_emitters.is_empty());
+            if has_out_conflict {
+                let prefix = if open_collectors.is_empty() && open_emitters.is_empty() {
                     format_args!("multiple out pins on net '{net_name}'")
+                } else if outs.is_empty() {
+                    format_args!("open_collector conflicts with open_emitter on net '{net_name}'")
                 } else {
-                    format_args!("driven out pin conflicts with open_collector on net '{net_name}'")
+                    format_args!(
+                        "driven out pin conflicts with open-collector/open-emitter on net '{net_name}'"
+                    )
                 };
                 push_group(
                     &mut violations,
                     ErcViolationKind::OutputConflict,
                     Severity::Error,
                     net_name,
-                    outs.iter().chain(&open_collectors).copied(),
+                    outs.iter()
+                        .chain(&open_collectors)
+                        .chain(&open_emitters)
+                        .copied(),
                     prefix,
                 );
             }
