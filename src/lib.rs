@@ -34,6 +34,7 @@ pub mod route;
 mod route_bridge;
 pub mod shapes;
 pub mod spec;
+mod spec_kicad;
 pub mod svg;
 pub mod verify;
 mod verify_excellon;

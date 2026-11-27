@@ -5,6 +5,7 @@ use crate::geom::remap_layer_for_side;
 use crate::ir::{
     BoardIr, Graphic, Keepout, Nm, PadDef, PadKind, PadShape, Placement, Pt, Side, nm_to_mm,
 };
+use crate::kicad_geom::is_ignored_kicad_field;
 
 pub(crate) struct UuidGen(pub(crate) u64);
 
@@ -21,11 +22,23 @@ pub(crate) fn esc(s: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
-            '\n' | '\r' => out.push(' '),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
             _ => out.push(c),
         }
     }
     out
+}
+
+fn write_fp_property(out: &mut String, key: &str, val: &str, fab_layer: &str, uuids: &mut UuidGen) {
+    let _ = writeln!(
+        out,
+        "\t\t(property \"{}\" \"{}\" (at 0 0 0) (layer \"{fab_layer}\") (hide yes) (uuid \"{}\") (effects (font (size 1 1) (thickness 0.15))))",
+        esc(key),
+        esc(val),
+        uuids.next()
+    );
 }
 
 fn kicad_layer_name(layer: &str) -> &str {
@@ -377,18 +390,27 @@ pub(crate) fn write_footprint(
     };
     let has_tht = fp.pads.iter().any(|p| p.kind == PadKind::Tht);
     let has_smd = fp.pads.iter().any(|p| p.kind == PadKind::Smd);
-    let attr = if has_tht {
-        "through_hole"
+    let has_sch_path = pl
+        .schematic
+        .as_ref()
+        .and_then(|s| s.path.as_deref())
+        .is_some_and(|p| !p.trim().is_empty());
+    // Schematic-linked padless/NPTH footprints (e.g. MountingHole) must omit `board_only` for parity.
+    let attr_type = if has_tht {
+        Some("through_hole")
     } else if has_smd {
-        "smd"
+        Some("smd")
+    } else if has_sch_path {
+        None
     } else {
-        "board_only"
+        Some("board_only")
     };
 
     let fp_id = pl
         .schematic
         .as_ref()
         .and_then(|s| s.footprint.as_deref())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(&fp.name);
     let _ = writeln!(out, "\t(footprint \"{}\"", esc(fp_id));
@@ -401,55 +423,41 @@ pub(crate) fn write_footprint(
         nm_to_mm(-pl.pos.y),
         pl.rot_deg.rem_euclid(360.0)
     );
-    let _ = writeln!(
-        out,
-        "\t\t(property \"Reference\" \"{}\" (at 0 0 0) (layer \"{fab_layer}\") (hide yes) (uuid \"{}\") (effects (font (size 1 1) (thickness 0.15))))",
-        esc(&pl.refdes),
-        uuids.next()
-    );
-    let _ = writeln!(
-        out,
-        "\t\t(property \"Value\" \"{}\" (at 0 0 0) (layer \"{fab_layer}\") (hide yes) (uuid \"{}\") (effects (font (size 1 1) (thickness 0.15))))",
-        esc(&pl.value),
-        uuids.next()
-    );
+    write_fp_property(out, "Reference", &pl.refdes, fab_layer, uuids);
+    write_fp_property(out, "Value", &pl.value, fab_layer, uuids);
     if let Some(sch) = &pl.schematic {
         for (k, v) in &sch.fields {
-            if matches!(
-                k.as_str(),
-                "Reference" | "Value" | "Footprint" | "Sheetname" | "Sheetfile"
-            ) {
+            if is_ignored_kicad_field(k) || v.is_empty() || (k == "Datasheet" && v == "~") {
                 continue;
             }
-            let _ = writeln!(
-                out,
-                "\t\t(property \"{}\" \"{}\" (at 0 0 0) (layer \"{fab_layer}\") (hide yes) (uuid \"{}\") (effects (font (size 1 1) (thickness 0.15))))",
-                esc(k),
-                esc(v),
-                uuids.next()
-            );
+            write_fp_property(out, k, v, fab_layer, uuids);
         }
-        if let Some(path) = sch.path.as_deref().filter(|s| !s.is_empty()) {
-            let _ = writeln!(out, "\t\t(path \"{}\")", esc(path));
-        }
-        if let Some(sheetname) = sch.sheetname.as_deref().filter(|s| !s.is_empty()) {
-            let _ = writeln!(out, "\t\t(sheetname \"{}\")", esc(sheetname));
-        }
-        if let Some(sheetfile) = sch.sheetfile.as_deref().filter(|s| !s.is_empty()) {
-            let _ = writeln!(out, "\t\t(sheetfile \"{}\")", esc(sheetfile));
+        for (tag, val) in [
+            ("path", sch.path.as_deref()),
+            ("sheetname", sch.sheetname.as_deref()),
+            ("sheetfile", sch.sheetfile.as_deref()),
+        ] {
+            if let Some(v) = val.map(str::trim).filter(|s| !s.is_empty()) {
+                let _ = writeln!(out, "\t\t({tag} \"{}\")", esc(v));
+            }
         }
     }
-    let _ = write!(out, "\t\t(attr {attr}");
+    let mut attr_tokens: Vec<&str> = Vec::with_capacity(4);
+    if let Some(t) = attr_type {
+        attr_tokens.push(t);
+    }
     if pl.exclude_from_pos {
-        out.push_str(" exclude_from_pos_files");
+        attr_tokens.push("exclude_from_pos_files");
     }
     if pl.exclude_from_bom {
-        out.push_str(" exclude_from_bom");
+        attr_tokens.push("exclude_from_bom");
     }
     if pl.dnp {
-        out.push_str(" dnp");
+        attr_tokens.push("dnp");
     }
-    out.push_str(")\n");
+    if !attr_tokens.is_empty() {
+        let _ = writeln!(out, "\t\t(attr {})", attr_tokens.join(" "));
+    }
 
     for g in &fp.graphics {
         let layer = g.layer();

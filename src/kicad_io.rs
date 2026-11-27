@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use clipper2_rust::{FillRule, union_subjects_64};
-use viahop::sexp::{self, SExp};
+use viahop::sexp::SExp;
 
 use crate::geom::{ensure_ccw, polygon_area, remap_layer_for_side};
 use crate::ir::{
@@ -13,7 +13,8 @@ use crate::ir::{
 };
 use crate::kicad_geom::{
     atom_at, chain_segments, child_atom, collect_poly_or_segment, f64_at, parse_at, parse_fill,
-    parse_graphic_node, parse_layers_list, parse_net_ref, parse_pt, parse_pts, parse_stroke_width,
+    parse_graphic_node, parse_kicad_sexp, parse_layers_list, parse_net_ref, parse_pt, parse_pts,
+    parse_stroke_width,
 };
 pub use crate::kicad_net::{
     KicadNetlist, NetlistComponent, NetlistNet, load_kicad_net, parse_kicad_net,
@@ -30,7 +31,7 @@ pub fn load_kicad_mod(path: &Path) -> Result<FootprintDef, String> {
 
 /// Parses `.kicad_mod` S-expression text into canonical Y-up `FootprintDef`.
 pub fn parse_kicad_mod(src: &str) -> Result<FootprintDef, String> {
-    let root = sexp::parse(src)?;
+    let root = parse_kicad_sexp(src)?;
     let tag = root
         .tag()
         .ok_or("expected S-expression list in .kicad_mod")?;

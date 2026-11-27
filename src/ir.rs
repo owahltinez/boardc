@@ -396,10 +396,19 @@ pub struct SchematicMeta {
 
 impl SchematicMeta {
     pub fn is_empty(&self) -> bool {
-        self.path.is_none()
-            && self.sheetname.is_none()
-            && self.sheetfile.is_none()
-            && self.footprint.is_none()
+        self.path.as_deref().is_none_or(|s| s.trim().is_empty())
+            && self
+                .sheetname
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+            && self
+                .sheetfile
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+            && self
+                .footprint
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
             && self.fields.is_empty()
     }
 }

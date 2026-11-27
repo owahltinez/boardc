@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
-use viahop::sexp::{self, SExp};
+use viahop::sexp::SExp;
 
 use crate::geom::{ensure_ccw, local_to_board, polygon_area};
 use crate::ir::{
@@ -11,8 +11,9 @@ use crate::ir::{
     default_net_class, default_two_layer_stackup, mm,
 };
 use crate::kicad_geom::{
-    atom_at, chain_segments, child_atom, collect_poly_or_segment, discretize_arc, f64_at, has_flag,
-    parse_at, parse_graphic_node, parse_layers_list, parse_net_ref, parse_pt, parse_pts,
+    atom_at, chain_segments, child_atom, collect_poly_or_segment, discretize_arc, f64_at,
+    find_field_ci, has_flag, insert_kicad_field, normalize_sheetname, parse_at, parse_graphic_node,
+    parse_kicad_sexp, parse_layers_list, parse_net_ref, parse_pt, parse_pts,
 };
 use crate::kicad_io::{parse_footprint_node, parse_keepout_zone};
 use crate::kicad_pro::parse_kicad_pro;
@@ -49,7 +50,7 @@ pub(crate) fn import_kicad_pcb(
 }
 
 pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<BoardIr, String> {
-    let root = sexp::parse(src)?;
+    let root = parse_kicad_sexp(src)?;
     if root.tag() != Some("kicad_pcb") {
         return Err("expected top-level '(kicad_pcb ...)'".into());
     }
@@ -593,43 +594,35 @@ fn parse_placed_footprint(
     }
 
     let path = child_atom(node, "path")
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let sheetname = child_atom(node, "sheetname")
+    let mut sheetname = child_atom(node, "sheetname")
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| parse_footprint_prop(node, "Sheetname", "").filter(|s| !s.is_empty()));
-    let sheetfile = child_atom(node, "sheetfile")
+        .map(str::to_string);
+    let mut sheetfile = child_atom(node, "sheetfile")
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| parse_footprint_prop(node, "Sheetfile", "").filter(|s| !s.is_empty()));
+        .map(str::to_string);
     let mut fields = BTreeMap::new();
     for prop in node.children_with_tag("property") {
         let Some(k) = atom_at(prop, 1).filter(|s| !s.is_empty()) else {
             continue;
         };
-        if matches!(
-            k,
-            "Reference" | "Value" | "Footprint" | "Sheetname" | "Sheetfile"
-        ) || k.starts_with("ki_")
-        {
+        let Some(v) = atom_at(prop, 2).filter(|s| !s.is_empty()) else {
             continue;
-        }
-        if let Some(v) = atom_at(prop, 2).filter(|s| !s.is_empty()) {
-            if k == "Datasheet" && v == "~" {
-                continue;
-            }
-            fields.insert(k.to_string(), v.to_string());
+        };
+        if k == "Sheetname" && sheetname.is_none() && !v.trim().is_empty() {
+            sheetname = Some(normalize_sheetname(v));
+        } else if k == "Sheetfile" && sheetfile.is_none() && !v.trim().is_empty() {
+            sheetfile = Some(v.trim().to_string());
+        } else {
+            insert_kicad_field(&mut fields, k, v);
         }
     }
-    let mpn = fields
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("mpn"))
-        .map(|(_, v)| v.clone());
-    let lcsc = fields
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("lcsc"))
-        .map(|(_, v)| v.clone());
+    let mpn = find_field_ci(&fields, "mpn");
+    let lcsc = find_field_ci(&fields, "lcsc");
     let has_sch = path.is_some()
         || sheetname.is_some()
         || sheetfile.is_some()

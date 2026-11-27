@@ -431,8 +431,10 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
 /// Renders a matching KiCad `.kicad_pro` JSON file carrying exact `DesignRules` and `NetClass` rules.
 pub fn render_kicad_pro(board: &BoardIr) -> String {
     let r = &board.rules;
+    let mut defined_classes: HashSet<&str> = HashSet::new();
     let mut classes = Vec::new();
     if !board.net_classes.contains_key("Default") {
+        defined_classes.insert("Default");
         classes.push(json!({
             "name": "Default",
             "clearance": nm_to_mm(r.clearance_nm),
@@ -442,6 +444,7 @@ pub fn render_kicad_pro(board: &BoardIr) -> String {
         }));
     }
     for nc in board.net_classes.values() {
+        defined_classes.insert(nc.name.as_str());
         classes.push(json!({
             "name": nc.name,
             "clearance": nm_to_mm(nc.clearance_nm),
@@ -454,7 +457,18 @@ pub fn render_kicad_pro(board: &BoardIr) -> String {
     }
     let mut assignments = serde_json::Map::new();
     for (net_name, nd) in &board.nets {
-        assignments.insert(net_name.clone(), json!([nd.class]));
+        let cls = nd.class.trim();
+        let class_name = if cls.is_empty() { "Default" } else { cls };
+        if defined_classes.insert(class_name) {
+            classes.push(json!({
+                "name": class_name,
+                "clearance": nm_to_mm(r.clearance_nm),
+                "track_width": nm_to_mm(r.track_width_nm),
+                "via_diameter": nm_to_mm(r.via_dia_nm),
+                "via_drill": nm_to_mm(r.via_drill_nm),
+            }));
+        }
+        assignments.insert(net_name.clone(), json!([class_name]));
     }
     let doc = json!({
         "meta": { "filename": format!("{}.kicad_pro", board.name), "version": 1 },
