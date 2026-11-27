@@ -7,7 +7,7 @@ use std::time::Instant;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::drc::{DrcReport, check_board_drc};
+use crate::drc::{DrcReport, Severity, check_board_drc};
 use crate::erc::ErcViolation;
 use crate::fab::{FabOptions, export_fab};
 use crate::geom::point_in_polygon;
@@ -639,8 +639,13 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
         }
     }
 
+    let erc_ok = !preflight
+        .erc_violations
+        .iter()
+        .any(|v| v.severity == Severity::Error);
     let ok = place_report.as_ref().is_none_or(|p| p.ok)
         && pv_report.ok
+        && erc_ok
         && route_summary.unconnected_pairs == 0
         && zone_report.chokes.is_empty()
         && drc_report.passed;

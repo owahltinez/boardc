@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -43,52 +44,102 @@ pub struct ErcReport {
     pub typed_pins: usize,
 }
 
-struct LogicalPin<'a> {
+struct LogicalPin {
     label: String,
     pin_type: Option<PinType>,
     pos_nm: Pt,
-    _refdes: &'a str,
 }
 
-fn is_kicad_unconnected_net(net: &str) -> bool {
-    net.starts_with("unconnected-(")
-}
-
-fn pin_labels(pins: &[&LogicalPin<'_>]) -> Vec<String> {
-    let mut out: Vec<String> = pins.iter().map(|p| p.label.clone()).collect();
-    out.sort();
-    out
+fn push_group<'a>(
+    violations: &mut Vec<ErcViolation>,
+    kind: ErcViolationKind,
+    severity: Severity,
+    net: &str,
+    pins: impl IntoIterator<Item = &'a LogicalPin>,
+    prefix: fmt::Arguments<'_>,
+) {
+    let mut ordered: Vec<&LogicalPin> = pins.into_iter().collect();
+    ordered.sort_by(|a, b| {
+        a.label
+            .cmp(&b.label)
+            .then_with(|| (a.pos_nm.x, a.pos_nm.y).cmp(&(b.pos_nm.x, b.pos_nm.y)))
+    });
+    let Some(first) = ordered.first() else {
+        return;
+    };
+    let pos_nm = first.pos_nm;
+    let labels: Vec<String> = ordered.into_iter().map(|p| p.label.clone()).collect();
+    let message = format!("{prefix}: {}", labels.join(", "));
+    violations.push(ErcViolation {
+        kind,
+        severity,
+        net: net.to_string(),
+        pins: labels,
+        pos_nm,
+        message,
+    });
 }
 
 /// Runs native electrical rules checks across nets and optional footprint/placement pin types.
 pub fn check_board_erc(board: &BoardIr) -> ErcReport {
     let mut violations = Vec::new();
-    let mut net_pins: BTreeMap<&str, Vec<LogicalPin<'_>>> = BTreeMap::new();
+    let mut net_pins: BTreeMap<&str, Vec<LogicalPin>> = BTreeMap::new();
+    let mut physical_net_pins: HashMap<&str, usize> = HashMap::new();
     let mut typed_pins = 0usize;
 
-    for pl in &board.placements {
-        if pl.dnp {
+    // Fallback pin-to-net index from board.nets so direct BoardIr JSON without mirrored pin_nets still works.
+    let mut net_def_pins: HashMap<(&str, &str), &str> = HashMap::new();
+    for (net_name, nd) in &board.nets {
+        if net_name.is_empty() || net_name.starts_with("unconnected-(") {
             continue;
         }
+        for (refdes, pin) in &nd.pins {
+            net_def_pins
+                .entry((refdes.as_str(), pin.as_str()))
+                .or_insert(net_name.as_str());
+        }
+    }
+
+    let copper_nets: HashSet<&str> = board
+        .pours
+        .iter()
+        .map(|p| p.net.as_str())
+        .chain(board.filled_pours.iter().map(|p| p.net.as_str()))
+        .chain(board.tracks.iter().map(|t| t.net.as_str()))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for pl in &board.placements {
         let Some(fp) = board.footprints.get(&pl.footprint) else {
             continue;
         };
-        // Deduplicate multiple physical copper pads sharing a pin name into one logical pin.
-        let mut logical_pads: BTreeMap<&str, Pt> = BTreeMap::new();
-        for pad in &fp.pads {
-            if pad.kind == PadKind::Npth {
-                continue;
-            }
-            let pin_name = pad.name.trim();
-            if pin_name.is_empty() {
-                continue;
-            }
-            logical_pads
-                .entry(pin_name)
-                .or_insert_with(|| transform_pad_local_pt(Pt::new(0, 0), pad, pl));
-        }
+        let refdes = if pl.refdes.trim().is_empty() {
+            "<unnamed>"
+        } else {
+            pl.refdes.as_str()
+        };
+        let mut seen_pins: HashSet<&str> = HashSet::new();
 
-        for (pin_name, pos_nm) in logical_pads {
+        for pad in &fp.pads {
+            if pad.kind == PadKind::Npth || pad.name.is_empty() || !seen_pins.insert(&pad.name) {
+                continue;
+            }
+            let pin_name = pad.name.as_str();
+            let net = pl
+                .pin_nets
+                .get(pin_name)
+                .map(String::as_str)
+                .or_else(|| net_def_pins.get(&(pl.refdes.as_str(), pin_name)).copied())
+                .filter(|s| !s.is_empty() && !s.starts_with("unconnected-("));
+
+            // Count DNP pads physically (avoiding false single-pin nets) but skip them in electrical checks.
+            if let Some(net_name) = net {
+                *physical_net_pins.entry(net_name).or_insert(0) += 1;
+            }
+            if pl.dnp {
+                continue;
+            }
+
             let pin_type = pl
                 .pin_types
                 .get(pin_name)
@@ -97,21 +148,11 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
             if pin_type.is_some() {
                 typed_pins += 1;
             }
-            let net = pl
-                .pin_nets
-                .get(pin_name)
-                .map(String::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let label = if pl.refdes.trim().is_empty() {
-                format!("<unnamed>.{pin_name}")
-            } else {
-                format!("{}.{pin_name}", pl.refdes)
-            };
 
             match net {
-                Some(net_name) if is_kicad_unconnected_net(net_name) => {}
                 Some(net_name) => {
+                    let pos_nm = transform_pad_local_pt(Pt::new(0, 0), pad, pl);
+                    let label = format!("{refdes}.{pin_name}");
                     if pin_type == Some(PinType::Nc) {
                         violations.push(ErcViolation {
                             kind: ErcViolationKind::ConnectedNcPin,
@@ -126,20 +167,22 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
                         label,
                         pin_type,
                         pos_nm,
-                        _refdes: &pl.refdes,
                     });
                 }
                 None => {
                     if let Some(pt) = pin_type
                         && pt != PinType::Nc
                     {
+                        let pos_nm = transform_pad_local_pt(Pt::new(0, 0), pad, pl);
+                        let label = format!("{refdes}.{pin_name}");
+                        let message = format!("unconnected {} pin {label}", pt.as_str());
                         violations.push(ErcViolation {
                             kind: ErcViolationKind::UnconnectedPin,
                             severity: Severity::Error,
                             net: String::new(),
-                            pins: vec![label.clone()],
+                            pins: vec![label],
                             pos_nm,
-                            message: format!("unconnected {} pin {label}", pt.as_str()),
+                            message,
                         });
                     }
                 }
@@ -149,7 +192,11 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
 
     let checked_nets = net_pins.len();
     for (net_name, pins) in &net_pins {
-        if pins.len() == 1 && pins[0].pin_type != Some(PinType::Nc) {
+        if pins.len() == 1
+            && physical_net_pins.get(net_name).copied().unwrap_or(0) == 1
+            && !copper_nets.contains(net_name)
+            && pins[0].pin_type != Some(PinType::Nc)
+        {
             let p = &pins[0];
             violations.push(ErcViolation {
                 kind: ErcViolationKind::SinglePinNet,
@@ -161,136 +208,123 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
             });
         }
 
-        let outs: Vec<&LogicalPin<'_>> = pins
-            .iter()
-            .filter(|p| p.pin_type == Some(PinType::Out))
-            .collect();
-        let power_outs: Vec<&LogicalPin<'_>> = pins
-            .iter()
-            .filter(|p| p.pin_type == Some(PinType::PowerOut))
-            .collect();
-        let tris: Vec<&LogicalPin<'_>> = pins
-            .iter()
-            .filter(|p| p.pin_type == Some(PinType::Tri))
-            .collect();
-        let ins: Vec<&LogicalPin<'_>> = pins
-            .iter()
-            .filter(|p| p.pin_type == Some(PinType::In))
-            .collect();
-        let power_ins: Vec<&LogicalPin<'_>> = pins
-            .iter()
-            .filter(|p| p.pin_type == Some(PinType::PowerIn))
-            .collect();
+        let mut outs = Vec::new();
+        let mut power_outs = Vec::new();
+        let mut tris = Vec::new();
+        let mut ins = Vec::new();
+        let mut power_ins = Vec::new();
+        let mut has_signal_driver = false;
+        let mut has_untyped = false;
+
+        for p in pins {
+            match p.pin_type {
+                Some(PinType::Out) => {
+                    outs.push(p);
+                    has_signal_driver = true;
+                }
+                Some(PinType::PowerOut) => {
+                    power_outs.push(p);
+                    has_signal_driver = true;
+                }
+                Some(PinType::Tri) => {
+                    tris.push(p);
+                    has_signal_driver = true;
+                }
+                Some(PinType::Bidir | PinType::Passive) => {
+                    has_signal_driver = true;
+                }
+                Some(PinType::In) => ins.push(p),
+                Some(PinType::PowerIn) => power_ins.push(p),
+                Some(PinType::Nc) => {}
+                None => has_untyped = true,
+            }
+        }
 
         if power_outs.len() >= 2 {
-            let labels = pin_labels(&power_outs);
-            violations.push(ErcViolation {
-                kind: ErcViolationKind::PowerOutputConflict,
-                severity: Severity::Error,
-                net: (*net_name).to_string(),
-                pos_nm: power_outs[0].pos_nm,
-                message: format!(
-                    "multiple power_out pins on net '{net_name}': {}",
-                    labels.join(", ")
-                ),
-                pins: labels,
-            });
-        }
-        if outs.len() >= 2 {
-            let labels = pin_labels(&outs);
-            violations.push(ErcViolation {
-                kind: ErcViolationKind::OutputConflict,
-                severity: Severity::Error,
-                net: (*net_name).to_string(),
-                pos_nm: outs[0].pos_nm,
-                message: format!(
-                    "multiple out pins on net '{net_name}': {}",
-                    labels.join(", ")
-                ),
-                pins: labels,
-            });
-        }
-        if !outs.is_empty() && !power_outs.is_empty() {
-            let mut both = outs.clone();
-            both.extend_from_slice(&power_outs);
-            let labels = pin_labels(&both);
-            violations.push(ErcViolation {
-                kind: ErcViolationKind::OutputConflict,
-                severity: Severity::Error,
-                net: (*net_name).to_string(),
-                pos_nm: outs[0].pos_nm,
-                message: format!(
-                    "out and power_out pins conflict on net '{net_name}': {}",
-                    labels.join(", ")
-                ),
-                pins: labels,
-            });
-        }
-        if !tris.is_empty() && (!outs.is_empty() || !power_outs.is_empty()) {
-            let mut mixed = outs.clone();
-            mixed.extend_from_slice(&power_outs);
-            mixed.extend_from_slice(&tris);
-            let labels = pin_labels(&mixed);
-            violations.push(ErcViolation {
-                kind: ErcViolationKind::OutputTriStateConflict,
-                severity: Severity::Warning,
-                net: (*net_name).to_string(),
-                pos_nm: tris[0].pos_nm,
-                message: format!(
-                    "tri-state pin shares net '{net_name}' with driven output: {}",
-                    labels.join(", ")
-                ),
-                pins: labels,
-            });
+            push_group(
+                &mut violations,
+                ErcViolationKind::PowerOutputConflict,
+                Severity::Error,
+                net_name,
+                power_outs.iter().copied(),
+                format_args!("multiple power_out pins on net '{net_name}'"),
+            );
         }
 
-        let has_signal_driver = pins.iter().any(|p| {
-            matches!(
-                p.pin_type,
-                Some(
-                    PinType::Out
-                        | PinType::Bidir
-                        | PinType::Tri
-                        | PinType::PowerOut
-                        | PinType::Passive
-                )
-            )
-        });
-        if !ins.is_empty() && !has_signal_driver {
-            let labels = pin_labels(&ins);
-            violations.push(ErcViolation {
-                kind: ErcViolationKind::UndrivenInput,
-                severity: Severity::Error,
-                net: (*net_name).to_string(),
-                pos_nm: ins[0].pos_nm,
-                message: format!(
-                    "undriven in pin(s) on net '{net_name}': {}",
-                    labels.join(", ")
+        if !power_outs.is_empty() && (!outs.is_empty() || !tris.is_empty()) {
+            push_group(
+                &mut violations,
+                ErcViolationKind::OutputConflict,
+                Severity::Error,
+                net_name,
+                power_outs.iter().chain(&outs).chain(&tris).copied(),
+                format_args!(
+                    "driven output/tri-state conflicts with power_out on net '{net_name}'"
                 ),
-                pins: labels,
-            });
+            );
+        } else {
+            if outs.len() >= 2 {
+                push_group(
+                    &mut violations,
+                    ErcViolationKind::OutputConflict,
+                    Severity::Error,
+                    net_name,
+                    outs.iter().copied(),
+                    format_args!("multiple out pins on net '{net_name}'"),
+                );
+            }
+            if !outs.is_empty() && !tris.is_empty() {
+                push_group(
+                    &mut violations,
+                    ErcViolationKind::OutputTriStateConflict,
+                    Severity::Warning,
+                    net_name,
+                    outs.iter().chain(&tris).copied(),
+                    format_args!("tri-state pin shares net '{net_name}' with driven output"),
+                );
+            }
         }
 
-        if !power_ins.is_empty() && power_outs.is_empty() {
-            let labels = pin_labels(&power_ins);
-            violations.push(ErcViolation {
-                kind: ErcViolationKind::UndrivenPowerInput,
-                severity: Severity::Error,
-                net: (*net_name).to_string(),
-                pos_nm: power_ins[0].pos_nm,
-                message: format!(
-                    "undriven power_in pin(s) on net '{net_name}': {}",
-                    labels.join(", ")
-                ),
-                pins: labels,
-            });
+        // Suppress undriven errors when unannotated pins share the net (partial pin_types adoption).
+        if !has_untyped && !ins.is_empty() && !has_signal_driver {
+            push_group(
+                &mut violations,
+                ErcViolationKind::UndrivenInput,
+                Severity::Error,
+                net_name,
+                ins.iter().copied(),
+                format_args!("undriven in pin(s) on net '{net_name}'"),
+            );
+        }
+        if !has_untyped && !power_ins.is_empty() && power_outs.is_empty() {
+            push_group(
+                &mut violations,
+                ErcViolationKind::UndrivenPowerInput,
+                Severity::Error,
+                net_name,
+                power_ins.iter().copied(),
+                format_args!("undriven power_in pin(s) on net '{net_name}'"),
+            );
         }
     }
 
     violations.sort_by(|a, b| {
-        (a.severity, a.kind, a.net.as_str(), a.pos_nm.x, a.pos_nm.y)
-            .cmp(&(b.severity, b.kind, b.net.as_str(), b.pos_nm.x, b.pos_nm.y))
-            .then_with(|| a.pins.cmp(&b.pins))
+        (
+            a.severity,
+            a.kind,
+            a.net.as_str(),
+            a.pins.as_slice(),
+            a.pos_nm.x,
+            a.pos_nm.y,
+        )
+            .cmp(&(
+                b.severity,
+                b.kind,
+                b.net.as_str(),
+                b.pins.as_slice(),
+                b.pos_nm.x,
+                b.pos_nm.y,
+            ))
     });
     let error_count = violations
         .iter()

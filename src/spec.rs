@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::footprints;
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FootprintDef, Graphic, Keepout, LayerDef, NetClass, NetDef,
-    Nm, PadDef, PinType, Placement, PourSpec, Pt, Stackup, Track, Via, default_two_layer_stackup,
+    Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup, Track, Via,
+    default_two_layer_stackup,
 };
 use crate::kicad_io::load_kicad_net;
 use crate::spec_kicad::{
@@ -75,18 +76,25 @@ fn deserialize_footprints<'de, D: serde::Deserializer<'de>>(
     let raw = BTreeMap::<String, serde_json::Value>::deserialize(de)?;
     let mut out = BTreeMap::new();
     for (name, mut val) in raw {
-        if let Some(map) = val.as_object_mut()
-            && !map.contains_key("kind")
-            && map.contains_key("pin_types")
-        {
-            if map.len() > 1 {
+        if let Some(map) = val.as_object_mut() {
+            if !map.contains_key("kind") && map.contains_key("pin_types") {
+                if map.len() > 1 {
+                    return Err(serde::de::Error::custom(format!(
+                        "footprint '{name}' missing 'kind' field"
+                    )));
+                }
+                map.insert("kind".into(), serde_json::Value::String("lib".into()));
+            }
+            if map.get("kind").and_then(|v| v.as_str()) == Some("lib")
+                && map.keys().any(|k| k != "kind" && k != "pin_types")
+            {
                 return Err(serde::de::Error::custom(format!(
-                    "footprint '{name}' missing 'kind' field"
+                    "footprint '{name}' with kind='lib' only accepts 'pin_types'"
                 )));
             }
-            map.insert("kind".into(), serde_json::Value::String("lib".into()));
         }
-        let fp: FootprintSpec = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
+        let fp: FootprintSpec = serde_json::from_value(val)
+            .map_err(|e| serde::de::Error::custom(format!("footprint '{name}': {e}")))?;
         out.insert(name, fp);
     }
     Ok(out)
@@ -133,7 +141,7 @@ impl FootprintSpec {
                 pin_types,
             } => (
                 FootprintDef {
-                    name: name.to_string(),
+                    name: String::new(),
                     pads: pads.clone(),
                     courtyard: courtyard.clone(),
                     graphics: graphics.clone(),
@@ -155,26 +163,50 @@ impl FootprintSpec {
     }
 }
 
-fn validate_pin_types_for_footprint(
-    owner: &str,
+pub(crate) fn validate_pin_types_for_footprint(
+    owner_kind: &str,
+    owner_name: &str,
     fp: &FootprintDef,
     pin_types: &BTreeMap<String, PinType>,
 ) -> Result<(), String> {
-    if pin_types.is_empty() || fp.pads.is_empty() {
+    if pin_types.is_empty() {
         return Ok(());
     }
     let known: HashSet<&str> = fp
         .pads
         .iter()
-        .map(|p| p.name.trim())
-        .filter(|s| !s.is_empty())
+        .filter(|p| p.kind != PadKind::Npth && !p.name.is_empty())
+        .map(|p| p.name.as_str())
         .collect();
     for pin in pin_types.keys() {
-        if !known.contains(pin.trim()) {
+        if !known.contains(pin.as_str()) {
             return Err(format!(
-                "{owner} pin_types references unknown pin '{pin}' on footprint '{}'",
+                "{owner_kind} '{owner_name}' pin_types references unknown electrical pin '{pin}' on footprint '{}'",
                 fp.name
             ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
+    for (name, fp) in &ir.footprints {
+        validate_pin_types_for_footprint("footprint", name, fp, &fp.pin_types)
+            .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
+    }
+    for p in &ir.placements {
+        if p.footprint.trim().is_empty() {
+            return Err(format!(
+                "board IR '{}' placement '{}' has empty footprint",
+                path.display(),
+                p.refdes
+            ));
+        }
+        if !p.pin_types.is_empty()
+            && let Some(fp) = ir.footprints.get(&p.footprint)
+        {
+            validate_pin_types_for_footprint("placement", &p.refdes, fp, &p.pin_types)
+                .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
         }
     }
     Ok(())
@@ -256,20 +288,14 @@ impl BoardIr {
         };
 
         let mut footprints = BTreeMap::new();
-        let mut lib_pin_overlays: HashMap<&str, &BTreeMap<String, PinType>> = HashMap::new();
         for (name, fp_spec) in &spec.footprints {
-            if let FootprintSpec::Lib { pin_types } = fp_spec {
-                lib_pin_overlays.insert(name.as_str(), pin_types);
-            } else {
+            if !matches!(fp_spec, FootprintSpec::Lib { .. }) {
                 let fp = fp_spec.resolve(name)?;
-                validate_pin_types_for_footprint(
-                    &format!("footprint '{name}'"),
-                    &fp,
-                    &fp.pin_types,
-                )?;
+                validate_pin_types_for_footprint("footprint", name, &fp, &fp.pin_types)?;
                 footprints.insert(name.clone(), fp);
             }
         }
+        let mut matched_overlays: HashSet<&str> = HashSet::new();
         let mut placements = spec.placements.clone();
         let mut seen_refs = HashSet::with_capacity(placements.len());
         for p in &placements {
@@ -297,13 +323,24 @@ impl BoardIr {
                 if let Some(mut fp) =
                     resolve_footprint_from_libs(&p.footprint, qual_fallback, &resolved_libs)?
                 {
-                    if let Some(&overlay) = lib_pin_overlays
-                        .get(p.footprint.as_str())
-                        .or_else(|| lib_pin_overlays.get(bare_footprint_name(&p.footprint)))
-                    {
-                        fp.pin_types = overlay.clone();
+                    if let Some((key, pin_types)) = [
+                        Some(p.footprint.as_str()),
+                        qual_fallback,
+                        Some(bare_footprint_name(&p.footprint)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|k| match spec.footprints.get_key_value(k) {
+                        Some((key, FootprintSpec::Lib { pin_types })) => {
+                            Some((key.as_str(), pin_types))
+                        }
+                        _ => None,
+                    }) {
+                        matched_overlays.insert(key);
+                        fp.pin_types = pin_types.clone();
                         validate_pin_types_for_footprint(
-                            &format!("footprint '{}'", p.footprint),
+                            "footprint",
+                            &p.footprint,
                             &fp,
                             &fp.pin_types,
                         )?;
@@ -318,11 +355,16 @@ impl BoardIr {
             }
             if !p.pin_types.is_empty() {
                 let fp = &footprints[&p.footprint];
-                validate_pin_types_for_footprint(
-                    &format!("placement '{}'", p.refdes),
-                    fp,
-                    &p.pin_types,
-                )?;
+                validate_pin_types_for_footprint("placement", &p.refdes, fp, &p.pin_types)?;
+            }
+        }
+        for (name, fp_spec) in &spec.footprints {
+            if matches!(fp_spec, FootprintSpec::Lib { .. })
+                && !matched_overlays.contains(name.as_str())
+            {
+                return Err(format!(
+                    "footprint '{name}' pin_types overlay did not match any library footprint placement"
+                ));
             }
         }
 
@@ -408,14 +450,6 @@ pub fn load_board_json(path: &Path) -> Result<BoardIr, String> {
         .map_err(|e| format!("failed to read board IR '{}': {e}", path.display()))?;
     let ir: BoardIr = serde_json::from_str(&text)
         .map_err(|e| format!("failed to parse board IR '{}': {e}", path.display()))?;
-    for p in &ir.placements {
-        if p.footprint.trim().is_empty() {
-            return Err(format!(
-                "board IR '{}' placement '{}' has empty footprint",
-                path.display(),
-                p.refdes
-            ));
-        }
-    }
+    validate_board_ir_pins(&ir, path)?;
     Ok(ir)
 }

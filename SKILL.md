@@ -39,7 +39,7 @@ Do not apply KiCad Y-down or millimeter assumptions when editing `BoardSpec` or 
    ```sh
    boardc preflight board.toml --json
    ```
-   Fix hard blockers (`layout_violations`, `zone_chokes`, `sealed_pads`, `blocked_nets`, `fixed_violations`) before spending time on routing.
+   Fix hard blockers (`layout_violations`, `zone_chokes`, `sealed_pads`, `blocked_nets`, `fixed_violations`, `erc_violations`) before spending time on routing.
 
 3. **Compile with stage caching**:
    ```sh

@@ -4,7 +4,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use viahop::run_preflight as viahop_run_preflight;
 
-use crate::drc::{Severity, Violation};
+use crate::drc::Violation;
 use crate::drc_constraints::check_cap_proximity;
 use crate::drc_layout::{check_courtyards_and_component_edges, check_keepouts};
 use crate::drc_rules::check_edge_clearances;
@@ -184,8 +184,7 @@ pub fn run_preflight(
         })
         .collect();
 
-    let erc_violations = check_board_erc(board).violations;
-    let has_erc_errors = erc_violations.iter().any(|v| v.severity == Severity::Error);
+    let erc = check_board_erc(board);
 
     let ok = !vreport.stopped_early
         && layout_violations.is_empty()
@@ -193,7 +192,7 @@ pub fn run_preflight(
         && sealed_pads.is_empty()
         && blocked_nets.is_empty()
         && fixed_violations.is_empty()
-        && !has_erc_errors;
+        && erc.passed;
 
     Ok(PreflightSummary {
         ok,
@@ -208,7 +207,7 @@ pub fn run_preflight(
         sealed_pads,
         blocked_nets,
         fixed_violations,
-        erc_violations,
+        erc_violations: erc.violations,
         elapsed_ms: start.elapsed().as_millis(),
     })
 }
