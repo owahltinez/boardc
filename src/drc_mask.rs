@@ -1,14 +1,19 @@
+use std::borrow::Cow;
+
 use crate::drc::{Violation, ViolationKind};
 use crate::drc_scene::{
     ClearanceHit, PadItem, PourItem, TrackItem, ViaItem, push_clearance_violation,
 };
 use crate::fab_gerber::pad_world_shape_with_margin;
+use crate::fab_silk::push_graphic_mask_shapes;
 use crate::geom::{
     EPS_NM, SpatialGrid, closest_pt_on_segment, pad_world_layers, polys_overlap_area,
+    remap_layer_for_side,
 };
-use crate::ir::{BBoxNm, BoardIr, Nm, PadKind, Pt, Side, same_named_net};
+use crate::ir::{BBoxNm, BoardIr, Graphic, Nm, PadKind, Placement, Pt, Side, same_named_net};
 use crate::shapes::ResolvedShape;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum MaskOwner {
     Pad {
         pad_idx: usize,
@@ -16,10 +21,11 @@ pub(crate) enum MaskOwner {
         mask_only: bool,
     },
     Via(usize),
+    Graphic(usize),
 }
 
 pub(crate) struct MaskOpening<'a> {
-    pub(crate) label: &'a str,
+    pub(crate) label: Cow<'a, str>,
     pub(crate) net: &'a str,
     pub(crate) center: Pt,
     pub(crate) shape: ResolvedShape,
@@ -48,6 +54,7 @@ pub(crate) fn collect_mask_openings<'a>(
     pads: &'a [PadItem],
     vias: &'a [ViaItem],
     side: Side,
+    include_graphics: bool,
 ) -> Vec<MaskOpening<'a>> {
     let mask_name = match side {
         Side::Top => "F.Mask",
@@ -78,7 +85,7 @@ pub(crate) fn collect_mask_openings<'a>(
                     item.net.as_str()
                 };
                 openings.push(MaskOpening {
-                    label: &item.label,
+                    label: Cow::Borrowed(&item.label),
                     net,
                     center: item.center,
                     bbox: shape.bbox(),
@@ -101,13 +108,51 @@ pub(crate) fn collect_mask_openings<'a>(
                     radius: dia / 2,
                 };
                 openings.push(MaskOpening {
-                    label: &item.label,
+                    label: Cow::Borrowed(&item.label),
                     net: &item.net,
                     center: via.pos,
                     bbox: shape.bbox(),
                     shape,
                     owner: MaskOwner::Via(vi),
                 });
+            }
+        }
+    }
+    if include_graphics {
+        let mut graphic_id = 0usize;
+        let mut shapes = Vec::new();
+        let mut push_graphic = |label: String, g: &Graphic, pl: Option<&Placement>| {
+            shapes.clear();
+            push_graphic_mask_shapes(g, pl, &mut shapes);
+            if shapes.is_empty() {
+                return;
+            }
+            let gid = graphic_id;
+            graphic_id += 1;
+            for sh in shapes.drain(..) {
+                openings.push(MaskOpening {
+                    label: Cow::Owned(label.clone()),
+                    net: "",
+                    center: sh.center(),
+                    bbox: sh.bbox(),
+                    shape: sh,
+                    owner: MaskOwner::Graphic(gid),
+                });
+            }
+        };
+        for pl in &board.placements {
+            let Some(fp) = board.footprints.get(&pl.footprint) else {
+                continue;
+            };
+            for (gi, g) in fp.graphics.iter().enumerate() {
+                if remap_layer_for_side(g.layer(), pl.side) == mask_name {
+                    push_graphic(format!("{}.mask#{gi}", pl.refdes), g, Some(pl));
+                }
+            }
+        }
+        for (gi, g) in board.graphics.iter().enumerate() {
+            if g.layer() == mask_name {
+                push_graphic(format!("mask#{gi}"), g, None);
             }
         }
     }
@@ -158,7 +203,7 @@ pub(crate) fn check_mask_to_copper(
         if !cu_layers.iter().any(|l| l == cu_layer) {
             continue;
         }
-        let openings = collect_mask_openings(board, cu_layers, pads, vias, side);
+        let openings = collect_mask_openings(board, cu_layers, pads, vias, side, false);
         if openings.is_empty() {
             continue;
         }
@@ -253,7 +298,7 @@ pub(crate) fn check_mask_to_copper(
                             pos_nm,
                             dist,
                             required_nm: req,
-                            item_a: op.label,
+                            item_a: &op.label,
                             item_b: target.label,
                             net_a: op.net,
                             net_b: target.net,
@@ -276,7 +321,7 @@ pub(crate) fn check_mask_to_copper(
                             pos_nm: op.center,
                             dist,
                             required_nm: req,
-                            item_a: op.label,
+                            item_a: &op.label,
                             item_b: &pour.label,
                             net_a: op.net,
                             net_b: pour.net,

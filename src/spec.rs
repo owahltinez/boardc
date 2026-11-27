@@ -264,13 +264,22 @@ pub(crate) fn backfill_net_names(nets: &mut BTreeMap<String, NetDef>) {
     }
 }
 
-pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
-    if ir.rules.mask_to_copper_nm.is_some_and(|v| v < 0) {
-        return Err(format!(
-            "board IR '{}': design rules mask_to_copper_nm must be >= 0",
-            path.display()
-        ));
+fn validate_optional_rule_clearances(rules: &DesignRules) -> Result<(), String> {
+    for (name, val) in [
+        ("mask_to_copper_nm", rules.mask_to_copper_nm),
+        ("silk_to_mask_nm", rules.silk_to_mask_nm),
+        ("silk_to_edge_nm", rules.silk_to_edge_nm),
+    ] {
+        if val.is_some_and(|v| v < 0) {
+            return Err(format!("design rules {name} must be >= 0"));
+        }
     }
+    Ok(())
+}
+
+pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
+    validate_optional_rule_clearances(&ir.rules)
+        .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     validate_net_names(&ir.nets).map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     ir.fab
         .validate()
@@ -509,9 +518,7 @@ impl BoardIr {
                 "design rules track_width_nm, via_dia_nm, and via_drill_nm must be > 0".into(),
             );
         }
-        if spec.rules.mask_to_copper_nm.is_some_and(|v| v < 0) {
-            return Err("design rules mask_to_copper_nm must be >= 0".into());
-        }
+        validate_optional_rule_clearances(&spec.rules)?;
         if spec.stackup.thickness_nm <= 0 {
             return Err("stackup.thickness_nm must be > 0".into());
         }

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::drc::{Hotspot, Severity, Violation, ViolationKind};
 use crate::erc::{is_unconnected_net, net_def_pin_index};
 use crate::geom::{EPS_NM, UnionFind, local_to_board, pad_copper_layers, pad_to_world_shape};
-use crate::ir::{BoardIr, Nm, PadDef, PadKind, Pt, mm, um};
+use crate::ir::{BoardIr, Nm, PadDef, PadKind, Pt, Side, mm, um};
 
 const KICAD_CLUSTER_RADIUS_NM: Nm = 2_000_000;
 
@@ -21,7 +21,10 @@ fn is_local_item(item: &str) -> bool {
 }
 
 fn is_point_local_item(item: &str) -> bool {
-    is_local_item(item) && !item.starts_with("track#")
+    is_local_item(item)
+        && !item.starts_with("track#")
+        && !item.starts_with("silk#")
+        && !item.starts_with("mask#")
 }
 
 fn violation_items(v: &Violation) -> impl Iterator<Item = (&str, &str)> {
@@ -101,6 +104,14 @@ fn build_action_hint(
         }
         ViolationKind::EdgeClearance | ViolationKind::ComponentToEdge => {
             format!("Move {root_item}{net_suffix} inward from board/cutout edge")
+        }
+        ViolationKind::SilkOverCopper => {
+            format!(
+                "Adjust silkscreen around {root_item}{net_suffix} to clear exposed mask openings"
+            )
+        }
+        ViolationKind::SilkEdgeClearance => {
+            format!("Move silkscreen {root_item} inward from board/cutout edge")
         }
         ViolationKind::Keepout => format!("Move {root_item}{net_suffix} outside keepout area"),
         ViolationKind::ViaAtSmd => format!("Offset via {root_item}{net_suffix} outside SMD pad"),
@@ -410,6 +421,8 @@ fn map_kicad_kind(t: &str) -> ViolationKind {
         "annular_width" => ViolationKind::MinAnnularRing,
         "track_width" => ViolationKind::MinTraceWidth,
         "copper_edge_clearance" => ViolationKind::EdgeClearance,
+        "silk_over_copper" => ViolationKind::SilkOverCopper,
+        "silk_edge_clearance" => ViolationKind::SilkEdgeClearance,
         "courtyards_overlap" => ViolationKind::CourtyardOverlap,
         "unconnected_items" => ViolationKind::OpenNet,
         "track_dangling" => ViolationKind::TrackDangling,
@@ -439,6 +452,14 @@ fn extract_layer(desc: &str) -> String {
         return rest[..end].trim().to_string();
     }
     String::new()
+}
+
+fn description_fallback(desc: &str) -> String {
+    desc.split(['(', '['])
+        .next()
+        .unwrap_or(desc)
+        .trim()
+        .to_string()
 }
 
 fn map_kicad_item_to_board(board: &BoardIr, item: &KicadItem, units: &str) -> (String, Pt, String) {
@@ -496,6 +517,24 @@ fn map_kicad_item_to_board(board: &BoardIr, item: &KicadItem, units: &str) -> (S
         }
     }
 
+    // Silkscreen items must never snap onto overlapped pads/vias during spatial fallback.
+    let desc_layer = extract_layer(desc);
+    if crate::fab_silk::is_silk_layer(&desc_layer, Side::Top)
+        || crate::fab_silk::is_silk_layer(&desc_layer, Side::Bottom)
+    {
+        if let Some(rest) = desc.strip_prefix("Reference field of ") {
+            let refdes = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(',');
+            if !refdes.is_empty() {
+                return (format!("{refdes}.refdes"), pos, net);
+            }
+        }
+        return (description_fallback(desc), pos, net);
+    }
+
     // Fallback spatial match across vias, pads, and tracks.
     let mut best: Option<(f64, String)> = None;
     for (vi, v) in board.vias.iter().enumerate() {
@@ -528,13 +567,7 @@ fn map_kicad_item_to_board(board: &BoardIr, item: &KicadItem, units: &str) -> (S
         }
     }
 
-    let fallback = desc
-        .split(['(', '['])
-        .next()
-        .unwrap_or(desc)
-        .trim()
-        .to_string();
-    (fallback, pos, net)
+    (description_fallback(desc), pos, net)
 }
 
 fn parse_first_number_before(text: &str, keyword: &str, units: &str) -> Option<Nm> {

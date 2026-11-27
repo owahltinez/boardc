@@ -3293,3 +3293,853 @@ fn via_dangling_rejects_orphan_via_bootstrapping_and_allows_stacked_blind_vias()
             .all(|v| v.severity == Severity::Error)
     );
 }
+
+fn silk_viols(rep: &DrcReport, kind: ViolationKind) -> Vec<&Violation> {
+    rep.violations.iter().filter(|v| v.kind == kind).collect()
+}
+
+fn smd_pad(name: &str, shape: PadShape, pos: Pt, layers: &[&str]) -> PadDef {
+    PadDef {
+        name: name.into(),
+        kind: PadKind::Smd,
+        shape,
+        pos,
+        rot_deg: 0.0,
+        drill_nm: None,
+        layers: layers.iter().map(|s| (*s).into()).collect(),
+        mask_margin_nm: None,
+        paste_margin_nm: None,
+    }
+}
+
+fn custom_fp(
+    name: &str,
+    pads: Vec<PadDef>,
+    courtyard: Vec<Pt>,
+    graphics: Vec<boardc::ir::Graphic>,
+) -> boardc::ir::FootprintDef {
+    FootprintSpec::Custom {
+        pads,
+        courtyard,
+        graphics,
+        keepouts: Vec::new(),
+        models: Vec::new(),
+        pin_types: Default::default(),
+    }
+    .resolve(name)
+    .unwrap()
+}
+
+#[test]
+fn silkscreen_rules_opt_in_toml_validation_and_kicad_clustering() {
+    let toml_src = r#"
+name = "silk_toml"
+size_nm = [20_000_000, 20_000_000]
+
+[rules]
+silk_to_mask_nm = 100_000
+silk_to_edge_nm = 120_000
+"#;
+    let spec: BoardSpec = toml::from_str(toml_src).unwrap();
+    assert_eq!(spec.rules.silk_to_mask_nm, Some(100_000));
+    assert_eq!(spec.rules.silk_to_edge_nm, Some(120_000));
+    let ir = BoardIr::from_spec(&spec).unwrap();
+    let json = serde_json::to_string(&ir).unwrap();
+    let rt: BoardIr = serde_json::from_str(&json).unwrap();
+    assert_eq!(rt.rules.silk_to_mask_nm, Some(100_000));
+    assert_eq!(rt.rules.silk_to_edge_nm, Some(120_000));
+
+    let default_json = serde_json::to_string(&DesignRules::default()).unwrap();
+    assert!(!default_json.contains("silk_to_mask_nm"));
+    assert!(!default_json.contains("silk_to_edge_nm"));
+
+    let mut bad_spec = spec.clone();
+    bad_spec.rules.silk_to_mask_nm = Some(-1);
+    assert!(BoardIr::from_spec(&bad_spec).is_err());
+
+    let mut bad_edge = spec.clone();
+    bad_edge.rules.silk_to_edge_nm = Some(-5);
+    assert!(BoardIr::from_spec(&bad_edge).is_err());
+
+    let mut bad_ir = ir.clone();
+    bad_ir.rules.silk_to_mask_nm = Some(-1);
+    assert!(
+        boardc::spec::validate_board_ir_pins(&bad_ir, std::path::Path::new("mem.json")).is_err()
+    );
+    bad_ir.rules.silk_to_mask_nm = None;
+    bad_ir.rules.silk_to_edge_nm = Some(-1);
+    assert!(
+        boardc::spec::validate_board_ir_pins(&bad_ir, std::path::Path::new("mem.json")).is_err()
+    );
+
+    // When both rules are None, overlapping/off-board silkscreen emits zero silk violations.
+    let mut off_board = base_board();
+    off_board.footprints.insert(
+        "FP".into(),
+        single_pad_fp(1.0, PadKind::Smd, vec!["F.Cu", "F.Mask"], None)
+            .resolve("FP")
+            .unwrap(),
+    );
+    off_board
+        .placements
+        .push(place_pin1("U1", "FP", 10.0, 10.0, Side::Top, "SIG"));
+    off_board.graphics.push(boardc::ir::Graphic::Line {
+        layer: "F.SilkS".into(),
+        a: Pt::new(mm(-1.0), mm(10.0)),
+        b: Pt::new(mm(12.0), mm(10.0)),
+        width: um(150.0),
+    });
+    let rep_disabled = check_board_drc(&off_board);
+    assert!(silk_viols(&rep_disabled, ViolationKind::SilkOverCopper).is_empty());
+    assert!(silk_viols(&rep_disabled, ViolationKind::SilkEdgeClearance).is_empty());
+
+    // KiCad DRC JSON mapping and hotspot hints.
+    let kdrc = r#"{
+        "coordinate_units": "mm",
+        "violations": [
+            {
+                "type": "silk_over_copper",
+                "severity": "error",
+                "description": "Silkscreen clipped by solder mask (clearance 0.1000 mm; actual 0.0200 mm)",
+                "items": [
+                    { "description": "Reference field of U1 on F.SilkS", "pos": { "x": 10.0, "y": -10.0 } },
+                    { "description": "Pad 1 [SIG] of U1 on F.Mask", "pos": { "x": 10.0, "y": -10.0 } }
+                ]
+            },
+            {
+                "type": "silk_edge_clearance",
+                "severity": "warning",
+                "description": "Silkscreen too close to board edge (clearance 0.1500 mm; actual 0.0500 mm)",
+                "items": [
+                    { "description": "Graphic line on B.SilkS", "pos": { "x": 20.0, "y": -0.05 } }
+                ]
+            },
+            {
+                "type": "silk_over_copper",
+                "severity": "error",
+                "description": "Graphic silkscreen clipped by solder mask (clearance 0.1000 mm; actual 0.0100 mm)",
+                "items": [
+                    { "description": "Graphic line on F.SilkS", "pos": { "x": 10.0, "y": -10.0 } },
+                    { "description": "Pad 1 [SIG] of U1 on F.Mask", "pos": { "x": 10.0, "y": -10.0 } }
+                ]
+            }
+        ]
+    }"#;
+    let hs = cluster_kicad_drc_json(&off_board, kdrc).unwrap();
+    assert_eq!(hs.len(), 2);
+    let mask_hs = hs
+        .iter()
+        .find(|h| h.kinds.contains(&ViolationKind::SilkOverCopper))
+        .unwrap();
+    let ref_v = mask_hs
+        .violations
+        .iter()
+        .find(|v| v.item_a == "U1.refdes")
+        .expect("Reference field must map to U1.refdes");
+    assert_eq!(ref_v.item_b.as_deref(), Some("U1.1"));
+    assert_eq!(ref_v.required_nm, um(100.0));
+    assert_eq!(ref_v.measured_nm, um(20.0));
+    assert!(
+        mask_hs
+            .violations
+            .iter()
+            .any(|v| v.item_a == "Graphic line on F.SilkS"),
+        "silkscreen graphic must not snap to overlapped U1.1 pad: {:?}",
+        mask_hs.violations
+    );
+    assert!(!mask_hs.action_hint.is_empty());
+
+    let edge_hs = hs
+        .iter()
+        .find(|h| h.kinds.contains(&ViolationKind::SilkEdgeClearance))
+        .unwrap();
+    assert_eq!(edge_hs.violations[0].layer, "B.SilkS");
+    assert!(!edge_hs.action_hint.is_empty());
+}
+
+#[test]
+fn silk_over_copper_sides_shapes_vias_zero_clearance_and_dedup() {
+    use boardc::ir::{AutoRefdes, Graphic};
+
+    let mut board = base_board();
+    board.rules.mask_expansion_nm = um(50.0);
+    board.rules.silk_to_mask_nm = Some(um(100.0));
+    board.fab.auto_refdes = AutoRefdes::Off;
+
+    // Footprint with 1.0x1.0 mm SMD pad (mask opening 1.1x1.1 mm) and an F.SilkS rect (4 strokes).
+    board.footprints.insert(
+        "SMD_BOX".into(),
+        custom_fp(
+            "SMD_BOX",
+            vec![smd_pad(
+                "1",
+                PadShape::Rect {
+                    width: mm(1.0),
+                    height: mm(1.0),
+                },
+                Pt::new(0, 0),
+                &["F.Cu", "F.Mask"],
+            )],
+            vec![],
+            vec![Graphic::Rect {
+                layer: "F.SilkS".into(),
+                min: Pt::new(um(-550.0), um(-550.0)),
+                max: Pt::new(um(550.0), um(550.0)),
+                width: um(100.0),
+                fill: false,
+            }],
+        ),
+    );
+    // NPTH pad with *.Mask only, and footprint explicit F.Mask graphic.
+    board.footprints.insert(
+        "MASK_ONLY".into(),
+        custom_fp(
+            "MASK_ONLY",
+            vec![PadDef {
+                name: "H1".into(),
+                kind: PadKind::Npth,
+                shape: PadShape::Circle { diameter: mm(1.0) },
+                pos: Pt::new(0, 0),
+                rot_deg: 0.0,
+                drill_nm: Some(mm(0.8)),
+                layers: vec!["*.Mask".into()],
+                mask_margin_nm: Some(0),
+                paste_margin_nm: None,
+            }],
+            vec![],
+            vec![Graphic::Circle {
+                layer: "F.Mask".into(),
+                center: Pt::new(mm(3.0), 0),
+                radius: mm(0.5),
+                width: 0,
+                fill: true,
+            }],
+        ),
+    );
+
+    board.placements = vec![
+        place_pin1("U_TOP", "SMD_BOX", 6.0, 10.0, Side::Top, "SIG_T"),
+        place_pin1("U_BOT", "SMD_BOX", 14.0, 10.0, Side::Bottom, "SIG_B"),
+        place_pin1("M1", "MASK_ONLY", 24.0, 10.0, Side::Top, ""),
+    ];
+    board.vias = vec![
+        mk_via("V_UNTENT", mm(10.0), mm(20.0), um(400.0), um(200.0), false), // mask r=250um
+        mk_via("V_TENT", mm(18.0), mm(20.0), um(400.0), um(200.0), true),
+    ];
+    board.graphics = vec![
+        // Board-level F.SilkS text overlapping V_UNTENT (multi-stroke -> 1 violation).
+        Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "VIA".into(),
+            pos: Pt::new(mm(10.0), mm(20.0)),
+            height_nm: mm(1.0),
+            stroke_nm: um(120.0),
+            rot_deg: 0.0,
+        },
+        // Board-level B.SilkS line overlapping V_UNTENT (bottom side) and V_TENT (ignored).
+        Graphic::Line {
+            layer: "B.SilkS".into(),
+            a: Pt::new(mm(9.0), mm(20.0)),
+            b: Pt::new(mm(19.0), mm(20.0)),
+            width: um(120.0),
+        },
+        // Board-level F.SilkS filled rect overlapping M1.H1 (NPTH mask) and M1.mask#0.
+        Graphic::Rect {
+            layer: "F.SilkS".into(),
+            min: Pt::new(mm(23.8), mm(9.8)),
+            max: Pt::new(mm(27.2), mm(10.2)),
+            width: 0,
+            fill: true,
+        },
+        // Board-level F.SilkS line at exact clearance 100 um from U_TOP pad edge (550 + 50 + 100 = 700 um): MUST pass.
+        Graphic::Line {
+            layer: "F.SilkS".into(),
+            a: Pt::new(mm(6.0) - mm(1.0), mm(10.0) + um(700.0)),
+            b: Pt::new(mm(6.0) + mm(1.0), mm(10.0) + um(700.0)),
+            width: um(100.0),
+        },
+    ];
+
+    let rep = check_board_drc(&board);
+    let sv = silk_viols(&rep, ViolationKind::SilkOverCopper);
+    let mut got: Vec<(&str, &str, &str)> = sv
+        .iter()
+        .map(|v| {
+            (
+                v.layer.as_str(),
+                v.item_a.as_str(),
+                v.item_b.as_deref().unwrap_or(""),
+            )
+        })
+        .collect();
+    got.sort();
+    assert!(sv.iter().all(|v| v.severity == Severity::Error));
+    assert_eq!(
+        got,
+        vec![
+            ("B.SilkS", "U_BOT.silk#0", "U_BOT.1"),
+            ("B.SilkS", "silk#1", "via#0"),
+            ("F.SilkS", "U_TOP.silk#0", "U_TOP.1"),
+            ("F.SilkS", "silk#0", "via#0"),
+            ("F.SilkS", "silk#2", "M1.H1"),
+            ("F.SilkS", "silk#2", "M1.mask#0"),
+        ],
+        "unexpected SilkOverCopper violations: {got:?}"
+    );
+    assert!(!rep.hotspots.is_empty());
+
+    // Auto pin-1 dot & auto_refdes SilkOverCopper: triggered when active, suppressed when dnp or Off.
+    let mut auto_board = base_board();
+    auto_board.rules.mask_expansion_nm = um(50.0);
+    auto_board.rules.silk_to_mask_nm = Some(um(100.0));
+    auto_board.fab.auto_refdes = AutoRefdes::Rotate;
+    auto_board.footprints.insert(
+        "PIN1_TEST".into(),
+        custom_fp(
+            "PIN1_TEST",
+            vec![
+                smd_pad(
+                    "1",
+                    PadShape::Circle { diameter: mm(0.8) },
+                    Pt::new(0, 0),
+                    &["F.Cu", "F.Mask"],
+                ),
+                smd_pad(
+                    "2",
+                    PadShape::Circle { diameter: mm(1.0) },
+                    Pt::new(0, mm(1.0)),
+                    &["F.Cu", "F.Mask"],
+                ),
+            ],
+            rect_pts(-0.2, -0.2, 0.2, 0.2),
+            vec![],
+        ),
+    );
+    auto_board.placements.push(place_pin1(
+        "U_AUTO",
+        "PIN1_TEST",
+        10.0,
+        10.0,
+        Side::Top,
+        "A",
+    ));
+    let auto_rep = check_board_drc(&auto_board);
+    let mut auto_items: Vec<(&str, &str)> = silk_viols(&auto_rep, ViolationKind::SilkOverCopper)
+        .into_iter()
+        .map(|v| (v.item_a.as_str(), v.item_b.as_deref().unwrap_or("")))
+        .collect();
+    auto_items.sort();
+    assert_eq!(
+        auto_items,
+        vec![
+            ("U_AUTO.pin1_dot", "U_AUTO.1"),
+            ("U_AUTO.refdes", "U_AUTO.1"),
+            ("U_AUTO.refdes", "U_AUTO.2"),
+        ],
+        "expected pin1_dot and refdes SilkOverCopper: {auto_rep:?}"
+    );
+    // Explicit filled silk Graphic::Circle suppresses auto pin1_dot.
+    let mut dot_suppressed = auto_board.clone();
+    dot_suppressed
+        .footprints
+        .get_mut("PIN1_TEST")
+        .unwrap()
+        .graphics
+        .push(Graphic::Circle {
+            layer: "F.SilkS".into(),
+            center: Pt::new(mm(-2.0), mm(-2.0)),
+            radius: um(120.0),
+            width: 0,
+            fill: true,
+        });
+    let dot_rep = check_board_drc(&dot_suppressed);
+    assert!(
+        silk_viols(&dot_rep, ViolationKind::SilkOverCopper)
+            .iter()
+            .all(|v| v.item_a != "U_AUTO.pin1_dot"),
+        "explicit filled silk Circle must suppress auto pin1_dot: {:?}",
+        dot_rep.violations
+    );
+
+    let mut auto_off = auto_board.clone();
+    auto_off.fab.auto_refdes = AutoRefdes::Off;
+    assert!(silk_viols(&check_board_drc(&auto_off), ViolationKind::SilkOverCopper).is_empty());
+    let mut auto_dnp = auto_board.clone();
+    auto_dnp.placements[0].dnp = true;
+    assert!(silk_viols(&check_board_drc(&auto_dnp), ViolationKind::SilkOverCopper).is_empty());
+
+    // Tented pads (no F.Mask layer or negative mask_margin_nm collapsing opening) emit zero SilkOverCopper.
+    let mut tent_board = base_board();
+    tent_board.rules.silk_to_mask_nm = Some(um(100.0));
+    tent_board.fab.auto_refdes = AutoRefdes::Off;
+    let mut collapsed_pad = smd_pad(
+        "1",
+        PadShape::Circle { diameter: mm(1.0) },
+        Pt::new(mm(2.0), 0),
+        &["F.Cu", "F.Mask"],
+    );
+    collapsed_pad.mask_margin_nm = Some(-mm(0.6));
+    tent_board.footprints.insert(
+        "TENT_FP".into(),
+        custom_fp(
+            "TENT_FP",
+            vec![
+                smd_pad(
+                    "1",
+                    PadShape::Circle { diameter: mm(1.0) },
+                    Pt::new(0, 0),
+                    &["F.Cu"],
+                ),
+                collapsed_pad,
+            ],
+            vec![],
+            vec![],
+        ),
+    );
+    tent_board
+        .placements
+        .push(place_pin1("U_TENT", "TENT_FP", 10.0, 10.0, Side::Top, "A"));
+    tent_board.graphics.push(Graphic::Line {
+        layer: "F.SilkS".into(),
+        a: Pt::new(mm(9.0), mm(10.0)),
+        b: Pt::new(mm(13.0), mm(10.0)),
+        width: um(150.0),
+    });
+    assert!(
+        silk_viols(&check_board_drc(&tent_board), ViolationKind::SilkOverCopper).is_empty(),
+        "tented pads must not trigger SilkOverCopper"
+    );
+
+    // Zero clearance (`Some(0)`): overlapping Poly/Capsule fails, exact tangent passes.
+    let mut zero_board = base_board();
+    zero_board.rules.mask_expansion_nm = 0;
+    zero_board.rules.silk_to_mask_nm = Some(0);
+    zero_board.fab.auto_refdes = AutoRefdes::Off;
+    zero_board.footprints.insert(
+        "SQ".into(),
+        custom_fp(
+            "SQ",
+            vec![smd_pad(
+                "1",
+                PadShape::Rect {
+                    width: mm(2.0),
+                    height: mm(2.0),
+                },
+                Pt::new(0, 0),
+                &["F.Cu", "F.Mask"],
+            )],
+            vec![],
+            vec![],
+        ),
+    );
+    zero_board
+        .placements
+        .push(place_pin1("U1", "SQ", 10.0, 10.0, Side::Top, "SIG"));
+    zero_board.graphics = vec![
+        // Tangent filled rect (x = 11.0..12.0 touches pad right edge x = 11.0): passes at req = 0.
+        Graphic::Rect {
+            layer: "F.SilkS".into(),
+            min: Pt::new(mm(11.0), mm(9.0)),
+            max: Pt::new(mm(12.0), mm(11.0)),
+            width: 0,
+            fill: true,
+        },
+        // Overlapping filled rect (x = 10.9..12.0 overlaps pad by 0.1 mm): fails at req = 0.
+        Graphic::Rect {
+            layer: "F.SilkS".into(),
+            min: Pt::new(mm(10.9), mm(9.0)),
+            max: Pt::new(mm(12.0), mm(11.0)),
+            width: 0,
+            fill: true,
+        },
+        // Tangent stroke line (y = 11.05 with width 0.10 => bottom edge y = 11.0): passes at req = 0.
+        Graphic::Line {
+            layer: "F.SilkS".into(),
+            a: Pt::new(mm(9.0), mm(11.05)),
+            b: Pt::new(mm(11.0), mm(11.05)),
+            width: um(100.0),
+        },
+        // Overlapping stroke line (y = 11.04 with width 0.10 => intrudes 10 um): fails at req = 0.
+        Graphic::Line {
+            layer: "F.SilkS".into(),
+            a: Pt::new(mm(9.0), mm(11.04)),
+            b: Pt::new(mm(11.0), mm(11.04)),
+            width: um(100.0),
+        },
+    ];
+    let zrep = check_board_drc(&zero_board);
+    let zsv = silk_viols(&zrep, ViolationKind::SilkOverCopper);
+    let mut z_items: Vec<&str> = zsv.iter().map(|v| v.item_a.as_str()).collect();
+    z_items.sort();
+    assert_eq!(z_items, vec!["silk#1", "silk#3"], "got {zsv:?}");
+}
+
+#[test]
+fn silk_edge_clearance_outline_cutout_overhang_and_auto_refdes() {
+    use boardc::ir::{AutoRefdes, Graphic};
+
+    let mut board = base_board(); // 40 x 30 mm
+    board.cutouts.push(rect_pts(18.0, 13.0, 22.0, 17.0));
+    board.rules.silk_to_edge_nm = Some(um(200.0));
+    board.fab.auto_refdes = AutoRefdes::Rotate;
+
+    board.footprints.insert(
+        "EDGE_FP".into(),
+        custom_fp(
+            "EDGE_FP",
+            vec![smd_pad(
+                "1",
+                PadShape::Circle { diameter: mm(0.8) },
+                Pt::new(0, 0),
+                &["F.Cu", "F.Mask"],
+            )],
+            rect_pts(-1.0, -1.0, 1.0, 1.0),
+            vec![],
+        ),
+    );
+
+    // U_TOP near top edge (y = 28.5): auto refdes at y = 28.5 + 1.45 = 29.95 violates edge.
+    let mut u_top = place_pin1("U_TOP", "EDGE_FP", 10.0, 28.5, Side::Top, "A");
+    u_top.allow_edge_overhang = true;
+    // U_DNP at same edge height, marked DNP: auto refdes & pin1_dot are suppressed.
+    let mut u_dnp = place_pin1("U_DNP", "EDGE_FP", 20.0, 28.5, Side::Top, "B");
+    u_dnp.dnp = true;
+    // U_BOT near bottom edge (y = 1.5, Side::Bottom): auto refdes at y = 1.5 - 1.45 = 0.05 violates B.SilkS edge.
+    let u_bot = place_pin1("U_BOT", "EDGE_FP", 30.0, 1.5, Side::Bottom, "C");
+    board.placements = vec![u_top, u_dnp, u_bot];
+
+    board.graphics = vec![
+        // Multi-stroke text near left board edge (x = 0.15 mm < 0.20 mm): deduplicated to 1 violation.
+        Graphic::Text {
+            layer: "F.SilkS".into(),
+            text: "EDGE".into(),
+            pos: Pt::new(um(450.0), mm(10.0)),
+            height_nm: mm(0.8),
+            stroke_nm: um(100.0),
+            rot_deg: 0.0,
+        },
+        // Circle intruding into internal cutout (cutout x=[18..22], y=[13..17]).
+        Graphic::Circle {
+            layer: "F.SilkS".into(),
+            center: Pt::new(mm(17.7), mm(15.0)),
+            radius: um(250.0),
+            width: um(100.0),
+            fill: false,
+        },
+        // Off-board filled poly completely outside outline.
+        Graphic::Rect {
+            layer: "B.SilkS".into(),
+            min: Pt::new(mm(41.0), mm(5.0)),
+            max: Pt::new(mm(43.0), mm(7.0)),
+            width: 0,
+            fill: true,
+        },
+        // Safe line 250 um from edge (center 300 um - half width 50 um = 250 um >= 200 um): passes.
+        Graphic::Line {
+            layer: "F.SilkS".into(),
+            a: Pt::new(mm(5.0), um(300.0)),
+            b: Pt::new(mm(15.0), um(300.0)),
+            width: um(100.0),
+        },
+        // Near-edge line strictly inside board at 100 um clearance (center 150 um - half width 50 um = 100 um < 200 um).
+        Graphic::Line {
+            layer: "F.SilkS".into(),
+            a: Pt::new(mm(5.0), um(150.0)),
+            b: Pt::new(mm(15.0), um(150.0)),
+            width: um(100.0),
+        },
+    ];
+
+    let rep = check_board_drc(&board);
+    let ev = silk_viols(&rep, ViolationKind::SilkEdgeClearance);
+    let mut items: Vec<(&str, &str)> = ev
+        .iter()
+        .map(|v| (v.layer.as_str(), v.item_a.as_str()))
+        .collect();
+    items.sort();
+    assert_eq!(
+        items,
+        vec![
+            ("B.SilkS", "U_BOT.refdes"),
+            ("B.SilkS", "silk#2"),
+            ("F.SilkS", "U_TOP.refdes"),
+            ("F.SilkS", "silk#0"),
+            ("F.SilkS", "silk#1"),
+            ("F.SilkS", "silk#4"),
+        ],
+        "unexpected SilkEdgeClearance violations: {ev:?}"
+    );
+    assert!(ev.iter().all(|v| {
+        v.severity == Severity::Error
+            && v.item_b.as_deref() == Some("board_edge")
+            && v.required_nm == um(200.0)
+    }));
+    let near_v = ev.iter().find(|v| v.item_a == "silk#4").unwrap();
+    assert_eq!(near_v.measured_nm, um(100.0));
+
+    // Switching auto_refdes = Off suppresses U_TOP.refdes and U_BOT.refdes.
+    let mut no_refdes = board.clone();
+    no_refdes.fab.auto_refdes = AutoRefdes::Off;
+    let rep_off = check_board_drc(&no_refdes);
+    let mut ev_off: Vec<&str> = silk_viols(&rep_off, ViolationKind::SilkEdgeClearance)
+        .into_iter()
+        .map(|v| v.item_a.as_str())
+        .collect();
+    ev_off.sort();
+    assert_eq!(ev_off, vec!["silk#0", "silk#1", "silk#2", "silk#4"]);
+
+    // Verify pipeline DRC stage invalidation when board.fab or board.graphics changes.
+    let tmp = std::env::temp_dir().join(format!("boardc_silk_cache_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let cfg = boardc::pipeline::BuildOptions {
+        cache_dir: tmp.join("cache"),
+        use_cache: true,
+        emit_outputs: false,
+        ..Default::default()
+    };
+    let mut pipe_board = base_board();
+    pipe_board.rules.silk_to_edge_nm = Some(um(200.0));
+    pipe_board
+        .footprints
+        .insert("EDGE_FP".into(), board.footprints["EDGE_FP"].clone());
+    pipe_board.placements.push(board.placements[0].clone()); // U_TOP with auto_refdes = Rotate
+    let r1 = boardc::pipeline::compile_board(pipe_board.clone(), &cfg).unwrap();
+    assert!(!r1.drc.passed);
+    pipe_board.fab.auto_refdes = AutoRefdes::Off;
+    let r2 = boardc::pipeline::compile_board(pipe_board.clone(), &cfg).unwrap();
+    assert!(
+        !r2.stage_hit(boardc::pipeline::StageKind::Drc),
+        "DRC cache must invalidate when board.fab changes"
+    );
+    assert!(r2.drc.passed);
+    pipe_board.graphics.push(Graphic::Line {
+        layer: "F.SilkS".into(),
+        a: Pt::new(mm(5.0), um(100.0)),
+        b: Pt::new(mm(15.0), um(100.0)),
+        width: um(100.0),
+    });
+    let r3 = boardc::pipeline::compile_board(pipe_board, &cfg).unwrap();
+    assert!(
+        !r3.stage_hit(boardc::pipeline::StageKind::Drc),
+        "DRC cache must invalidate when board.graphics changes"
+    );
+    assert!(!r3.drc.passed);
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // silk_to_edge_nm == Some(0): tangent passes, off-board/cutout fails with clean message.
+    let mut edge_zero = base_board();
+    edge_zero.cutouts.push(rect_pts(18.0, 13.0, 22.0, 17.0));
+    edge_zero.rules.silk_to_edge_nm = Some(0);
+    edge_zero.fab.auto_refdes = AutoRefdes::Off;
+    edge_zero.graphics = vec![
+        // Tangent line (y = 0.05 with width 0.10 => bottom edge at y = 0.0): passes.
+        Graphic::Line {
+            layer: "F.SilkS".into(),
+            a: Pt::new(mm(5.0), um(50.0)),
+            b: Pt::new(mm(10.0), um(50.0)),
+            width: um(100.0),
+        },
+        // Tangent filled rect (y = 0..1): passes.
+        Graphic::Rect {
+            layer: "F.SilkS".into(),
+            min: Pt::new(mm(11.0), 0),
+            max: Pt::new(mm(13.0), mm(1.0)),
+            width: 0,
+            fill: true,
+        },
+        // Off-board line: fails.
+        Graphic::Line {
+            layer: "F.SilkS".into(),
+            a: Pt::new(mm(5.0), um(20.0)),
+            b: Pt::new(mm(10.0), um(20.0)),
+            width: um(100.0),
+        },
+        // Filled poly overlapping internal cutout: fails.
+        Graphic::Poly {
+            layer: "F.SilkS".into(),
+            verts: rect_pts(17.5, 14.0, 18.5, 16.0),
+            width: 0,
+            fill: true,
+        },
+    ];
+    let ez_rep = check_board_drc(&edge_zero);
+    let ez_ev = silk_viols(&ez_rep, ViolationKind::SilkEdgeClearance);
+    let mut ez_items: Vec<&str> = ez_ev.iter().map(|v| v.item_a.as_str()).collect();
+    ez_items.sort();
+    assert_eq!(ez_items, vec!["silk#2", "silk#3"], "got {ez_ev:?}");
+    for v in ez_ev {
+        assert!(v.message.contains("silk extends off board/cutout edge"));
+        assert!(!v.message.contains("0 nm < 0 nm"));
+    }
+}
+
+#[test]
+fn silk_capsule_mask_dedup_hotspot_isolation_poly_and_upright() {
+    use boardc::ir::{AutoRefdes, Graphic};
+
+    // 1. Long F.Mask Capsule crossing + multi-stroke F.Mask graphic deduplication + Graphic::Poly.
+    let mut board = base_board();
+    board.rules.silk_to_mask_nm = Some(um(100.0));
+    board.fab.auto_refdes = AutoRefdes::Off;
+    board.graphics = vec![
+        // mask#0: long horizontal F.Mask capsule centered at x = 15 mm.
+        Graphic::Line {
+            layer: "F.Mask".into(),
+            a: Pt::new(mm(2.0), mm(10.0)),
+            b: Pt::new(mm(28.0), mm(10.0)),
+            width: um(200.0),
+        },
+        // silk#1: vertical silk line crossing mask#0 at x = 24 mm.
+        Graphic::Line {
+            layer: "F.SilkS".into(),
+            a: Pt::new(mm(24.0), mm(9.0)),
+            b: Pt::new(mm(24.0), mm(11.0)),
+            width: um(100.0),
+        },
+        // mask#2: 4-stroke unfilled F.Mask rect.
+        Graphic::Rect {
+            layer: "F.Mask".into(),
+            min: Pt::new(mm(10.0), mm(20.0)),
+            max: Pt::new(mm(12.0), mm(22.0)),
+            width: um(100.0),
+            fill: false,
+        },
+        // silk#3: filled F.SilkS polygon overlapping multiple strokes of mask#2.
+        Graphic::Poly {
+            layer: "F.SilkS".into(),
+            verts: rect_pts(10.5, 19.5, 11.5, 22.5),
+            width: 0,
+            fill: true,
+        },
+        // silk#4: unfilled F.SilkS triangle touching mask#2 at (12.0, 20.0) corner via an edge.
+        Graphic::Poly {
+            layer: "F.SilkS".into(),
+            verts: vec![
+                Pt::new(mm(12.0), mm(20.0)),
+                Pt::new(mm(14.0), mm(20.0)),
+                Pt::new(mm(13.0), mm(21.0)),
+            ],
+            width: um(100.0),
+            fill: false,
+        },
+    ];
+    let rep = check_board_drc(&board);
+    let sv = silk_viols(&rep, ViolationKind::SilkOverCopper);
+    let mut pairs: Vec<(&str, &str)> = sv
+        .iter()
+        .map(|v| (v.item_a.as_str(), v.item_b.as_deref().unwrap_or("")))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("silk#1", "mask#0"),
+            ("silk#3", "mask#2"),
+            ("silk#4", "mask#2"),
+        ],
+        "got {sv:?}"
+    );
+    let cap_v = sv.iter().find(|v| v.item_a == "silk#1").unwrap();
+    assert!(
+        (cap_v.pos_nm.x - mm(24.0)).abs() <= um(50.0)
+            && (cap_v.pos_nm.y - mm(10.0)).abs() <= um(50.0),
+        "Capsule crossing pos_nm must be near (24mm, 10mm), got {:?}",
+        cap_v.pos_nm
+    );
+
+    // 2. Board-wide silk#0 crossing two distant pads stays in 2 separate hotspots.
+    let mut wide_board = base_board();
+    wide_board.rules.silk_to_mask_nm = Some(um(100.0));
+    wide_board.fab.auto_refdes = AutoRefdes::Off;
+    wide_board.footprints.insert(
+        "PAD".into(),
+        custom_fp(
+            "PAD",
+            vec![smd_pad(
+                "1",
+                PadShape::Circle { diameter: mm(1.0) },
+                Pt::new(0, 0),
+                &["F.Cu", "F.Mask"],
+            )],
+            vec![],
+            vec![],
+        ),
+    );
+    wide_board.placements = vec![
+        place_pin1("U1", "PAD", 4.0, 20.0, Side::Top, "A"),
+        place_pin1("U2", "PAD", 36.0, 20.0, Side::Top, "B"),
+    ];
+    wide_board.graphics.push(Graphic::Line {
+        layer: "F.SilkS".into(),
+        a: Pt::new(mm(2.0), mm(20.0)),
+        b: Pt::new(mm(38.0), mm(20.0)),
+        width: um(150.0),
+    });
+    let wide_rep = check_board_drc(&wide_board);
+    assert_eq!(
+        silk_viols(&wide_rep, ViolationKind::SilkOverCopper).len(),
+        2
+    );
+    assert_eq!(
+        wide_rep.hotspots.len(),
+        2,
+        "board-wide silk#0 must not merge distant hotspots: {:?}",
+        wide_rep.hotspots
+    );
+
+    // 3. AutoRefdes::Upright with 180-deg rotated footprint flips glyph upright.
+    let mut up_board = base_board();
+    up_board.rules.mask_expansion_nm = 0;
+    up_board.rules.silk_to_mask_nm = Some(um(50.0));
+    up_board.fab.auto_refdes = AutoRefdes::Upright;
+    up_board.footprints.insert(
+        "ROT_FP".into(),
+        custom_fp(
+            "ROT_FP",
+            vec![smd_pad(
+                "1",
+                PadShape::Circle { diameter: mm(0.2) },
+                Pt::new(0, 0),
+                &["F.Cu", "F.Mask"],
+            )],
+            rect_pts(-0.5, -0.5, 0.5, 0.5),
+            vec![],
+        ),
+    );
+    up_board.footprints.insert(
+        "PROBE_PAD".into(),
+        custom_fp(
+            "PROBE_PAD",
+            vec![smd_pad(
+                "1",
+                PadShape::Circle { diameter: mm(0.1) },
+                Pt::new(0, 0),
+                &["F.Cu", "F.Mask"],
+            )],
+            vec![],
+            vec![],
+        ),
+    );
+    let mut rot_pl = place_pin1("L", "ROT_FP", 10.0, 10.0, Side::Top, "A");
+    rot_pl.rot_deg = 180.0;
+    // Refdes center at (10.0, 9.05); upright 'L' bottom bar sits at y = 8.70, rotated-180 'L' sits at y = 9.40.
+    up_board.placements = vec![
+        rot_pl,
+        place_pin1("P1", "PROBE_PAD", 10.0, 8.70, Side::Top, "B"),
+    ];
+    let up_rep = check_board_drc(&up_board);
+    assert!(
+        silk_viols(&up_rep, ViolationKind::SilkOverCopper)
+            .iter()
+            .any(|v| v.item_a == "L.refdes" && v.item_b.as_deref() == Some("P1.1")),
+        "expected Upright 'L.refdes' bottom stroke to hit P1.1: {:?}",
+        up_rep.violations
+    );
+    up_board.fab.auto_refdes = AutoRefdes::Rotate;
+    let rot_rep = check_board_drc(&up_board);
+    assert!(
+        silk_viols(&rot_rep, ViolationKind::SilkOverCopper).is_empty(),
+        "rotated-180 'L.refdes' must clear P1.1: {:?}",
+        rot_rep.violations
+    );
+}

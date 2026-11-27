@@ -432,6 +432,21 @@ pub(crate) fn closest_pt_on_segment(p: Pt, a: Pt, b: Pt) -> Pt {
 }
 
 pub(crate) fn segment_pair_midpoint(a1: Pt, a2: Pt, b1: Pt, b2: Pt) -> Pt {
+    if segments_intersect(a1, a2, b1, b2) {
+        let dx_a = (a2.x - a1.x) as f64;
+        let dy_a = (a2.y - a1.y) as f64;
+        let dx_b = (b2.x - b1.x) as f64;
+        let dy_b = (b2.y - b1.y) as f64;
+        let denom = dx_a * dy_b - dy_a * dx_b;
+        if denom.abs() > 1e-6 {
+            let t = (((b1.x - a1.x) as f64 * dy_b - (b1.y - a1.y) as f64 * dx_b) / denom)
+                .clamp(0.0, 1.0);
+            return Pt::new(
+                a1.x + (t * dx_a).round() as Nm,
+                a1.y + (t * dy_a).round() as Nm,
+            );
+        }
+    }
     let candidates = [
         (a1, closest_pt_on_segment(a1, b1, b2)),
         (a2, closest_pt_on_segment(a2, b1, b2)),

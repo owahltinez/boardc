@@ -12,9 +12,10 @@ use crate::erc::ErcViolation;
 use crate::fab::{FabOptions, export_fab};
 use crate::geom::point_in_polygon;
 use crate::ir::{
-    BgaShadowRule, BoardIr, CapProximityRule, Constraints, DesignRules, FilledPour, FootprintDef,
-    Keepout, LayerDef, LayerKind, MatchGroupRule, MaxLengthRule, MinViasRule, NetClass, NetDef, Nm,
-    PadKind, Placement, PourSpec, Pt, Track, Via, fnv1a_128, safe_slug, save_board_json,
+    BgaShadowRule, BoardIr, CapProximityRule, Constraints, DesignRules, FabConfig, FilledPour,
+    FootprintDef, Graphic, Keepout, LayerDef, LayerKind, MatchGroupRule, MaxLengthRule,
+    MinViasRule, NetClass, NetDef, Nm, PadKind, Placement, PourSpec, Pt, Track, Via, fnv1a_128,
+    safe_slug, save_board_json,
 };
 use crate::pipeline_repair::route_with_repair;
 use crate::place::{
@@ -30,7 +31,7 @@ use crate::shapes::transform_pad_local_pt;
 use crate::svg::write_board_svgs;
 use crate::zones::{ZoneChoke, ZoneReport, fill_zones};
 
-const CACHE_SCHEMA: &str = "v6";
+const CACHE_SCHEMA: &str = "v7";
 static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Pipeline stage identifier in execution order.
@@ -337,6 +338,10 @@ struct DrcKeyInput<'a> {
     zones_key: &'a str,
     constraints: &'a Constraints,
     rules: &'a DesignRules,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fab: Option<&'a FabConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graphics: Option<&'a [Graphic]>,
 }
 
 fn all_tht_pads_in_plane_pours(board: &BoardIr, net: &str, plane_pours: &[&PourSpec]) -> bool {
@@ -647,11 +652,15 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
     let zone_report = zones_cache.report;
 
     // 6. DRC (exact continuous DRC + spatial hotspot clustering).
+    let silk_drc_active =
+        board.rules.silk_to_mask_nm.is_some() || board.rules.silk_to_edge_nm.is_some();
     let drc_key = content_hash_hex(&DrcKeyInput {
         schema: CACHE_SCHEMA,
         zones_key: &zones_key,
         constraints: &board.constraints,
         rules: &board.rules,
+        fab: silk_drc_active.then_some(&board.fab),
+        graphics: silk_drc_active.then_some(board.graphics.as_slice()),
     })?;
     let drc_report = run_cached_stage(cfg, StageKind::Drc, drc_key, &mut stages, || {
         Ok(check_board_drc(&board))

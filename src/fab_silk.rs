@@ -22,6 +22,78 @@ const PIN1_DOT_RADIUS_NM: Nm = 120_000;
 const MIN_CLIPPED_SEG_NM: f64 = 50_000.0;
 const MIN_FILLED_AREA_NM2: f64 = 50_000.0 * 50_000.0;
 
+pub(crate) enum SilkElement<'a> {
+    Graphic {
+        pl: Option<&'a Placement>,
+        idx: usize,
+        graphic: &'a Graphic,
+    },
+    Pin1Dot {
+        refdes: &'a str,
+        center: Pt,
+        radius: Nm,
+    },
+    Refdes {
+        refdes: &'a str,
+        segs: Vec<(Pt, Pt)>,
+        stroke_nm: Nm,
+    },
+}
+
+pub(crate) fn for_each_silk_element<'a>(
+    board: &'a BoardIr,
+    side: Side,
+    fab: FabConfig,
+    mut visit: impl FnMut(SilkElement<'a>),
+) {
+    for pl in &board.placements {
+        let Some(fp) = board.footprints.get(&pl.footprint) else {
+            continue;
+        };
+        let mut has_silk_dot = false;
+        for (idx, graphic) in fp.graphics.iter().enumerate() {
+            let layer = remap_layer_for_side(graphic.layer(), pl.side);
+            if !is_silk_layer(&layer, side) {
+                continue;
+            }
+            if matches!(graphic, Graphic::Circle { fill: true, .. }) {
+                has_silk_dot = true;
+            }
+            visit(SilkElement::Graphic {
+                pl: Some(pl),
+                idx,
+                graphic,
+            });
+        }
+        if pl.side == side && !pl.dnp && fab.auto_refdes != AutoRefdes::Off {
+            if !has_silk_dot && let Some(center) = pin1_dot_world(fp, pl) {
+                visit(SilkElement::Pin1Dot {
+                    refdes: &pl.refdes,
+                    center,
+                    radius: PIN1_DOT_RADIUS_NM,
+                });
+            }
+            let segs = refdes_world_segments(fp, pl, fab.auto_refdes);
+            if !segs.is_empty() {
+                visit(SilkElement::Refdes {
+                    refdes: &pl.refdes,
+                    segs,
+                    stroke_nm: fab.refdes_stroke_nm,
+                });
+            }
+        }
+    }
+    for (idx, graphic) in board.graphics.iter().enumerate() {
+        if is_silk_layer(graphic.layer(), side) {
+            visit(SilkElement::Graphic {
+                pl: None,
+                idx,
+                graphic,
+            });
+        }
+    }
+}
+
 pub(crate) fn is_silk_layer(layer: &str, side: Side) -> bool {
     match side {
         Side::Top => matches!(layer, "F.Silk" | "F.SilkS" | "F.Silkscreen"),
@@ -147,6 +219,25 @@ fn placement_local_bbox(fp: &FootprintDef) -> BBoxNm {
     } else {
         BBoxNm::from_pts(&pts).expand(400_000)
     }
+}
+
+fn pin1_dot_world(fp: &FootprintDef, pl: &Placement) -> Option<Pt> {
+    let pad1 = fp.pads.first()?;
+    let b = placement_local_bbox(fp);
+    let dx = if pad1.pos.x <= (b.min_x + b.max_x) / 2 {
+        -250_000
+    } else {
+        250_000
+    };
+    let dy = if pad1.pos.y >= (b.min_y + b.max_y) / 2 {
+        250_000
+    } else {
+        -250_000
+    };
+    let dot_local = Pt::new(b.min_x.min(pad1.pos.x) + dx, pad1.pos.y + dy);
+    Some(local_to_board(
+        dot_local, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side,
+    ))
 }
 
 fn needs_upright_flip(rot_deg: f64, side: Side) -> bool {
@@ -339,57 +430,23 @@ pub(crate) fn emit_silk_layer(
     let clr = board.rules.silk_clearance_nm.max(0);
     let mut raw_segs: Vec<(Pt, Pt, Nm)> = Vec::new();
     let mut filled_graphics: Vec<(&Graphic, Option<&Placement>, ResolvedShape)> = Vec::new();
-    let mut pin1_dots: Vec<Pt> = Vec::new();
+    let mut pin1_dots: Vec<(Pt, Nm)> = Vec::new();
 
-    for pl in &board.placements {
-        let Some(fp) = board.footprints.get(&pl.footprint) else {
-            continue;
-        };
-        let mut has_silk_dot = false;
-        for g in &fp.graphics {
-            let layer = remap_layer_for_side(g.layer(), pl.side);
-            if !is_silk_layer(&layer, side) {
-                continue;
-            }
-            if matches!(g, Graphic::Circle { fill: true, .. }) {
-                has_silk_dot = true;
-            }
-            if let Some(sh) = graphic_world_geom(g, Some(pl), &mut raw_segs) {
-                filled_graphics.push((g, Some(pl), sh));
+    for_each_silk_element(board, side, fab, |elem| match elem {
+        SilkElement::Graphic { pl, graphic, .. } => {
+            if let Some(sh) = graphic_world_geom(graphic, pl, &mut raw_segs) {
+                filled_graphics.push((graphic, pl, sh));
             }
         }
-
-        if pl.side == side && !pl.dnp && fab.auto_refdes != AutoRefdes::Off {
-            if !has_silk_dot && let Some(pad1) = fp.pads.first() {
-                let b = placement_local_bbox(fp);
-                let dx = if pad1.pos.x <= (b.min_x + b.max_x) / 2 {
-                    -250_000
-                } else {
-                    250_000
-                };
-                let dy = if pad1.pos.y >= (b.min_y + b.max_y) / 2 {
-                    250_000
-                } else {
-                    -250_000
-                };
-                let dot_local = Pt::new(b.min_x.min(pad1.pos.x) + dx, pad1.pos.y + dy);
-                pin1_dots.push(local_to_board(
-                    dot_local, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side,
-                ));
-            }
-            for (wa, wb) in refdes_world_segments(fp, pl, fab.auto_refdes) {
-                raw_segs.push((wa, wb, fab.refdes_stroke_nm));
+        SilkElement::Pin1Dot { center, radius, .. } => pin1_dots.push((center, radius)),
+        SilkElement::Refdes {
+            segs, stroke_nm, ..
+        } => {
+            for (wa, wb) in segs {
+                raw_segs.push((wa, wb, stroke_nm));
             }
         }
-    }
-
-    for g in &board.graphics {
-        if is_silk_layer(g.layer(), side)
-            && let Some(sh) = graphic_world_geom(g, None, &mut raw_segs)
-        {
-            filled_graphics.push((g, None, sh));
-        }
-    }
+    });
 
     // Emit clipped filled regions (with Clear holes) first so Clear polarity never erases strokes or dots.
     let mut clipped_polys: Vec<PourPoly> = Vec::new();
@@ -414,11 +471,9 @@ pub(crate) fn emit_silk_layer(
         builder.emit_graphic(g, pl);
     }
 
-    for dot_world in pin1_dots {
-        if mask_openings.is_empty()
-            || !point_hits_mask(dot_world, PIN1_DOT_RADIUS_NM, mask_openings, clr)
-        {
-            builder.flash_circle(dot_world, PIN1_DOT_RADIUS_NM * 2);
+    for (dot_world, radius) in pin1_dots {
+        if mask_openings.is_empty() || !point_hits_mask(dot_world, radius, mask_openings, clr) {
+            builder.flash_circle(dot_world, radius * 2);
         }
     }
 

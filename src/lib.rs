@@ -10,6 +10,7 @@ mod drc_layout;
 mod drc_mask;
 mod drc_rules;
 mod drc_scene;
+mod drc_silk;
 pub mod erc;
 pub mod fab;
 mod fab_assembly;
