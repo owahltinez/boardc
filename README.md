@@ -37,7 +37,7 @@ For coding agents, run `boardc skill install` (or read [SKILL.md](SKILL.md) dire
 `boardc` has zero external binary dependencies (it never shells out to `kicad-cli` or `gerbv`) and never chases KiCad bug-compatibility:
 
 - **Native Fab Verification (`src/verify.rs`)**: Re-parses every emitted Gerber via `gerber_parser`, parses PTH/NPTH and blind/buried Excellon `.drl` files independently, verifies bounds and 1-to-1 drill counts/diameters/positions, and reconstructs copper islands per layer with full `%LPD*%` / `%LPC*%` polarity replay and PTH barrel connectivity to verify zero shorts and zero opens against the `BoardIr` netlist.
-- **KiCad File Interop (`import-kicad` / `export-kicad`)**: Reads `.kicad_pcb`/`.kicad_pro`/`.kicad_mod` and writes `.kicad_pcb` + `.kicad_pro` as pure files so you can open or inspect a board in KiCad externally if desired.
+- **KiCad File Interop (`import-kicad` / `export-kicad`)**: Reads `.kicad_pcb`/`.kicad_pro`/`.kicad_mod`/`.kicad_net` and writes `.kicad_pcb` + `.kicad_pro` as pure files (preserving schematic `path`/`sheetname`/`sheetfile` metadata for `kicad-cli pcb drc --schematic-parity`) so you can open or inspect a board in KiCad externally if desired.
 
 ## CLI Subcommands
 

@@ -108,6 +108,7 @@ fn pad_world_shape_and_courtyard_transform() {
         exclude_from_bom: false,
         exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
+        schematic: None,
     };
     let p1 = pad_to_world_shape(&fp.pads[0], &pl, 8);
     let b = p1.bbox();
@@ -250,6 +251,8 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
                 thickness_nm: None,
             },
         ],
+        footprint_libs: vec![],
+        netlist: None,
         footprints,
         placements: vec![Placement {
             refdes: "R1".into(),
@@ -266,6 +269,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             exclude_from_bom: false,
             exclude_from_pos: false,
             cpl_rotation_offset_deg: 0.0,
+            schematic: None,
         }],
         keepouts: vec![],
         pours: vec![PourSpec {

@@ -2,17 +2,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
-use viahop::sexp::{self, SExp};
+use viahop::sexp::SExp;
 
 use crate::geom::{ensure_ccw, local_to_board, polygon_area};
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FilledPour, FootprintDef, Keepout, LayerDef, LayerKind,
-    NetDef, Nm, Placement, PourPoly, PourSpec, Pt, Side, Stackup, Track, Via, default_net_class,
-    default_two_layer_stackup, mm,
+    NetDef, Nm, Placement, PourPoly, PourSpec, Pt, SchematicMeta, Side, Stackup, Track, Via,
+    default_net_class, default_two_layer_stackup, mm,
 };
 use crate::kicad_geom::{
-    atom_at, chain_segments, child_atom, collect_poly_or_segment, discretize_arc, f64_at, has_flag,
-    parse_at, parse_graphic_node, parse_layers_list, parse_net_ref, parse_pt, parse_pts,
+    atom_at, chain_segments, child_atom, collect_poly_or_segment, discretize_arc, f64_at,
+    find_field_ci, has_flag, insert_kicad_field, normalize_sheetname, parse_at, parse_graphic_node,
+    parse_kicad_sexp, parse_layers_list, parse_net_ref, parse_pt, parse_pts,
 };
 use crate::kicad_io::{parse_footprint_node, parse_keepout_zone};
 use crate::kicad_pro::parse_kicad_pro;
@@ -49,7 +50,7 @@ pub(crate) fn import_kicad_pcb(
 }
 
 pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<BoardIr, String> {
-    let root = sexp::parse(src)?;
+    let root = parse_kicad_sexp(src)?;
     if root.tag() != Some("kicad_pcb") {
         return Err("expected top-level '(kicad_pcb ...)'".into());
     }
@@ -549,6 +550,7 @@ fn parse_placed_footprint(
         }
     }
 
+    let orig_fp_name = fp_def.name.clone();
     let fp_key = match footprints.get(&fp_def.name) {
         Some(existing)
             if existing.pads == fp_def.pads
@@ -591,6 +593,49 @@ fn parse_placed_footprint(
         }
     }
 
+    let path = child_atom(node, "path")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut sheetname = child_atom(node, "sheetname")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut sheetfile = child_atom(node, "sheetfile")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut fields = BTreeMap::new();
+    for prop in node.children_with_tag("property") {
+        let Some(k) = atom_at(prop, 1).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(v) = atom_at(prop, 2).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if k == "Sheetname" && sheetname.is_none() && !v.trim().is_empty() {
+            sheetname = Some(normalize_sheetname(v));
+        } else if k == "Sheetfile" && sheetfile.is_none() && !v.trim().is_empty() {
+            sheetfile = Some(v.trim().to_string());
+        } else {
+            insert_kicad_field(&mut fields, k, v);
+        }
+    }
+    let mpn = find_field_ci(&fields, "mpn");
+    let lcsc = find_field_ci(&fields, "lcsc");
+    let has_sch = path.is_some()
+        || sheetname.is_some()
+        || sheetfile.is_some()
+        || !fields.is_empty()
+        || orig_fp_name != fp_key;
+    let schematic = has_sch.then(|| SchematicMeta {
+        path,
+        sheetname,
+        sheetfile,
+        footprint: (!orig_fp_name.is_empty()).then_some(orig_fp_name),
+        fields,
+    });
+
     let mut pin_nets = BTreeMap::new();
     for (pin, net) in pad_nets {
         pin_nets.insert(pin, net);
@@ -604,12 +649,13 @@ fn parse_placed_footprint(
         side,
         locked: has_flag(node, "locked"),
         pin_nets,
-        mpn: None,
-        lcsc: None,
+        mpn,
+        lcsc,
         dnp,
         exclude_from_bom,
         exclude_from_pos,
         cpl_rotation_offset_deg: 0.0,
+        schematic,
     });
     Ok(())
 }

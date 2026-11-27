@@ -110,6 +110,7 @@ fn make_4layer_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "C1".into(),
@@ -126,6 +127,7 @@ fn make_4layer_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "C2".into(),
@@ -142,6 +144,7 @@ fn make_4layer_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 90.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "R_DNP".into(),
@@ -158,6 +161,7 @@ fn make_4layer_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "J1".into(),
@@ -174,6 +178,7 @@ fn make_4layer_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             Placement {
                 refdes: "H1".into(),
@@ -190,6 +195,7 @@ fn make_4layer_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
         ],
         keepouts: Vec::new(),
@@ -287,6 +293,7 @@ fn make_4layer_board() -> BoardIr {
         constraints: Default::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
     let mut board = BoardIr::from_spec(&spec).unwrap();
     fill_zones(&mut board);

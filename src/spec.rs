@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 use crate::footprints;
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FootprintDef, Graphic, Keepout, LayerDef, NetClass, NetDef,
-    Nm, PadDef, Placement, PourSpec, Pt, Stackup, Track, Via, default_net_class,
-    default_two_layer_stackup,
+    Nm, PadDef, Placement, PourSpec, Pt, Stackup, Track, Via, default_two_layer_stackup,
+};
+use crate::kicad_io::load_kicad_net;
+use crate::spec_kicad::{
+    apply_netlist_components, bare_footprint_name, resolve_footprint_from_libs,
+    resolve_footprint_libs, resolve_spec_path, sync_spec_and_netlist_nets,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,6 +100,10 @@ pub struct BoardSpec {
     pub cutouts: Vec<Vec<Pt>>,
     #[serde(default)]
     pub layers: Vec<LayerDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub footprint_libs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netlist: Option<String>,
     #[serde(default)]
     pub footprints: BTreeMap<String, FootprintSpec>,
     #[serde(default)]
@@ -124,6 +132,11 @@ pub struct BoardSpec {
 
 impl BoardIr {
     pub fn from_spec(spec: &BoardSpec) -> Result<Self, String> {
+        Self::from_spec_with_base(spec, None)
+    }
+
+    /// Resolves `BoardSpec` into `BoardIr`, resolving relative `footprint_libs` and `netlist` paths against `base_dir`.
+    pub fn from_spec_with_base(spec: &BoardSpec, base_dir: Option<&Path>) -> Result<Self, String> {
         let outline = if !spec.outline.is_empty() {
             spec.outline.clone()
         } else if let Some([w, h]) = spec.size_nm {
@@ -142,44 +155,57 @@ impl BoardIr {
         } else {
             spec.layers.clone()
         };
+
+        let resolved_libs = resolve_footprint_libs(&spec.footprint_libs, base_dir)?;
+        let netlist = match spec.netlist.as_deref() {
+            Some(raw_net) => Some(load_kicad_net(&resolve_spec_path(
+                raw_net, base_dir, "netlist",
+            )?)?),
+            None => None,
+        };
+
         let mut footprints = BTreeMap::new();
         for (name, fp_spec) in &spec.footprints {
             footprints.insert(name.clone(), fp_spec.resolve(name)?);
         }
         let mut placements = spec.placements.clone();
+        let mut seen_refs = HashSet::with_capacity(placements.len());
+        for p in &placements {
+            let r = p.refdes.trim();
+            if !r.is_empty() && !seen_refs.insert(r) {
+                return Err(format!("duplicate placement refdes '{}'", p.refdes));
+            }
+        }
         let mut nets = spec.nets.clone();
+
+        if let Some(ref nl) = netlist {
+            apply_netlist_components(&mut placements, nl)?;
+        }
+
         for p in &placements {
+            if p.footprint.trim().is_empty() {
+                return Err(format!("placement '{}' has no footprint", p.refdes));
+            }
             if !footprints.contains_key(&p.footprint) {
-                return Err(format!(
-                    "placement '{}' references unknown footprint '{}'",
-                    p.refdes, p.footprint
-                ));
-            }
-        }
-        // Keep Placement::pin_nets and NetDef::pins mutually consistent.
-        for p in &placements {
-            for (pin, net_name) in &p.pin_nets {
-                let entry = nets.entry(net_name.clone()).or_insert_with(|| NetDef {
-                    name: net_name.clone(),
-                    class: default_net_class(),
-                    pins: Vec::new(),
-                    ignore_route: false,
-                });
-                let pair = (p.refdes.clone(), pin.clone());
-                if !entry.pins.contains(&pair) {
-                    entry.pins.push(pair);
+                let qual_fallback = p
+                    .schematic
+                    .as_ref()
+                    .and_then(|s| s.footprint.as_deref())
+                    .filter(|sf| bare_footprint_name(sf) == p.footprint);
+                if let Some(fp) =
+                    resolve_footprint_from_libs(&p.footprint, qual_fallback, &resolved_libs)?
+                {
+                    footprints.insert(p.footprint.clone(), fp);
+                } else {
+                    return Err(format!(
+                        "placement '{}' references unknown footprint '{}'",
+                        p.refdes, p.footprint
+                    ));
                 }
             }
         }
-        for (net_name, net_def) in &nets {
-            for (refdes, pin) in &net_def.pins {
-                if let Some(p) = placements.iter_mut().find(|pl| &pl.refdes == refdes) {
-                    p.pin_nets
-                        .entry(pin.clone())
-                        .or_insert_with(|| net_name.clone());
-                }
-            }
-        }
+
+        sync_spec_and_netlist_nets(&mut placements, &mut nets, netlist.as_ref());
         if spec.rules.track_width_nm <= 0
             || spec.rules.via_dia_nm <= 0
             || spec.rules.via_drill_nm <= 0
@@ -259,6 +285,16 @@ pub fn save_board_json(board: &BoardIr, path: &Path) -> Result<(), String> {
 pub fn load_board_json(path: &Path) -> Result<BoardIr, String> {
     let text = fs::read_to_string(path)
         .map_err(|e| format!("failed to read board IR '{}': {e}", path.display()))?;
-    serde_json::from_str(&text)
-        .map_err(|e| format!("failed to parse board IR '{}': {e}", path.display()))
+    let ir: BoardIr = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse board IR '{}': {e}", path.display()))?;
+    for p in &ir.placements {
+        if p.footprint.trim().is_empty() {
+            return Err(format!(
+                "board IR '{}' placement '{}' has empty footprint",
+                path.display(),
+                p.refdes
+            ));
+        }
+    }
+    Ok(ir)
 }

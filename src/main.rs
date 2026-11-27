@@ -4,13 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use boardc::drc::{check_board_drc, cluster_kicad_drc_json};
 use boardc::fab::{FabOptions, export_fab};
 use boardc::ir::{
     BoardIr, BoardSpec, Constraints, FootprintSpec, LayerDef, LayerKind, MaxLengthRule, Placement,
-    PourSpec, Pt, Side, load_board_json, load_spec_file, mm, nm_to_mm, save_board_json,
+    PourSpec, Pt, Side, load_spec_file, mm, nm_to_mm, save_board_json,
 };
 use boardc::kicad_export::export_kicad_pcb;
 use boardc::kicad_io::import_kicad_pcb;
@@ -309,18 +309,72 @@ fn sample_spec() -> BoardSpec {
     }
 }
 
-fn load_board_input(path: &Path) -> Result<BoardIr, String> {
-    if path.extension().and_then(|s| s.to_str()) == Some("kicad_pcb") {
-        import_kicad_pcb(path, None)
-    } else {
-        match load_board_json(path) {
-            Ok(ir) => Ok(ir),
-            Err(_) => {
-                let spec = load_spec_file(path)?;
-                BoardIr::from_spec(&spec)
-            }
+fn spec_base_dir(path: &Path) -> Option<&Path> {
+    path.parent().filter(|p| !p.as_os_str().is_empty())
+}
+
+fn load_spec_as_ir(path: &Path) -> Result<BoardIr, String> {
+    let spec = load_spec_file(path)?;
+    BoardIr::from_spec_with_base(&spec, spec_base_dir(path))
+}
+
+#[derive(Default, Deserialize)]
+struct JsonBoardProbe {
+    footprint_libs: Option<serde::de::IgnoredAny>,
+    netlist: Option<serde::de::IgnoredAny>,
+    size_nm: Option<serde::de::IgnoredAny>,
+    filled_pours: Option<serde::de::IgnoredAny>,
+}
+
+fn validate_loaded_ir(ir: BoardIr, path: &Path) -> Result<BoardIr, String> {
+    for p in &ir.placements {
+        if p.footprint.trim().is_empty() {
+            return Err(format!(
+                "board IR '{}' placement '{}' has empty footprint",
+                path.display(),
+                p.refdes
+            ));
         }
     }
+    Ok(ir)
+}
+
+fn load_board_input(path: &Path) -> Result<BoardIr, String> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("kicad_pcb") => return import_kicad_pcb(path, None),
+        Some("toml") => return load_spec_as_ir(path),
+        _ => {}
+    }
+
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    let base = spec_base_dir(path);
+    if let Ok(probe) = serde_json::from_str::<JsonBoardProbe>(&text) {
+        if probe.footprint_libs.is_some() || probe.netlist.is_some() || probe.size_nm.is_some() {
+            let spec: BoardSpec = serde_json::from_str(&text)
+                .map_err(|e| format!("failed to parse JSON spec '{}': {e}", path.display()))?;
+            return BoardIr::from_spec_with_base(&spec, base);
+        }
+        if probe.filled_pours.is_some() {
+            let ir: BoardIr = serde_json::from_str(&text)
+                .map_err(|e| format!("failed to parse board IR '{}': {e}", path.display()))?;
+            return validate_loaded_ir(ir, path);
+        }
+        if let Ok(spec) = serde_json::from_str::<BoardSpec>(&text) {
+            return BoardIr::from_spec_with_base(&spec, base);
+        }
+        let ir: BoardIr = serde_json::from_str(&text)
+            .map_err(|e| format!("failed to parse board IR '{}': {e}", path.display()))?;
+        return validate_loaded_ir(ir, path);
+    }
+
+    let spec: BoardSpec = toml::from_str(&text)
+        .map_err(|e| format!("failed to parse spec '{}': {e}", path.display()))?;
+    BoardIr::from_spec_with_base(&spec, base)
 }
 
 fn to_net_set(items: Vec<String>) -> HashSet<String> {
@@ -352,8 +406,7 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::DumpSpec { input, format, out } => {
             let text = if let Some(path) = input {
-                let spec = load_spec_file(&path)?;
-                let ir = BoardIr::from_spec(&spec)?;
+                let ir = load_spec_as_ir(&path)?;
                 serde_json::to_string_pretty(&ir)
                     .map_err(|e| format!("failed to serialize BoardIr: {e}"))?
             } else {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::f64::consts::{FRAC_PI_2, TAU};
 
 use viahop::sexp::SExp;
@@ -8,6 +8,151 @@ use crate::ir::{Graphic, Nm, Pt, Side, mm};
 use crate::shapes::circle_poly;
 
 const CHAIN_TOL_NM: Nm = 10_000;
+
+/// Iterative KiCad S-expression parser handling `#` atoms (e.g. `#PWR01`) and full string escapes.
+pub(crate) fn parse_kicad_sexp(src: &str) -> Result<SExp, String> {
+    let bytes = src.as_bytes();
+    let mut pos = 0usize;
+    let mut stack: Vec<Vec<SExp>> = Vec::new();
+    let mut root: Option<SExp> = None;
+
+    while pos < bytes.len() {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+        match bytes[pos] {
+            b'(' => {
+                if root.is_some() {
+                    return Err("unexpected trailing expression in KiCad S-expression".into());
+                }
+                pos += 1;
+                stack.push(Vec::new());
+            }
+            b')' => {
+                pos += 1;
+                let list = stack
+                    .pop()
+                    .ok_or_else(|| "unexpected ')' in KiCad S-expression".to_string())?;
+                let node = SExp::List(list);
+                if let Some(parent) = stack.last_mut() {
+                    parent.push(node);
+                } else {
+                    root = Some(node);
+                }
+            }
+            b'"' => {
+                if root.is_some() {
+                    return Err("unexpected trailing string in KiCad S-expression".into());
+                }
+                pos += 1;
+                let mut s = String::new();
+                let mut closed = false;
+                while pos < bytes.len() {
+                    let b = bytes[pos];
+                    if b == b'"' {
+                        pos += 1;
+                        closed = true;
+                        break;
+                    }
+                    if b == b'\\' {
+                        pos += 1;
+                        if pos >= bytes.len() {
+                            return Err("unterminated escape in KiCad S-expression string".into());
+                        }
+                        match bytes[pos] {
+                            b'\\' => s.push('\\'),
+                            b'"' => s.push('"'),
+                            b'n' => s.push('\n'),
+                            b'r' => s.push('\r'),
+                            b't' => s.push('\t'),
+                            _ => {
+                                let ch = src[pos..].chars().next().unwrap();
+                                s.push(ch);
+                                pos += ch.len_utf8();
+                                continue;
+                            }
+                        }
+                        pos += 1;
+                    } else {
+                        let start = pos;
+                        while pos < bytes.len() && bytes[pos] != b'"' && bytes[pos] != b'\\' {
+                            pos += 1;
+                        }
+                        s.push_str(&src[start..pos]);
+                    }
+                }
+                if !closed {
+                    return Err("unterminated quoted string in KiCad S-expression".into());
+                }
+                let node = SExp::Atom(s);
+                if let Some(parent) = stack.last_mut() {
+                    parent.push(node);
+                } else {
+                    root = Some(node);
+                }
+            }
+            _ => {
+                if root.is_some() {
+                    return Err("unexpected trailing token in KiCad S-expression".into());
+                }
+                let start = pos;
+                while pos < bytes.len()
+                    && !bytes[pos].is_ascii_whitespace()
+                    && bytes[pos] != b'('
+                    && bytes[pos] != b')'
+                {
+                    pos += 1;
+                }
+                let node = SExp::Atom(src[start..pos].to_string());
+                if let Some(parent) = stack.last_mut() {
+                    parent.push(node);
+                } else {
+                    root = Some(node);
+                }
+            }
+        }
+    }
+
+    if !stack.is_empty() {
+        return Err("unclosed '(' in KiCad S-expression".into());
+    }
+    root.ok_or_else(|| "empty KiCad S-expression".into())
+}
+
+pub(crate) fn is_ignored_kicad_field(name: &str) -> bool {
+    name.trim().is_empty()
+        || matches!(
+            name,
+            "Reference" | "Value" | "Footprint" | "Sheetname" | "Sheetfile"
+        )
+        || name.starts_with("ki_")
+}
+
+pub(crate) fn insert_kicad_field(fields: &mut BTreeMap<String, String>, k: &str, v: &str) {
+    if is_ignored_kicad_field(k) || v.is_empty() || (k == "Datasheet" && v == "~") {
+        return;
+    }
+    fields.insert(k.to_string(), v.to_string());
+}
+
+pub(crate) fn find_field_ci(fields: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.clone())
+}
+
+pub(crate) fn normalize_sheetname(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        "/".into()
+    } else {
+        format!("/{trimmed}/")
+    }
+}
 
 pub(crate) fn atom_at(node: &SExp, idx: usize) -> Option<&str> {
     node.as_list()?.get(idx)?.as_atom()

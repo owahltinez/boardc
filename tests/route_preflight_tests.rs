@@ -69,6 +69,7 @@ fn place_2pin(
         exclude_from_bom: false,
         exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
+        ..Default::default()
     }
 }
 
@@ -122,6 +123,7 @@ fn build_2layer_board() -> BoardIr {
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             },
             place_2pin("R1", "R_0603", (23.0, 14.0), 0.0, Side::Top, "SIG_A", "VCC"),
             place_2pin(
@@ -145,6 +147,7 @@ fn build_2layer_board() -> BoardIr {
         constraints: Constraints::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
     BoardIr::from_spec(&spec).unwrap()
 }
@@ -246,6 +249,7 @@ fn route_4layer_board_ir_with_inner_planes_clean_drc() {
         constraints: Constraints::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
     let mut board = BoardIr::from_spec(&spec).unwrap();
     let vboard = to_viahop_board(&board, &HashSet::new(), None).unwrap();
@@ -443,6 +447,7 @@ fn length_constraints_propagate_to_viahop() {
             },
             graphics: Vec::new(),
             stackup: Default::default(),
+            ..Default::default()
         };
         BoardIr::from_spec(&spec).unwrap()
     };
@@ -540,6 +545,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
                 exclude_from_bom: false,
                 exclude_from_pos: false,
                 cpl_rotation_offset_deg: 0.0,
+                ..Default::default()
             });
         }
     }
@@ -558,6 +564,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
         exclude_from_bom: false,
         exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
+        ..Default::default()
     });
 
     // Overlapping 0603 courtyards (C1 and C2, pads don't short) + C1 violates cap_proximity to U1 (> 3mm).
@@ -596,6 +603,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
         exclude_from_bom: false,
         exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
+        ..Default::default()
     });
     placements.push(Placement {
         refdes: "G2".into(),
@@ -612,6 +620,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
         exclude_from_bom: false,
         exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
+        ..Default::default()
     });
 
     let spec = BoardSpec {
@@ -671,6 +680,7 @@ fn preflight_catches_courtyard_cap_proximity_pinched_zone_and_sealed_bga_fast() 
         },
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
     let board = BoardIr::from_spec(&spec).unwrap();
 
@@ -761,6 +771,7 @@ fn preflight_catches_edge_keepout_blocked_net_and_fixed_violation() {
         exclude_from_bom: false,
         exclude_from_pos: false,
         cpl_rotation_offset_deg: 0.0,
+        ..Default::default()
     };
 
     let spec = BoardSpec {
@@ -813,6 +824,7 @@ fn preflight_catches_edge_keepout_blocked_net_and_fixed_violation() {
         constraints: Constraints::default(),
         graphics: Vec::new(),
         stackup: Default::default(),
+        ..Default::default()
     };
     let board = BoardIr::from_spec(&spec).unwrap();
     let summary = run_preflight(&board, &HashSet::new()).unwrap();
