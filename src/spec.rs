@@ -5,10 +5,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::footprints;
+use crate::geom::polygon_signed_area_2;
 use crate::ir::{
     BoardIr, Constraints, DesignRules, FabConfig, FootprintDef, Graphic, Keepout, LayerDef,
-    NetClass, NetDef, Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup, Track, Via,
-    default_two_layer_stackup,
+    Model3d, NetClass, NetDef, Nm, PadDef, PadKind, PinType, Placement, PourSpec, Pt, Stackup,
+    Track, Via, default_two_layer_stackup,
 };
 use crate::kicad_io::load_kicad_net;
 use crate::spec_kicad::{
@@ -17,7 +18,7 @@ use crate::spec_kicad::{
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FootprintSpec {
     Chip2Pin {
         package: String,
@@ -60,11 +61,15 @@ pub enum FootprintSpec {
         graphics: Vec<Graphic>,
         #[serde(default)]
         keepouts: Vec<Keepout>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        models: Vec<Model3d>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pin_types: BTreeMap<String, PinType>,
     },
-    /// Pin-type overlay for a `.kicad_mod` footprint loaded from `footprint_libs`.
+    /// Pin-type and/or courtyard overlay for a `.kicad_mod` footprint loaded from `footprint_libs`.
     Lib {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        courtyard: Option<Vec<Pt>>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pin_types: BTreeMap<String, PinType>,
     },
@@ -76,28 +81,48 @@ fn deserialize_footprints<'de, D: serde::Deserializer<'de>>(
     let raw = BTreeMap::<String, serde_json::Value>::deserialize(de)?;
     let mut out = BTreeMap::new();
     for (name, mut val) in raw {
-        if let Some(map) = val.as_object_mut() {
-            if !map.contains_key("kind") && map.contains_key("pin_types") {
-                if map.len() > 1 {
-                    return Err(serde::de::Error::custom(format!(
-                        "footprint '{name}' missing 'kind' field"
-                    )));
-                }
-                map.insert("kind".into(), serde_json::Value::String("lib".into()));
-            }
-            if map.get("kind").and_then(|v| v.as_str()) == Some("lib")
-                && map.keys().any(|k| k != "kind" && k != "pin_types")
-            {
-                return Err(serde::de::Error::custom(format!(
-                    "footprint '{name}' with kind='lib' only accepts 'pin_types'"
-                )));
-            }
+        if let Some(map) = val.as_object_mut()
+            && !map.contains_key("kind")
+            && !map.is_empty()
+            && map.keys().all(|k| k == "pin_types" || k == "courtyard")
+        {
+            map.insert("kind".into(), serde_json::Value::String("lib".into()));
         }
         let fp: FootprintSpec = serde_json::from_value(val)
             .map_err(|e| serde::de::Error::custom(format!("footprint '{name}': {e}")))?;
         out.insert(name, fp);
     }
     Ok(out)
+}
+
+fn validate_courtyard(owner: &str, pts: &[Pt]) -> Result<(), String> {
+    if pts.len() < 3 {
+        return Err(format!("{owner} courtyard must have at least 3 vertices"));
+    }
+    if polygon_signed_area_2(pts) == 0 {
+        return Err(format!("{owner} courtyard polygon must have non-zero area"));
+    }
+    Ok(())
+}
+
+fn validate_models(owner: &str, models: &[Model3d]) -> Result<(), String> {
+    for (i, m) in models.iter().enumerate() {
+        if m.path.trim().is_empty() {
+            return Err(format!("{owner} model#{i} has empty path"));
+        }
+        if m.offset_mm.iter().any(|v| !v.is_finite())
+            || m.scale.iter().any(|v| !v.is_finite())
+            || m.rotate_deg.iter().any(|v| !v.is_finite())
+        {
+            return Err(format!("{owner} model#{i} has non-finite transform value"));
+        }
+        if m.scale.contains(&0.0) {
+            return Err(format!(
+                "{owner} model#{i} scale components must be non-zero"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl FootprintSpec {
@@ -138,22 +163,30 @@ impl FootprintSpec {
                 courtyard,
                 graphics,
                 keepouts,
+                models,
                 pin_types,
-            } => (
-                FootprintDef {
-                    name: String::new(),
-                    pads: pads.clone(),
-                    courtyard: courtyard.clone(),
-                    graphics: graphics.clone(),
-                    keepouts: keepouts.clone(),
-                    models: Vec::new(),
-                    pin_types: BTreeMap::new(),
-                },
-                pin_types,
-            ),
+            } => {
+                let owner = format!("footprint '{name}'");
+                if !courtyard.is_empty() {
+                    validate_courtyard(&owner, courtyard)?;
+                }
+                validate_models(&owner, models)?;
+                (
+                    FootprintDef {
+                        name: String::new(),
+                        pads: pads.clone(),
+                        courtyard: courtyard.clone(),
+                        graphics: graphics.clone(),
+                        keepouts: keepouts.clone(),
+                        models: models.clone(),
+                        pin_types: BTreeMap::new(),
+                    },
+                    pin_types,
+                )
+            }
             Self::Lib { .. } => {
                 return Err(format!(
-                    "footprint '{name}' is a library pin_types overlay and requires footprint_libs"
+                    "footprint '{name}' is a library overlay and requires footprint_libs"
                 ));
             }
         };
@@ -194,6 +227,13 @@ pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
         .validate()
         .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     for (name, fp) in &ir.footprints {
+        let owner = format!("footprint '{name}'");
+        if !fp.courtyard.is_empty() {
+            validate_courtyard(&owner, &fp.courtyard)
+                .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
+        }
+        validate_models(&owner, &fp.models)
+            .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
         validate_pin_types_for_footprint("footprint", name, fp, &fp.pin_types)
             .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     }
@@ -328,7 +368,7 @@ impl BoardIr {
                 if let Some(mut fp) =
                     resolve_footprint_from_libs(&p.footprint, qual_fallback, &resolved_libs)?
                 {
-                    if let Some((key, pin_types)) = [
+                    if let Some((key, courtyard, pin_types)) = [
                         Some(p.footprint.as_str()),
                         qual_fallback,
                         Some(bare_footprint_name(&p.footprint)),
@@ -336,12 +376,19 @@ impl BoardIr {
                     .into_iter()
                     .flatten()
                     .find_map(|k| match spec.footprints.get_key_value(k) {
-                        Some((key, FootprintSpec::Lib { pin_types })) => {
-                            Some((key.as_str(), pin_types))
-                        }
+                        Some((
+                            key,
+                            FootprintSpec::Lib {
+                                courtyard,
+                                pin_types,
+                            },
+                        )) => Some((key.as_str(), courtyard, pin_types)),
                         _ => None,
                     }) {
                         matched_overlays.insert(key);
+                        if let Some(cy) = courtyard {
+                            fp.courtyard = cy.clone();
+                        }
                         fp.pin_types = pin_types.clone();
                         validate_pin_types_for_footprint(
                             "footprint",
@@ -364,12 +411,24 @@ impl BoardIr {
             }
         }
         for (name, fp_spec) in &spec.footprints {
-            if matches!(fp_spec, FootprintSpec::Lib { .. })
-                && !matched_overlays.contains(name.as_str())
+            if let FootprintSpec::Lib {
+                courtyard,
+                pin_types,
+            } = fp_spec
             {
-                return Err(format!(
-                    "footprint '{name}' pin_types overlay did not match any library footprint placement"
-                ));
+                if courtyard.is_none() && pin_types.is_empty() {
+                    return Err(format!(
+                        "footprint '{name}' library overlay must specify courtyard and/or pin_types"
+                    ));
+                }
+                if let Some(cy) = courtyard {
+                    validate_courtyard(&format!("footprint '{name}'"), cy)?;
+                }
+                if !matched_overlays.contains(name.as_str()) {
+                    return Err(format!(
+                        "footprint '{name}' library overlay did not match any library footprint placement"
+                    ));
+                }
             }
         }
 
