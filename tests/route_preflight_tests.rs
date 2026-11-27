@@ -186,6 +186,7 @@ fn route_4layer_board_ir_with_inner_planes_clean_drc() {
                 class: "Default".into(),
                 pins: Vec::new(),
                 ignore_route: ignore,
+                power_driven: false,
             },
         );
     }
@@ -401,6 +402,7 @@ fn length_constraints_propagate_to_viahop() {
                 class: "HS".into(),
                 pins: Vec::new(),
                 ignore_route: false,
+                power_driven: false,
             },
         );
     }

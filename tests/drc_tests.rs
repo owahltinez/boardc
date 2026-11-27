@@ -182,6 +182,7 @@ fn continuous_nm_clearance_zero_slack_and_net_class() {
             class: "HV".into(),
             pins: Vec::new(),
             ignore_route: false,
+            power_driven: false,
         },
     );
     let rep_hv = check_board_drc(&board);

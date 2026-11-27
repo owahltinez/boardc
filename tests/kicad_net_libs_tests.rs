@@ -515,6 +515,7 @@ fn footprint_lib_errors_precedence_and_path_traversal_guards() {
                 class: "Default".into(),
                 pins: vec![("R1".into(), "1".into())],
                 ignore_route: false,
+                power_driven: false,
             },
         )]),
         placements: vec![Placement {
@@ -987,6 +988,7 @@ fn roast_regressions_sexp_escapes_lib_isolation_net_sync_and_parity() {
                 class: "Default".into(),
                 pins: vec![("U1".into(), "1".into())],
                 ignore_route: false,
+                power_driven: false,
             },
         )]),
         placements: vec![

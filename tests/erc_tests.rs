@@ -9,7 +9,7 @@ use boardc::ir::{
     BoardIr, BoardSpec, FootprintSpec, NetDef, PadDef, PadKind, PadShape, PinType, Placement,
     PourSpec, Pt, load_board_json, load_spec_file, mm, save_board_json,
 };
-use boardc::pipeline::{BuildOptions, compile_board};
+use boardc::pipeline::{BuildOptions, StageKind, compile_board};
 use boardc::preflight::{PreflightSummary, run_preflight};
 
 fn test_dir(name: &str) -> PathBuf {
@@ -374,6 +374,13 @@ fn erc_partial_annotation_dnp_copper_unconnected_and_order_invariance() {
                 pin_types: BTreeMap::from([("1".into(), PinType::Out), ("2".into(), PinType::Nc)]),
                 ..Default::default()
             },
+            Placement {
+                refdes: "U6".into(),
+                footprint: "DUAL".into(),
+                pos: Pt::new(mm(25.0), mm(15.0)),
+                pin_types: BTreeMap::from([("1".into(), PinType::In), ("2".into(), PinType::Nc)]),
+                ..Default::default()
+            },
         ],
         pours: vec![PourSpec {
             name: "P1".into(),
@@ -391,7 +398,7 @@ fn erc_partial_annotation_dnp_copper_unconnected_and_order_invariance() {
     };
     let ir = BoardIr::from_spec(&spec).unwrap();
     let rep = check_board_erc(&ir);
-    // Only U4.1 (unconnected-(...) on non-nc) and U5.1 (LONE_OUT single-pin) should fail.
+    // U4.1/U4.2 on unconnected-(...) are intentional nc; only U6.1 (genuinely unassigned) and U5.1 (LONE_OUT) fail.
     assert_eq!(
         rep.violations.len(),
         2,
@@ -399,7 +406,7 @@ fn erc_partial_annotation_dnp_copper_unconnected_and_order_invariance() {
         rep.violations
     );
     assert!(rep.violations.iter().any(|v| {
-        v.kind == ErcViolationKind::UnconnectedPin && v.pins == vec!["U4.1"] && v.net.is_empty()
+        v.kind == ErcViolationKind::UnconnectedPin && v.pins == vec!["U6.1"] && v.net.is_empty()
     }));
     assert!(rep.violations.iter().any(|v| {
         v.kind == ErcViolationKind::SinglePinNet && v.net == "LONE_OUT" && v.pins == vec!["U5.1"]
@@ -428,6 +435,7 @@ fn erc_partial_annotation_dnp_copper_unconnected_and_order_invariance() {
             class: String::new(),
             pins: vec![("U1".into(), "3".into()), ("U2".into(), "3".into())],
             ignore_route: false,
+            power_driven: false,
         },
     )]);
     let nets_only = check_board_erc(&rev_ir);
@@ -700,6 +708,437 @@ fn preflight_pipeline_and_cli_erc_report_and_gate_on_erc_errors() {
             .unwrap()
             .passed
     );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn erc_power_driven_net_suppresses_undriven_and_invalidates_preflight_cache() {
+    let dir = test_dir("power_driven");
+    // Passive shunt/ferrite-fed rail with power_in + in (EN strapped to rail) + passive pins.
+    let base_toml = r#"
+name = "power_driven_board"
+size_nm = [40000000, 30000000]
+
+[net_classes.Power]
+name = "Power"
+track_width_nm = 300000
+clearance_nm = 150000
+via_dia_nm = 500000
+via_drill_nm = 250000
+
+[nets.VDD_1V8_IO]
+class = "Power"
+power_driven = true
+
+[nets.GND]
+class = "Power"
+power_driven = true
+
+[footprints.FB_0402]
+kind = "chip2_pin"
+package = "0402"
+pin_types = { "1" = "passive", "2" = "passive" }
+
+[footprints.U_LOAD]
+kind = "sot23"
+pin_count = 3
+pin_types = { "1" = "power_in", "2" = "power_in", "3" = "in" }
+
+[[placements]]
+refdes = "FB1"
+footprint = "FB_0402"
+pos = { x = 8000000, y = 15000000 }
+locked = true
+pin_nets = { "1" = "VIN", "2" = "VDD_1V8_IO" }
+
+[[placements]]
+refdes = "FB2"
+footprint = "FB_0402"
+pos = { x = 14000000, y = 15000000 }
+locked = true
+pin_nets = { "1" = "VIN", "2" = "GND" }
+
+[[placements]]
+refdes = "U1"
+footprint = "U_LOAD"
+pos = { x = 22000000, y = 15000000 }
+locked = true
+pin_nets = { "1" = "VDD_1V8_IO", "2" = "GND", "3" = "VDD_1V8_IO" }
+"#;
+    let spec: BoardSpec = toml::from_str(base_toml).unwrap();
+    let ir = BoardIr::from_spec(&spec).unwrap();
+    assert_eq!(ir.nets["VDD_1V8_IO"].name, "VDD_1V8_IO");
+    assert_eq!(ir.nets["VDD_1V8_IO"].class, "Power");
+    assert!(ir.nets["VDD_1V8_IO"].power_driven);
+    assert!(!ir.nets["VIN"].power_driven);
+
+    let rep = check_board_erc(&ir);
+    assert!(rep.passed, "expected clean ERC: {:?}", rep.violations);
+    assert_eq!(rep.error_count, 0);
+
+    // JSON round-trip preserves power_driven = true and omits false.
+    let ir_path = dir.join("power_driven.board.json");
+    save_board_json(&ir, &ir_path).unwrap();
+    let raw_json = fs::read_to_string(&ir_path).unwrap();
+    assert!(raw_json.contains("\"power_driven\": true"));
+    let rt = load_board_json(&ir_path).unwrap();
+    assert!(rt.nets["VDD_1V8_IO"].power_driven);
+    assert!(!rt.nets["VIN"].power_driven);
+
+    // power_driven = true + 1 power_out pin on the same net must NOT raise PowerOutputConflict.
+    let mut with_pwr_out = rt.clone();
+    with_pwr_out.placements[0]
+        .pin_types
+        .insert("2".into(), PinType::PowerOut);
+    let rep_po = check_board_erc(&with_pwr_out);
+    assert!(
+        rep_po.passed,
+        "unexpected violations: {:?}",
+        rep_po.violations
+    );
+
+    // Toggling power_driven invalidates the pipeline preflight cache cleanly.
+    let mut undriven_spec = spec.clone();
+    undriven_spec
+        .nets
+        .get_mut("VDD_1V8_IO")
+        .unwrap()
+        .power_driven = false;
+    let undriven_ir = BoardIr::from_spec(&undriven_spec).unwrap();
+    let undriven_rep = check_board_erc(&undriven_ir);
+    assert!(
+        undriven_rep
+            .violations
+            .iter()
+            .any(|v| v.kind == ErcViolationKind::UndrivenPowerInput && v.net == "VDD_1V8_IO")
+    );
+
+    let cache_dir = dir.join("cache");
+    let cfg = BuildOptions {
+        cache_dir,
+        use_cache: true,
+        ..Default::default()
+    };
+    let r1 = compile_board(undriven_ir, &cfg).unwrap();
+    assert!(!r1.ok);
+    let r2 = compile_board(ir, &cfg).unwrap();
+    assert!(r2.ok);
+    assert!(
+        !r2.stage_hit(StageKind::Preflight),
+        "toggling power_driven must invalidate preflight cache"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn erc_open_collector_and_open_drain_alias_matrix() {
+    assert_eq!(PinType::OpenCollector.as_str(), "open_collector");
+    let parsed_json: BTreeMap<String, PinType> =
+        serde_json::from_str(r#"{"a":"open_collector","b":"open_drain"}"#).unwrap();
+    assert_eq!(parsed_json["a"], PinType::OpenCollector);
+    assert_eq!(parsed_json["b"], PinType::OpenCollector);
+
+    // Clean wired-OR I2C/INT bus + bidir/tri/passive/in compatibility.
+    let clean_toml = r#"
+name = "open_drain_clean"
+size_nm = [40000000, 30000000]
+
+[footprints.U_PMIC]
+kind = "sot23"
+pin_count = 5
+pin_types = { "1" = "open_collector", "2" = "open_drain", "3" = "in", "4" = "bidir", "5" = "tri" }
+
+[footprints.R_PU]
+kind = "chip2_pin"
+package = "0402"
+pin_types = { "1" = "passive", "2" = "passive" }
+
+[nets.VDD]
+power_driven = true
+
+[[placements]]
+refdes = "U1"
+footprint = "U_PMIC"
+pos = { x = 10000000, y = 15000000 }
+pin_nets = { "1" = "SCL", "2" = "INT_N", "3" = "INT_N", "4" = "SDA", "5" = "BUS" }
+
+[[placements]]
+refdes = "U2"
+footprint = "U_PMIC"
+pos = { x = 22000000, y = 15000000 }
+pin_nets = { "1" = "SCL", "2" = "INT_N", "3" = "SCL", "4" = "INT_N", "5" = "INT_N" }
+
+[[placements]]
+refdes = "R1"
+footprint = "R_PU"
+pos = { x = 16000000, y = 22000000 }
+pin_nets = { "1" = "VDD", "2" = "INT_N" }
+
+[[placements]]
+refdes = "R2"
+footprint = "R_PU"
+pos = { x = 20000000, y = 22000000 }
+pin_nets = { "1" = "VDD", "2" = "SDA" }
+
+[[placements]]
+refdes = "R3"
+footprint = "R_PU"
+pos = { x = 24000000, y = 22000000 }
+pin_nets = { "1" = "VDD", "2" = "BUS" }
+"#;
+    let clean_ir = BoardIr::from_spec(&toml::from_str(clean_toml).unwrap()).unwrap();
+    let clean_rep = check_board_erc(&clean_ir);
+    assert!(
+        clean_rep.passed && clean_rep.warning_count == 0,
+        "unexpected violations: {:?}",
+        clean_rep.violations
+    );
+
+    // Conflict matrix:
+    // - N_OC_PO: open_collector + power_out -> OutputConflict (Error)
+    // - N_OC_OUT: open_collector + out -> OutputConflict (Error)
+    // - N_OC_2OUT: open_collector + 2x out -> single OutputConflict (Error)
+    // - N_OC_PWR: open_collector + power_in -> UndrivenPowerInput (Error; open_collector does NOT drive power_in)
+    let conflict_toml = r#"
+name = "open_drain_conflicts"
+size_nm = [50000000, 30000000]
+
+[footprints.IC3]
+kind = "sot23"
+pin_count = 3
+
+[[placements]]
+refdes = "U1"
+footprint = "IC3"
+pos = { x = 8000000, y = 15000000 }
+pin_nets = { "1" = "N_OC_PO", "2" = "N_OC_OUT", "3" = "N_OC_2OUT" }
+pin_types = { "1" = "open_collector", "2" = "open_drain", "3" = "open_collector" }
+
+[[placements]]
+refdes = "U2"
+footprint = "IC3"
+pos = { x = 18000000, y = 15000000 }
+pin_nets = { "1" = "N_OC_PO", "2" = "N_OC_OUT", "3" = "N_OC_2OUT" }
+pin_types = { "1" = "power_out", "2" = "out", "3" = "out" }
+
+[[placements]]
+refdes = "U3"
+footprint = "IC3"
+pos = { x = 28000000, y = 15000000 }
+pin_nets = { "1" = "N_OC_PWR", "2" = "N_OC_PWR", "3" = "N_OC_2OUT" }
+pin_types = { "1" = "open_collector", "2" = "power_in", "3" = "out" }
+"#;
+    let conf_rep =
+        check_board_erc(&BoardIr::from_spec(&toml::from_str(conflict_toml).unwrap()).unwrap());
+    assert!(!conf_rep.passed);
+    assert!(conf_rep.violations.iter().any(|v| {
+        v.kind == ErcViolationKind::OutputConflict
+            && v.severity == Severity::Error
+            && v.net == "N_OC_PO"
+            && v.pins == vec!["U1.1", "U2.1"]
+    }));
+    assert!(conf_rep.violations.iter().any(|v| {
+        v.kind == ErcViolationKind::OutputConflict
+            && v.severity == Severity::Error
+            && v.net == "N_OC_OUT"
+            && v.pins == vec!["U1.2", "U2.2"]
+    }));
+    let two_out_errs: Vec<_> = conf_rep
+        .violations
+        .iter()
+        .filter(|v| v.net == "N_OC_2OUT")
+        .collect();
+    assert_eq!(two_out_errs.len(), 1);
+    assert_eq!(two_out_errs[0].kind, ErcViolationKind::OutputConflict);
+    assert_eq!(two_out_errs[0].pins, vec!["U1.3", "U2.3", "U3.3"]);
+    assert!(conf_rep.violations.iter().any(|v| {
+        v.kind == ErcViolationKind::UndrivenPowerInput
+            && v.severity == Severity::Error
+            && v.net == "N_OC_PWR"
+            && v.pins == vec!["U3.2"]
+    }));
+}
+
+#[test]
+fn erc_kicad_netlist_unconnected_nc_inference_and_power_driven_e2e() {
+    let dir = test_dir("kicad_e2e");
+    let lib = dir.join("custom.pretty");
+    fs::create_dir_all(&lib).unwrap();
+    fs::write(
+        lib.join("U_PMIC.kicad_mod"),
+        r#"(footprint "U_PMIC"
+  (version 20241229) (layer "F.Cu")
+  (pad "A1" smd rect (at -1.5 0) (size 0.4 0.4) (layers "F.Cu" "F.Mask" "F.Paste"))
+  (pad "A2" smd rect (at -0.5 0) (size 0.4 0.4) (layers "F.Cu" "F.Mask" "F.Paste"))
+  (pad "B1" smd rect (at 0.5 0) (size 0.4 0.4) (layers "F.Cu" "F.Mask" "F.Paste"))
+  (pad "B2" smd rect (at 1.5 0) (size 0.4 0.4) (layers "F.Cu" "F.Mask" "F.Paste"))
+  (pad "C1" smd rect (at 0 1.0) (size 0.4 0.4) (layers "F.Cu" "F.Mask" "F.Paste"))
+)"#,
+    )
+    .unwrap();
+    fs::write(
+        lib.join("R_0402.kicad_mod"),
+        r#"(footprint "R_0402"
+  (version 20241229) (layer "F.Cu")
+  (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask" "F.Paste"))
+  (pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu" "F.Mask" "F.Paste"))
+)"#,
+    )
+    .unwrap();
+
+    // KiCad .net with passive-fed VDD_1V8_IO, shared open-drain /INT, and unconnected-(...) on typed pins.
+    let net_path = dir.join("design.net");
+    fs::write(
+        &net_path,
+        r#"(export (version "E")
+  (components
+    (comp (ref "U1") (value "PMIC") (footprint "custom:U_PMIC"))
+    (comp (ref "U2") (value "MCU") (footprint "custom:U_PMIC"))
+    (comp (ref "R1") (value "0R") (footprint "custom:R_0402"))
+    (comp (ref "R2") (value "10k") (footprint "custom:R_0402"))
+  )
+  (nets
+    (net (code "1") (name "VIN") (class "Default")
+      (node (ref "R1") (pin "1"))
+    )
+    (net (code "2") (name "VDD_1V8_IO") (class "Power")
+      (node (ref "R1") (pin "2"))
+      (node (ref "R2") (pin "1"))
+      (node (ref "U1") (pin "A1"))
+      (node (ref "U2") (pin "A1"))
+    )
+    (net (code "3") (name "INT_N") (class "Default")
+      (node (ref "U1") (pin "B1"))
+      (node (ref "U2") (pin "B1"))
+      (node (ref "R2") (pin "2"))
+    )
+    (net (code "4") (name "unconnected-(U1-STAT-PadA2)") (class "Default")
+      (node (ref "U1") (pin "A2"))
+    )
+    (net (code "5") (name "Unconnected-(U2-STAT-PadA2)") (class "Default")
+      (node (ref "U2") (pin "A2"))
+    )
+    (net (code "6") (name "unconnected-(SHARED-NC)") (class "Default")
+      (node (ref "U1") (pin "B2"))
+      (node (ref "U2") (pin "B2"))
+    )
+    (net (code "7") (name "unconnected-(U1-NC-PadC1)") (class "Default")
+      (node (ref "U1") (pin "C1"))
+    )
+    (net (code "8") (name "unconnected-(U2-NC-PadC1)") (class "Default")
+      (node (ref "U2") (pin "C1"))
+    )
+  )
+)"#,
+    )
+    .unwrap();
+
+    let spec_path = dir.join("board.toml");
+    fs::write(
+        &spec_path,
+        r#"
+name = "kicad_erc_e2e"
+size_nm = [40000000, 30000000]
+footprint_libs = ["custom.pretty"]
+netlist = "design.net"
+
+[nets.VDD_1V8_IO]
+class = "Power"
+power_driven = true
+
+[footprints."custom:U_PMIC".pin_types]
+A1 = "power_in"
+A2 = "out"
+B1 = "open_collector"
+B2 = "in"
+C1 = "nc"
+
+[footprints."custom:R_0402".pin_types]
+1 = "passive"
+2 = "passive"
+
+[[placements]]
+refdes = "U1"
+pos = { x = 10000000, y = 15000000 }
+pin_types = { B1 = "open_drain" }
+
+[[placements]]
+refdes = "U2"
+pos = { x = 22000000, y = 15000000 }
+
+[[placements]]
+refdes = "R1"
+pos = { x = 10000000, y = 22000000 }
+
+[[placements]]
+refdes = "R2"
+pos = { x = 22000000, y = 22000000 }
+"#,
+    )
+    .unwrap();
+
+    // All typed pins either on real nets or unconnected-(...) -> passes cleanly (ignoring VIN single-pin? Wait: R1.1 is only pin on VIN!).
+    // Tie R1.1 to GND/VIN pair by giving U1/U2? Wait: VIN has only R1.1 so add R3 on VIN, or check clean pass with R3!
+    let mut clean_toml = fs::read_to_string(&spec_path).unwrap();
+    clean_toml.push_str(
+        r#"
+[[placements]]
+refdes = "R3"
+footprint = "R_0402"
+pos = { x = 6000000, y = 22000000 }
+pin_nets = { "1" = "VIN", "2" = "VIN" }
+"#,
+    );
+    fs::write(&spec_path, &clean_toml).unwrap();
+
+    let spec = load_spec_file(&spec_path).unwrap();
+    let mut ir = BoardIr::from_spec_with_base(&spec, Some(&dir)).unwrap();
+    assert!(ir.nets["VDD_1V8_IO"].power_driven);
+    let rep = check_board_erc(&ir);
+    assert!(rep.passed, "expected clean ERC: {:?}", rep.violations);
+    assert_eq!(rep.error_count, 0);
+
+    // CLI `boardc erc` and `boardc preflight` both pass cleanly.
+    let cli_erc = run_cli(&["erc", spec_path.to_str().unwrap(), "--json"]);
+    assert!(cli_erc.status.success());
+    let cli_rep: ErcReport = serde_json::from_slice(&cli_erc.stdout).unwrap();
+    assert!(cli_rep.passed, "CLI ERC failed: {:?}", cli_rep.violations);
+
+    let cli_pf = run_cli(&["preflight", spec_path.to_str().unwrap(), "--json"]);
+    assert!(cli_pf.status.success());
+    let pf_rep: PreflightSummary = serde_json::from_slice(&cli_pf.stdout).unwrap();
+    assert!(
+        pf_rep.ok,
+        "CLI preflight failed: {:?}",
+        pf_rep.erc_violations
+    );
+
+    // board.nets fallback (with pl.pin_nets cleared) also treats unconnected-(...) as intentional nc.
+    for p in &mut ir.placements {
+        p.pin_nets.clear();
+    }
+    let fallback_rep = check_board_erc(&ir);
+    assert!(
+        fallback_rep.passed,
+        "expected board.nets fallback to pass: {:?}",
+        fallback_rep.violations
+    );
+
+    // Removing an unconnected-(...) assignment from a typed non-nc pin must still flag UnconnectedPin.
+    let u1_idx = ir.placements.iter().position(|p| p.refdes == "U1").unwrap();
+    ir.nets
+        .get_mut("unconnected-(U1-STAT-PadA2)")
+        .unwrap()
+        .pins
+        .clear();
+    ir.placements[u1_idx].pin_nets.remove("A2");
+    let missing_rep = check_board_erc(&ir);
+    assert!(!missing_rep.passed);
+    assert!(missing_rep.violations.iter().any(|v| {
+        v.kind == ErcViolationKind::UnconnectedPin && v.pins == vec!["U1.A2"] && v.net.is_empty()
+    }));
 
     let _ = fs::remove_dir_all(&dir);
 }

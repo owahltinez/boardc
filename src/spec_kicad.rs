@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::ir::{FootprintDef, NetDef, Placement, default_net_class};
+use crate::ir::{FootprintDef, NetDef, Placement};
 use crate::kicad_io::{KicadNetlist, load_kicad_mod};
 
 pub(crate) fn resolve_spec_path(
@@ -343,6 +343,9 @@ pub(crate) fn sync_spec_and_netlist_nets(
     // Prune empty-named nets and any stale pin overridden onto another net or disconnected.
     nets.retain(|k, _| !k.trim().is_empty());
     for (net_name, nd) in nets.iter_mut() {
+        if nd.name.trim().is_empty() {
+            nd.name = net_name.clone();
+        }
         nd.pins
             .retain(|(refdes, pin)| match by_ref.get(refdes.as_str()) {
                 Some(&idx) => {
@@ -357,9 +360,7 @@ pub(crate) fn sync_spec_and_netlist_nets(
         for (pin, net_name) in &p.pin_nets {
             let entry = nets.entry(net_name.clone()).or_insert_with(|| NetDef {
                 name: net_name.clone(),
-                class: default_net_class(),
-                pins: Vec::new(),
-                ignore_route: false,
+                ..Default::default()
             });
             if entry.class == "Default"
                 && let Some(&c) = netlist_classes.get(net_name.as_str())
