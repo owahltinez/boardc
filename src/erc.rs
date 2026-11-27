@@ -80,10 +80,30 @@ fn push_group<'a>(
     });
 }
 
-fn is_unconnected_net(net: &str) -> bool {
+pub(crate) fn is_unconnected_net(net: &str) -> bool {
     const PREFIX: &[u8] = b"unconnected-(";
     let bytes = net.as_bytes();
     bytes.len() >= PREFIX.len() && bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+}
+
+pub(crate) fn net_def_pin_index(board: &BoardIr) -> HashMap<(&str, &str), &str> {
+    let mut index: HashMap<(&str, &str), &str> = HashMap::new();
+    for (net_name, nd) in &board.nets {
+        if net_name.trim().is_empty() {
+            continue;
+        }
+        for (refdes, pin) in &nd.pins {
+            index
+                .entry((refdes.as_str(), pin.as_str()))
+                .and_modify(|cur| {
+                    if is_unconnected_net(cur) {
+                        *cur = net_name.as_str();
+                    }
+                })
+                .or_insert(net_name.as_str());
+        }
+    }
+    index
 }
 
 /// Runs native electrical rules checks across nets and optional footprint/placement pin types.
@@ -94,22 +114,7 @@ pub fn check_board_erc(board: &BoardIr) -> ErcReport {
     let mut typed_pins = 0usize;
 
     // Fallback pin-to-net index from board.nets so direct BoardIr JSON without mirrored pin_nets still works.
-    let mut net_def_pins: HashMap<(&str, &str), &str> = HashMap::new();
-    for (net_name, nd) in &board.nets {
-        if net_name.trim().is_empty() {
-            continue;
-        }
-        for (refdes, pin) in &nd.pins {
-            net_def_pins
-                .entry((refdes.as_str(), pin.as_str()))
-                .and_modify(|cur| {
-                    if is_unconnected_net(cur) {
-                        *cur = net_name.as_str();
-                    }
-                })
-                .or_insert(net_name.as_str());
-        }
-    }
+    let net_def_pins = net_def_pin_index(board);
 
     let copper_nets: HashSet<&str> = board
         .pours
