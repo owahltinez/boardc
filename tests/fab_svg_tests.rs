@@ -74,6 +74,7 @@ fn make_4layer_board() -> BoardIr {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -572,6 +573,7 @@ fn regression_cw_poly_mask_expands_and_blind_via_splits_drill_file() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -1262,6 +1264,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -1282,6 +1285,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -1305,6 +1309,7 @@ fn silkscreen_exact_mask_clipping_and_cli_subtract_soldermask() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -1845,6 +1850,7 @@ fn footprint_graphic_text_and_rotated_bottom_silk_coordinates() {
                 },
             ],
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );

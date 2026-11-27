@@ -78,6 +78,7 @@ fn make_two_sided_4layer_board() -> BoardIr {
                 fill: false,
             }],
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -793,6 +794,7 @@ fn roast_regressions_tools_bounds_asymmetric_mirror_and_edge_cases() {
                 },
             ],
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );
@@ -813,6 +815,7 @@ fn roast_regressions_tools_bounds_asymmetric_mirror_and_edge_cases() {
             courtyard: Vec::new(),
             graphics: Vec::new(),
             keepouts: Vec::new(),
+            models: Vec::new(),
             pin_types: Default::default(),
         },
     );

@@ -10,7 +10,10 @@ use crate::geom::{
     EPS_NM, ensure_ccw, local_to_board, polygon_area, polygon_violates_clearance, pts_to_path64,
     remap_layer_for_side,
 };
-use crate::ir::{BBoxNm, BoardIr, Graphic, Nm, Placement, PourPoly, Pt, Side};
+use crate::ir::{
+    AutoRefdes, BBoxNm, BoardIr, FabConfig, FootprintDef, Graphic, Nm, Placement, PourPoly, Pt,
+    Side,
+};
 use crate::shapes::{ResolvedShape, circle_poly};
 use crate::stroke_text::{text_graphic_segments, text_stroke_segments};
 use crate::zone_scene::{paths_to_pour_polys, pour_poly_area, shape_inflated_poly};
@@ -131,7 +134,7 @@ pub(crate) fn push_graphic_mask_shapes(
     }
 }
 
-fn placement_local_bbox(fp: &crate::ir::FootprintDef) -> BBoxNm {
+fn placement_local_bbox(fp: &FootprintDef) -> BBoxNm {
     if !fp.courtyard.is_empty() {
         return BBoxNm::from_pts(&fp.courtyard);
     }
@@ -146,12 +149,39 @@ fn placement_local_bbox(fp: &crate::ir::FootprintDef) -> BBoxNm {
     }
 }
 
-pub(crate) fn refdes_local_pos(board: &BoardIr, pl: &Placement) -> Pt {
-    let Some(fp) = board.footprints.get(&pl.footprint) else {
-        return Pt::new(0, 0);
+fn needs_upright_flip(rot_deg: f64, side: Side) -> bool {
+    let view_rot = match side {
+        Side::Top => rot_deg.rem_euclid(360.0),
+        Side::Bottom => (180.0 - rot_deg).rem_euclid(360.0),
     };
+    view_rot > 90.0 + 1e-6 && view_rot <= 270.0 + 1e-6
+}
+
+pub(crate) fn refdes_world_segments(
+    fp: &FootprintDef,
+    pl: &Placement,
+    mode: AutoRefdes,
+) -> Vec<(Pt, Pt)> {
+    if mode == AutoRefdes::Off || pl.refdes.is_empty() {
+        return Vec::new();
+    }
     let b = placement_local_bbox(fp);
-    Pt::new((b.min_x + b.max_x) / 2, b.max_y + 450_000)
+    let local_center = Pt::new((b.min_x + b.max_x) / 2, b.max_y + 450_000);
+    let world_center = local_to_board(local_center, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
+    let eff_rot = if mode == AutoRefdes::Upright && needs_upright_flip(pl.rot_deg, pl.side) {
+        pl.rot_deg + 180.0
+    } else {
+        pl.rot_deg
+    };
+    text_stroke_segments(&pl.refdes, Pt::new(0, 0), 700_000, 0.0, false)
+        .into_iter()
+        .map(|(a, b)| {
+            (
+                local_to_board(a, world_center.x, world_center.y, eff_rot, pl.side),
+                local_to_board(b, world_center.x, world_center.y, eff_rot, pl.side),
+            )
+        })
+        .collect()
 }
 
 fn point_hits_mask(p: Pt, radius: Nm, openings: &[ResolvedShape], clr: Nm) -> bool {
@@ -304,6 +334,7 @@ pub(crate) fn emit_silk_layer(
     board: &BoardIr,
     side: Side,
     mask_openings: &[ResolvedShape],
+    fab: FabConfig,
 ) {
     let clr = board.rules.silk_clearance_nm.max(0);
     let mut raw_segs: Vec<(Pt, Pt, Nm)> = Vec::new();
@@ -328,7 +359,7 @@ pub(crate) fn emit_silk_layer(
             }
         }
 
-        if pl.side == side && !pl.dnp {
+        if pl.side == side && !pl.dnp && fab.auto_refdes != AutoRefdes::Off {
             if !has_silk_dot && let Some(pad1) = fp.pads.first() {
                 let b = placement_local_bbox(fp);
                 let dx = if pad1.pos.x <= (b.min_x + b.max_x) / 2 {
@@ -346,13 +377,8 @@ pub(crate) fn emit_silk_layer(
                     dot_local, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side,
                 ));
             }
-            if !pl.refdes.is_empty() {
-                let text_center = refdes_local_pos(board, pl);
-                for (a, b) in text_stroke_segments(&pl.refdes, text_center, 700_000, 0.0, false) {
-                    let wa = local_to_board(a, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
-                    let wb = local_to_board(b, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
-                    raw_segs.push((wa, wb, 120_000));
-                }
+            for (wa, wb) in refdes_world_segments(fp, pl, fab.auto_refdes) {
+                raw_segs.push((wa, wb, fab.refdes_stroke_nm));
             }
         }
     }

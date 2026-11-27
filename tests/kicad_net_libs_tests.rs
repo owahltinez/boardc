@@ -512,9 +512,8 @@ fn footprint_lib_errors_precedence_and_path_traversal_guards() {
             "SPEC_NET".into(),
             NetDef {
                 name: "SPEC_NET".into(),
-                class: "Default".into(),
                 pins: vec![("R1".into(), "1".into())],
-                ignore_route: false,
+                ..Default::default()
             },
         )]),
         placements: vec![Placement {
@@ -984,9 +983,8 @@ fn roast_regressions_sexp_escapes_lib_isolation_net_sync_and_parity() {
             "OLD_SPEC_NET".into(),
             NetDef {
                 name: "OLD_SPEC_NET".into(),
-                class: "Default".into(),
                 pins: vec![("U1".into(), "1".into())],
-                ignore_route: false,
+                ..Default::default()
             },
         )]),
         placements: vec![
@@ -1067,6 +1065,158 @@ fn roast_regressions_sexp_escapes_lib_isolation_net_sync_and_parity() {
         rt_fields.get("Note").map(String::as_str),
         Some("line1\nline2\t\"q\"")
     );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lib_courtyard_override_replaces_kicad_mod_courtyard_and_validates() {
+    use boardc::drc::check_board_drc;
+    use boardc::ir::PinType;
+
+    let dir = test_dir("lib_courtyard_override");
+    let lib_dir = dir.join("conn.pretty");
+    fs::create_dir_all(&lib_dir).unwrap();
+    // Library footprint has a huge overhanging courtyard (-10..+10, -10..+10) around pads at (-0.6, 0) and (0.6, 0).
+    let mod_src = "(footprint \"CONN_2P\"\n  (version 20241229)\n  (layer \"F.Cu\")\n  (fp_rect (start -10.0 -10.0) (end 10.0 10.0) (stroke (width 0.05) (type solid)) (fill no) (layer \"F.CrtYd\"))\n  (pad \"1\" smd rect (at -0.6 0) (size 0.5 0.6) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\"))\n  (pad \"2\" smd rect (at 0.6 0) (size 0.5 0.6) (layers \"F.Cu\" \"F.Mask\" \"F.Paste\"))\n)\n";
+    fs::write(lib_dir.join("CONN_2P.kicad_mod"), mod_src).unwrap();
+
+    // 1. Inferred lib overlay (no `kind = "lib"`, courtyard only) shrinks courtyard to fit inside board and passes DRC.
+    let inferred_cy_toml = r#"
+name = "lib_cy_inferred"
+size_nm = [10000000, 10000000]
+footprint_libs = ["conn.pretty"]
+
+[footprints.CONN_2P]
+courtyard = [
+  { x = -1200000, y = -600000 },
+  { x = 1200000, y = -600000 },
+  { x = 1200000, y = 600000 },
+  { x = -1200000, y = 600000 },
+]
+
+[[placements]]
+refdes = "J1"
+footprint = "CONN_2P"
+pos = { x = 5000000, y = 5000000 }
+pin_nets = { "1" = "SIG1", "2" = "SIG2" }
+"#;
+    let spec: BoardSpec = toml::from_str(inferred_cy_toml).unwrap();
+    let ir = BoardIr::from_spec_with_base(&spec, Some(&dir)).unwrap();
+    assert_eq!(ir.footprints["CONN_2P"].courtyard.len(), 4);
+    assert_eq!(
+        ir.footprints["CONN_2P"].courtyard[0],
+        Pt::new(mm(-1.2), mm(-0.6))
+    );
+    let drc = check_board_drc(&ir);
+    assert!(
+        drc.passed,
+        "expected DRC pass with tightened lib courtyard: {:?}",
+        drc.violations
+    );
+
+    // 2. Explicit `kind = "lib"` with both `courtyard` and `pin_types`.
+    let explicit_toml = r#"
+name = "lib_cy_explicit"
+size_nm = [10000000, 10000000]
+footprint_libs = ["conn.pretty"]
+
+[footprints."conn:CONN_2P"]
+kind = "lib"
+pin_types = { "1" = "passive", "2" = "passive" }
+courtyard = [
+  { x = -1100000, y = -500000 },
+  { x = 1100000, y = -500000 },
+  { x = 1100000, y = 500000 },
+  { x = -1100000, y = 500000 },
+]
+
+[[placements]]
+refdes = "J1"
+footprint = "conn:CONN_2P"
+pos = { x = 5000000, y = 5000000 }
+"#;
+    let exp_spec: BoardSpec = toml::from_str(explicit_toml).unwrap();
+    let exp_ir = BoardIr::from_spec_with_base(&exp_spec, Some(&dir)).unwrap();
+    assert_eq!(
+        exp_ir.footprints["conn:CONN_2P"].pin_types.get("1"),
+        Some(&PinType::Passive)
+    );
+    assert_eq!(
+        exp_ir.footprints["conn:CONN_2P"].courtyard[0],
+        Pt::new(mm(-1.1), mm(-0.5))
+    );
+    let exp_pcb = render_kicad_pcb(&exp_ir);
+    let crtyd_lines: Vec<&str> = exp_pcb
+        .lines()
+        .filter(|l| l.contains("(layer \"F.CrtYd\")"))
+        .collect();
+    assert_eq!(
+        crtyd_lines.len(),
+        4,
+        "expected 4 F.CrtYd lines: {crtyd_lines:?}"
+    );
+    assert!(
+        crtyd_lines
+            .iter()
+            .any(|l| l.contains("1.100000") && l.contains("0.500000")),
+        "expected overridden courtyard in F.CrtYd: {crtyd_lines:?}"
+    );
+    assert!(
+        crtyd_lines.iter().all(|l| !l.contains("10.000000")),
+        "old library courtyard must not appear in F.CrtYd: {crtyd_lines:?}"
+    );
+
+    // 3. Reject < 3 vertex, empty `courtyard = []`, collinear, empty `kind = "lib"`, unmatched overlay, and unknown fields.
+    let bad_degenerate = inferred_cy_toml.replace(
+        "  { x = 1200000, y = 600000 },\n  { x = -1200000, y = 600000 },\n",
+        "",
+    );
+    let deg_spec: BoardSpec = toml::from_str(&bad_degenerate).unwrap();
+    assert!(BoardIr::from_spec_with_base(&deg_spec, Some(&dir)).is_err());
+
+    let empty_cy = inferred_cy_toml.replace(
+        "[\n  { x = -1200000, y = -600000 },\n  { x = 1200000, y = -600000 },\n  { x = 1200000, y = 600000 },\n  { x = -1200000, y = 600000 },\n]",
+        "[]",
+    );
+    assert!(BoardIr::from_spec_with_base(&toml::from_str(&empty_cy).unwrap(), Some(&dir)).is_err());
+
+    let collinear_cy = inferred_cy_toml.replace(
+        "  { x = 1200000, y = 600000 },\n  { x = -1200000, y = 600000 },\n",
+        "  { x = 0, y = -600000 },\n",
+    );
+    assert!(
+        BoardIr::from_spec_with_base(&toml::from_str(&collinear_cy).unwrap(), Some(&dir)).is_err()
+    );
+
+    let empty_lib = r#"
+name = "empty_lib"
+size_nm = [10000000, 10000000]
+footprint_libs = ["conn.pretty"]
+[footprints.CONN_2P]
+kind = "lib"
+[[placements]]
+refdes = "J1"
+footprint = "CONN_2P"
+pos = { x = 5000000, y = 5000000 }
+"#;
+    assert!(BoardIr::from_spec_with_base(&toml::from_str(empty_lib).unwrap(), Some(&dir)).is_err());
+
+    let unmatched = format!(
+        "{inferred_cy_toml}\n[footprints.NO_SUCH_CONN]\ncourtyard = [{{ x = 0, y = 0 }}, {{ x = 1000000, y = 0 }}, {{ x = 0, y = 1000000 }}]\n"
+    );
+    let unm_spec: BoardSpec = toml::from_str(&unmatched).unwrap();
+    assert!(BoardIr::from_spec_with_base(&unm_spec, Some(&dir)).is_err());
+
+    let bad_extra = r#"
+name = "bad_extra"
+size_nm = [10000000, 10000000]
+[footprints.CONN_2P]
+kind = "lib"
+courtyard = [{ x = 0, y = 0 }, { x = 1000000, y = 0 }, { x = 0, y = 1000000 }]
+pads = []
+"#;
+    assert!(toml::from_str::<BoardSpec>(bad_extra).is_err());
 
     let _ = fs::remove_dir_all(&dir);
 }

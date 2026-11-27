@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 use crate::drc::DrcReport;
 use crate::fab_assembly::render_assembly_svg;
 use crate::fab_drills::render_drill_map_svg;
-use crate::fab_silk::{is_silk_layer, refdes_local_pos};
+use crate::fab_silk::{is_silk_layer, refdes_world_segments};
 use crate::geom::{local_to_board, pad_copper_layers, remap_layer_for_side};
-use crate::ir::{BBoxNm, BoardIr, Graphic, PadKind, Pt, Side, mm, nm_to_mm, safe_slug};
+use crate::ir::{
+    BBoxNm, BoardIr, DEFAULT_REFDES_STROKE_NM, Graphic, MIN_REFDES_STROKE_NM, PadKind, Pt, Side,
+    mm, nm_to_mm, safe_slug,
+};
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
-use crate::stroke_text::{text_graphic_segments, text_stroke_segments};
+use crate::stroke_text::text_graphic_segments;
 
 pub(crate) const DEFAULT_SVG_MARGIN_MM: f64 = 2.0;
 
@@ -451,6 +454,13 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
             _ => None,
         };
         if let Some(side) = silk_side {
+            let stroke_mm = nm_to_mm(if board.fab.refdes_stroke_nm >= MIN_REFDES_STROKE_NM {
+                board.fab.refdes_stroke_nm
+            } else if board.fab.refdes_stroke_nm > 0 {
+                MIN_REFDES_STROKE_NM
+            } else {
+                DEFAULT_REFDES_STROKE_NM
+            });
             out.push_str("  <g id=\"silkscreen\">\n");
             for pl in &board.placements {
                 let Some(fp) = board.footprints.get(&pl.footprint) else {
@@ -461,16 +471,13 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
                         render_graphic_svg(&mut out, g, Some(pl), "#f1f5f9", mirror_x);
                     }
                 }
-                if pl.side == side && !pl.dnp && !pl.refdes.is_empty() {
-                    let c = refdes_local_pos(board, pl);
-                    for (a, b) in text_stroke_segments(&pl.refdes, c, 700_000, 0.0, false) {
-                        let wa = local_to_board(a, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
-                        let wb = local_to_board(b, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
+                if pl.side == side && !pl.dnp {
+                    for (wa, wb) in refdes_world_segments(fp, pl, board.fab.auto_refdes) {
                         let (ax, ay) = svg_pt(wa, mirror_x);
                         let (bx, by) = svg_pt(wb, mirror_x);
                         let _ = writeln!(
                             out,
-                            r##"  <line x1="{ax:.4}" y1="{ay:.4}" x2="{bx:.4}" y2="{by:.4}" stroke="#f1f5f9" stroke-width="0.10" stroke-linecap="round" />"##
+                            r##"  <line x1="{ax:.4}" y1="{ay:.4}" x2="{bx:.4}" y2="{by:.4}" stroke="#f1f5f9" stroke-width="{stroke_mm:.4}" stroke-linecap="round" />"##
                         );
                     }
                 }

@@ -24,11 +24,11 @@ For coding agents, run `boardc skill install` (or read [SKILL.md](SKILL.md) dire
 ## Architecture
 
 - **Canonical Coordinates & Units**: Integer nanometers (`Nm = i64`, `1 mm = 1_000_000 nm`) in a right-handed 2D frame (`+X` right, `+Y` up, CCW rotation positive). Bottom-side placements flip across local `X` (`ly' = -ly`) before rotating CCW by `rot_deg` and remapping `Top <-> Bottom` layers. KiCad Y-down conversion is isolated strictly at the import (`src/kicad_io.rs`) and export (`src/kicad_export.rs`) file boundaries.
-- **Core IR & Parametric Footprints** (`src/ir.rs`, `src/spec.rs`, `src/footprints.rs`, `src/geom.rs`, `src/shapes.rs`, `src/poly_index.rs`): JSON/TOML `BoardSpec` and canonical `BoardIr`, IPC-7351 parametric footprints (`0201`/`0402`/`0603`/`0805`, `BGA`, `QFN`, `SOT23`, `PinHeader`), and exact continuous 2D shape distance primitives with flat-grid polygon indexing.
+- **Core IR & Parametric Footprints** (`src/ir.rs`, `src/spec.rs`, `src/footprints.rs`, `src/geom.rs`, `src/shapes.rs`, `src/poly_index.rs`): JSON/TOML `BoardSpec` and canonical `BoardIr`, IPC-7351 parametric footprints (`0201`/`0402`/`0603`/`0805`, `BGA`, `QFN`, `SOT23`, `PinHeader`), custom footprints with 3D `models`, `.kicad_mod` library overlays (`pin_types`/`courtyard`), and exact continuous 2D shape distance primitives with flat-grid polygon indexing.
 - **Placement & Power Vias** (`src/place.rs`): Deterministic placement legalizer (courtyards, keepouts, edge clearance, BGA shadow rules, decoupling-capacitor proximity) and power-via / thermal-array solver landing into inner planes without sealing BGA channels or pinching pours.
 - **Zone Filler & Choke Analysis** (`src/zones.rs`): Priority-ordered Clipper2 copper pours with edge/keepout/antipad clearances, thermal reliefs, dead-island and sliver pruning, plus copper-graph split-pour and narrow-neck choke detection.
 - **Continuous DRC & Hotspot Clusterer** (`src/drc.rs`): Continuous `Nm` DRC across clearances, hole-to-hole, drill-to-copper, edge clearance, annular ring, keepouts, courtyards, connectivity across tracks/vias/filled pours, and length/match/proximity constraints, grouped into spatial and shared-object hotspots (plus `kicad-cli` JSON hotspot clustering).
-- **In-Memory Routing & Preflight** (`src/preflight.rs`, `src/route.rs`): Sub-second pre-routing feasibility gate and direct in-memory `BoardIr -> viahop::Board` bridge with incremental `--reroute-nets` support.
+- **In-Memory Routing & Preflight** (`src/preflight.rs`, `src/route.rs`, `src/erc.rs`): Sub-second pre-routing feasibility gate (including native ERC for `pin_types` including `open_collector`/`open_drain`, `[nets.<NAME>] power_driven`, and KiCad `unconnected-(...)` intentional no-connects) and direct in-memory `BoardIr -> viahop::Board` bridge with incremental `--reroute-nets` support.
 - **Staged Compiler Pipeline** (`src/pipeline.rs`): Content-hashed stage caching in `.boardc-cache/` (`place -> power-via -> preflight -> route -> zones -> drc -> fab/svg`).
 - **Manufacturing & Visual Outputs** (`src/fab.rs`, `src/svg.rs`): Native RS-274X/Gerber X2 copper, mask, paste, silkscreen (clipped to solder mask), and `Edge.Cuts`, metric Excellon PTH/NPTH and blind/buried span drills, JLCPCB BOM/CPL CSVs, and zero-dependency 2D SVGs with optional DRC hotspot overlays.
 
@@ -49,7 +49,7 @@ boardc route <INPUT> [-o <OUT_BOARD_JSON>] [--reroute-nets NET,...] [--via-at-sm
 boardc zones <INPUT> [-o <OUT_BOARD_JSON>] [--report <REPORT_JSON>]
 boardc erc <INPUT> [--json]
 boardc drc <INPUT> [--kicad-drc <KICAD_DRC_JSON>] [--json]
-boardc fab <INPUT> -o <FAB_DIR> [--no-clip-silk] [--json]
+boardc fab <INPUT> -o <FAB_DIR> [--no-clip-silk] [--no-auto-refdes] [--auto-refdes rotate|upright|off] [--refdes-stroke-nm <NM>] [--json]
 boardc svg <INPUT> -o <OUT_SVG_OR_DIR> [--view top|bottom] [--layer <LAYER>] [--no-hotspots]
 boardc verify <INPUT> --fab-dir <FAB_DIR> [--json]
 boardc import-kicad <KICAD_PCB> [--pro <KICAD_PRO>] [-o <OUT_BOARD_JSON>]
@@ -89,6 +89,7 @@ value = "100nF"
 pos = { x = 10000000, y = 10000000 }
 rot_deg = 90.0
 side = "top"
+# allow_edge_overhang = true # skip courtyard-to-edge DRC for edge-mating connectors (pads still checked)
 pin_nets = { "1" = "VCC", "2" = "GND" }
 
 [[pours]]
@@ -109,4 +110,8 @@ text = "EXAMPLE\nREV A1"
 pos = { x = 15000000, y = 17000000 }
 height_nm = 650000
 stroke_nm = 150000
+
+[fab]
+auto_refdes = "upright" # false / "off" suppresses auto refdes & pin-1 dots; "rotate" (default)
+refdes_stroke_nm = 150000 # >= 10000 nm (0.01 mm), default 120000
 ```
