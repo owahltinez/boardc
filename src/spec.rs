@@ -190,6 +190,12 @@ pub(crate) fn validate_pin_types_for_footprint(
 }
 
 pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
+    if ir.rules.mask_to_copper_nm.is_some_and(|v| v < 0) {
+        return Err(format!(
+            "board IR '{}': design rules mask_to_copper_nm must be >= 0",
+            path.display()
+        ));
+    }
     for (name, fp) in &ir.footprints {
         validate_pin_types_for_footprint("footprint", name, fp, &fp.pin_types)
             .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
@@ -376,6 +382,9 @@ impl BoardIr {
             return Err(
                 "design rules track_width_nm, via_dia_nm, and via_drill_nm must be > 0".into(),
             );
+        }
+        if spec.rules.mask_to_copper_nm.is_some_and(|v| v < 0) {
+            return Err("design rules mask_to_copper_nm must be >= 0".into());
         }
         if spec.stackup.thickness_nm <= 0 {
             return Err("stackup.thickness_nm must be > 0".into());

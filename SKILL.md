@@ -100,5 +100,6 @@ kicad-cli pcb render out/board.kicad_pcb -o out/render_bot.png --side bottom --q
 - Electrical pin types (`pin_types` on `[footprints.<NAME>]` or `[[placements]]`): optional `in`, `out`, `bidir`, `tri`, `power_in`, `power_out`, `passive`, `nc` annotations checked by `boardc erc` and `boardc preflight` (single-pin nets, output/`power_out` conflicts, undriven `in`/`power_in`, unconnected non-`nc` pins, and connected `nc` pins).
 - Stackup (`[stackup]`): `thickness_nm`, `finish`, `pofv` (via plugging + filling + capping), and `dielectric_nm` (emitted to `<name>-job.gbrjob` and KiCad `(general)`/`(setup (stackup ...))`).
 - Constraints (`[constraints]`): `max_lengths`, `match_groups`, `cap_proximity`, `min_vias`, and `bga_shadows`.
+- Mask-to-copper DRC (`[rules]`): set optional `mask_to_copper_nm` (imported/exported via `.kicad_pro` `solder_mask_to_copper_clearance`) to flag `solder_mask_to_copper` violations where outer copper encroaches on another net's solder mask opening.
 - Keepout kinds: `all`, `track`, `via`, `copper` (pours only, allows tracks), `placement`, or `custom` (`tracks`/`vias`/`copper`/`placement` booleans).
 - `boardc` embeds `viahop` statically; you do not need `viahop` installed separately unless you specifically need Specctra `.dsn`/`.ses` Freerouting compatibility.

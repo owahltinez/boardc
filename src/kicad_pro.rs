@@ -49,6 +49,9 @@ pub(crate) fn parse_kicad_pro(
         if let Some(v) = json_mm(r, "min_hole_clearance") {
             rules.hole_clearance_nm = Some(v);
         }
+        if let Some(v) = json_mm(r, "solder_mask_to_copper_clearance") {
+            rules.mask_to_copper_nm = Some(v);
+        }
     }
     if let Some(ns) = root.get("net_settings") {
         if let Some(classes) = ns.get("classes").and_then(Value::as_array) {

@@ -8,6 +8,7 @@ use crate::zone_scene::match_pour_specs;
 pub(crate) struct PadItem {
     pub label: String,
     pub pl_idx: usize,
+    pub pad_idx: usize,
     pub net: String,
     pub kind: PadKind,
     pub center: Pt,
@@ -124,7 +125,7 @@ pub(crate) fn collect_pads(board: &BoardIr, cu_layers: &[String]) -> Vec<PadItem
         let Some(fp) = board.footprints.get(&pl.footprint) else {
             continue;
         };
-        for pad in &fp.pads {
+        for (pad_idx, pad) in fp.pads.iter().enumerate() {
             let net = pl.pin_nets.get(&pad.name).cloned().unwrap_or_default();
             let center = local_to_board(pad.pos, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
             let shape = pad_to_world_shape(pad, pl, 16);
@@ -134,6 +135,7 @@ pub(crate) fn collect_pads(board: &BoardIr, cu_layers: &[String]) -> Vec<PadItem
             pads.push(PadItem {
                 label: format!("{}.{}", pl.refdes, pad.name),
                 pl_idx,
+                pad_idx,
                 net,
                 kind: pad.kind,
                 center,

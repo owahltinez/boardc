@@ -490,6 +490,7 @@ pub fn render_kicad_pro(board: &BoardIr) -> String {
                     "keepout": "error",
                     "rule_area": "error",
                     "shorting_items": "error",
+                    "solder_mask_to_copper": "error",
                     "track_dangling": "error",
                     "track_width": "error",
                     "tracks_crossing": "error",
@@ -509,7 +510,7 @@ pub fn render_kicad_pro(board: &BoardIr) -> String {
                     "min_silk_clearance": nm_to_mm(r.silk_clearance_nm),
                     "min_connection": 0.0,
                     "min_resolved_spokes": 1,
-                    "solder_mask_to_copper_clearance": 0.0
+                    "solder_mask_to_copper_clearance": r.mask_to_copper_nm.map(nm_to_mm).unwrap_or(0.0)
                 }
             }
         },

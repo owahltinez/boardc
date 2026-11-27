@@ -79,6 +79,18 @@ fn build_action_hint(
                 )
             }
         }
+        ViolationKind::SolderMaskToCopper => {
+            if others.is_empty() {
+                format!(
+                    "Move copper or adjust mask expansion around {root_item}{net_suffix} to restore mask-to-copper clearance"
+                )
+            } else {
+                format!(
+                    "Move copper or adjust mask expansion between {root_item}{net_suffix} and {}",
+                    others.join(", ")
+                )
+            }
+        }
         ViolationKind::HoleToHole | ViolationKind::MinAnnularRing => {
             format!("Adjust drill size or move {root_item}{net_suffix} to satisfy drill rules")
         }
@@ -302,6 +314,7 @@ fn map_kicad_kind(t: &str) -> ViolationKind {
         "clearance" | "shorting_items" | "tracks_crossing" | "zone_to_zone" => {
             ViolationKind::Clearance
         }
+        "solder_mask_to_copper" => ViolationKind::SolderMaskToCopper,
         "hole_to_hole" | "hole_near_hole" => ViolationKind::HoleToHole,
         "annular_width" => ViolationKind::MinAnnularRing,
         "track_width" => ViolationKind::MinTraceWidth,
