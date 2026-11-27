@@ -148,6 +148,7 @@ impl FootprintSpec {
                     keepouts: keepouts.clone(),
                     models: Vec::new(),
                     pin_types: BTreeMap::new(),
+                    kicad_raw: None,
                 },
                 pin_types,
             ),

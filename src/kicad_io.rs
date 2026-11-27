@@ -39,7 +39,8 @@ pub fn parse_kicad_mod(src: &str) -> Result<FootprintDef, String> {
         return Err(format!("expected '(footprint ...)', got '({tag} ...)'"));
     }
     let empty_nets = HashMap::new();
-    let (fp, _) = parse_footprint_node(&root, false, &empty_nets)?;
+    let (mut fp, _) = parse_footprint_node(&root, false, &empty_nets)?;
+    fp.kicad_raw = Some(src.to_string());
     Ok(fp)
 }
 
@@ -140,6 +141,7 @@ pub(crate) fn parse_footprint_node(
             keepouts,
             models,
             pin_types: BTreeMap::new(),
+            kicad_raw: None,
         },
         pad_nets,
     ))

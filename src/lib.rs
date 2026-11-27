@@ -25,6 +25,7 @@ pub mod kicad_io;
 mod kicad_net;
 mod kicad_pcb;
 mod kicad_pro;
+mod kicad_raw_fp;
 pub mod pipeline;
 pub mod place;
 mod place_legalize;

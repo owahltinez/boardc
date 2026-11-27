@@ -3,7 +3,8 @@ use std::fmt::Write as _;
 
 use crate::geom::remap_layer_for_side;
 use crate::ir::{
-    BoardIr, Graphic, Keepout, Nm, PadDef, PadKind, PadShape, Placement, Pt, Side, nm_to_mm,
+    BBoxNm, BoardIr, FootprintDef, Graphic, Keepout, Nm, PadDef, PadKind, PadShape, Placement, Pt,
+    SchematicMeta, Side, nm_to_mm,
 };
 use crate::kicad_geom::is_ignored_kicad_field;
 
@@ -31,10 +32,18 @@ pub(crate) fn esc(s: &str) -> String {
     out
 }
 
-fn write_fp_property(out: &mut String, key: &str, val: &str, fab_layer: &str, uuids: &mut UuidGen) {
+pub(crate) fn write_fp_property(
+    out: &mut String,
+    key: &str,
+    val: &str,
+    fab_layer: &str,
+    mirror: bool,
+    uuids: &mut UuidGen,
+) {
+    let just = if mirror { " (justify mirror)" } else { "" };
     let _ = writeln!(
         out,
-        "\t\t(property \"{}\" \"{}\" (at 0 0 0) (layer \"{fab_layer}\") (hide yes) (uuid \"{}\") (effects (font (size 1 1) (thickness 0.15))))",
+        "\t\t(property \"{}\" \"{}\" (at 0 0 0) (layer \"{fab_layer}\") (hide yes) (uuid \"{}\") (effects (font (size 1 1) (thickness 0.15)){just}))",
         esc(key),
         esc(val),
         uuids.next()
@@ -49,9 +58,80 @@ fn kicad_layer_name(layer: &str) -> &str {
     }
 }
 
-fn remap_kicad_layer(layer: &str, side: Side) -> String {
+pub(crate) fn remap_kicad_layer(layer: &str, side: Side) -> String {
     let mapped = remap_layer_for_side(layer, side);
     kicad_layer_name(&mapped).to_string()
+}
+
+pub(crate) fn is_exportable_kicad_field(k: &str, v: &str) -> bool {
+    !(is_ignored_kicad_field(k) || v.is_empty() || (k == "Datasheet" && v == "~"))
+}
+
+pub(crate) fn write_schematic_paths(out: &mut String, sch: &SchematicMeta) {
+    for (tag, val) in [
+        ("path", sch.path.as_deref()),
+        ("sheetname", sch.sheetname.as_deref()),
+        ("sheetfile", sch.sheetfile.as_deref()),
+    ] {
+        if let Some(v) = val.map(str::trim).filter(|s| !s.is_empty()) {
+            let _ = writeln!(out, "\t\t({tag} \"{}\")", esc(v));
+        }
+    }
+}
+
+pub(crate) fn collect_attr_tokens(fp: &FootprintDef, pl: &Placement) -> Vec<&'static str> {
+    let has_tht = fp.pads.iter().any(|p| p.kind == PadKind::Tht);
+    let has_smd = fp.pads.iter().any(|p| p.kind == PadKind::Smd);
+    let has_sch_path = pl
+        .schematic
+        .as_ref()
+        .and_then(|s| s.path.as_deref())
+        .is_some_and(|p| !p.trim().is_empty());
+    // Schematic-linked padless/NPTH footprints (e.g. MountingHole) must omit `board_only` for parity.
+    let attr_type = if has_tht {
+        Some("through_hole")
+    } else if has_smd {
+        Some("smd")
+    } else if has_sch_path {
+        None
+    } else {
+        Some("board_only")
+    };
+    let mut tokens = Vec::with_capacity(4);
+    if let Some(t) = attr_type {
+        tokens.push(t);
+    }
+    if pl.exclude_from_pos {
+        tokens.push("exclude_from_pos_files");
+    }
+    if pl.exclude_from_bom {
+        tokens.push("exclude_from_bom");
+    }
+    if pl.dnp {
+        tokens.push("dnp");
+    }
+    tokens
+}
+
+fn axis_aligned_rect(pts: &[Pt]) -> Option<(Pt, Pt)> {
+    if pts.len() != 4 {
+        return None;
+    }
+    let bbox = BBoxNm::from_pts(pts);
+    if bbox.min_x == bbox.max_x || bbox.min_y == bbox.max_y {
+        return None;
+    }
+    for i in 0..4 {
+        let a = pts[i];
+        let b = pts[(i + 1) % 4];
+        if (a.x != b.x && a.y != b.y) || a == b {
+            return None;
+        }
+    }
+    Some((
+        Pt::new(bbox.min_x, bbox.min_y),
+        Pt::new(bbox.max_x, bbox.max_y),
+    ))
 }
 
 pub(crate) fn write_pts(out: &mut String, pts: &[Pt], y_sign: i64, indent: &str) {
@@ -375,37 +455,6 @@ pub(crate) fn write_footprint(
     let Some(fp) = board.footprints.get(&pl.footprint) else {
         return;
     };
-    // B.Cu footprints in .kicad_pcb store Y-flipped local coords (y_sign = +1).
-    let y_sign: i64 = if pl.side == Side::Bottom { 1 } else { -1 };
-    let cu_layer = pl.side.cu_layer();
-    let fab_layer = if pl.side == Side::Bottom {
-        "B.Fab"
-    } else {
-        "F.Fab"
-    };
-    let crtyd_layer = if pl.side == Side::Bottom {
-        "B.CrtYd"
-    } else {
-        "F.CrtYd"
-    };
-    let has_tht = fp.pads.iter().any(|p| p.kind == PadKind::Tht);
-    let has_smd = fp.pads.iter().any(|p| p.kind == PadKind::Smd);
-    let has_sch_path = pl
-        .schematic
-        .as_ref()
-        .and_then(|s| s.path.as_deref())
-        .is_some_and(|p| !p.trim().is_empty());
-    // Schematic-linked padless/NPTH footprints (e.g. MountingHole) must omit `board_only` for parity.
-    let attr_type = if has_tht {
-        Some("through_hole")
-    } else if has_smd {
-        Some("smd")
-    } else if has_sch_path {
-        None
-    } else {
-        Some("board_only")
-    };
-
     let fp_id = pl
         .schematic
         .as_ref()
@@ -413,6 +462,18 @@ pub(crate) fn write_footprint(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(&fp.name);
+    if let Some(raw) = &fp.kicad_raw
+        && crate::kicad_raw_fp::try_write_raw_footprint(out, raw, fp_id, pl, fp, net_ids, uuids)
+    {
+        return;
+    }
+    // B.Cu footprints in .kicad_pcb store Y-flipped local coords (y_sign = +1).
+    let bottom = pl.side == Side::Bottom;
+    let y_sign: i64 = if bottom { 1 } else { -1 };
+    let cu_layer = pl.side.cu_layer();
+    let fab_layer = if bottom { "B.Fab" } else { "F.Fab" };
+    let crtyd_layer = if bottom { "B.CrtYd" } else { "F.CrtYd" };
+
     let _ = writeln!(out, "\t(footprint \"{}\"", esc(fp_id));
     let _ = writeln!(out, "\t\t(layer \"{cu_layer}\")");
     let _ = writeln!(out, "\t\t(uuid \"{}\")", uuids.next());
@@ -423,38 +484,20 @@ pub(crate) fn write_footprint(
         nm_to_mm(-pl.pos.y),
         pl.rot_deg.rem_euclid(360.0)
     );
-    write_fp_property(out, "Reference", &pl.refdes, fab_layer, uuids);
-    write_fp_property(out, "Value", &pl.value, fab_layer, uuids);
+    if pl.locked {
+        out.push_str("\t\t(locked yes)\n");
+    }
+    write_fp_property(out, "Reference", &pl.refdes, fab_layer, bottom, uuids);
+    write_fp_property(out, "Value", &pl.value, fab_layer, bottom, uuids);
     if let Some(sch) = &pl.schematic {
         for (k, v) in &sch.fields {
-            if is_ignored_kicad_field(k) || v.is_empty() || (k == "Datasheet" && v == "~") {
-                continue;
-            }
-            write_fp_property(out, k, v, fab_layer, uuids);
-        }
-        for (tag, val) in [
-            ("path", sch.path.as_deref()),
-            ("sheetname", sch.sheetname.as_deref()),
-            ("sheetfile", sch.sheetfile.as_deref()),
-        ] {
-            if let Some(v) = val.map(str::trim).filter(|s| !s.is_empty()) {
-                let _ = writeln!(out, "\t\t({tag} \"{}\")", esc(v));
+            if is_exportable_kicad_field(k, v) {
+                write_fp_property(out, k, v, fab_layer, bottom, uuids);
             }
         }
+        write_schematic_paths(out, sch);
     }
-    let mut attr_tokens: Vec<&str> = Vec::with_capacity(4);
-    if let Some(t) = attr_type {
-        attr_tokens.push(t);
-    }
-    if pl.exclude_from_pos {
-        attr_tokens.push("exclude_from_pos_files");
-    }
-    if pl.exclude_from_bom {
-        attr_tokens.push("exclude_from_bom");
-    }
-    if pl.dnp {
-        attr_tokens.push("dnp");
-    }
+    let attr_tokens = collect_attr_tokens(fp, pl);
     if !attr_tokens.is_empty() {
         let _ = writeln!(out, "\t\t(attr {})", attr_tokens.join(" "));
     }
@@ -468,15 +511,26 @@ pub(crate) fn write_footprint(
     }
 
     if fp.courtyard.len() >= 3 {
-        write_closed_poly_lines(
-            out,
-            "fp_line",
-            crtyd_layer,
-            &fp.courtyard,
-            50_000,
-            y_sign,
-            uuids,
-        );
+        if let Some((min, max)) = axis_aligned_rect(&fp.courtyard) {
+            let rect = Graphic::Rect {
+                layer: crtyd_layer.to_string(),
+                min,
+                max,
+                width: 50_000,
+                fill: false,
+            };
+            write_graphic(out, "fp", &rect, y_sign, Side::Top, "\t\t", uuids);
+        } else {
+            write_closed_poly_lines(
+                out,
+                "fp_line",
+                crtyd_layer,
+                &fp.courtyard,
+                50_000,
+                y_sign,
+                uuids,
+            );
+        }
     }
 
     for ko in &fp.keepouts {

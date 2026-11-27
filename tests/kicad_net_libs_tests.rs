@@ -1070,3 +1070,313 @@ fn roast_regressions_sexp_escapes_lib_isolation_net_sync_and_parity() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn export_kicad_preserves_kicad_mod_fidelity_across_sides_rotations_and_roundtrip() {
+    use boardc::geom::pad_to_world_shape;
+
+    let dir = test_dir("raw_fidelity");
+    let lib_dir = dir.join("RichLib.pretty");
+    fs::create_dir_all(&lib_dir).unwrap();
+
+    let rich_mod = r#"(footprint "RichPart"
+  (version 20260206)
+  (generator "kicad-footprint-generator")
+  (generator_version "10.0")
+  (layer "F.Cu")
+  (descr "Rich SMD test part")
+  (tags "rich smd arc")
+  (solder_mask_margin 0.05)
+  (property "Reference" "REF**" (at 0 -1.5 90) (layer "F.SilkS") (uuid "11111111-1111-1111-1111-111111111111") (effects (font (size 1 1) (thickness 0.15)) (justify left)))
+  (property "Value" "RichPart" (at 0 1.5 0) (layer "F.Fab") (hide yes) (uuid "22222222-2222-2222-2222-222222222222") (effects (font (size 0.8 0.8) (thickness 0.12))))
+  (property "Datasheet" "" (at 0 0 0) (layer "F.Fab") (hide yes) (uuid "33333333-3333-3333-3333-333333333333") (effects (font (size 1.27 1.27) (thickness 0.15))))
+  (attr smd allow_missing_courtyard)
+  (duplicate_pad_numbers_are_jumpers no)
+  (fp_arc (start -1.0 -0.8) (mid 0.0 -1.2) (end 1.0 -0.8) (stroke (width 0.12) (type solid)) (layer "F.SilkS"))
+  (fp_rect (start -1.6 -1.4) (end 1.6 1.4) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))
+  (fp_text user "${REFERENCE}" (at 0 0 0) (layer "F.Fab") (effects (font (size 0.5 0.5) (thickness 0.1))))
+  (zone (layer "F.Cu") (keepout (tracks not_allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints allowed))
+    (polygon (pts (xy -0.4 -0.4) (xy 0.4 -0.4) (xy 0.4 0.4) (xy -0.4 0.4))))
+  (pad "1" smd roundrect (at -0.8 -0.4 30) (size 0.6 0.4) (layers "F.Cu" "F.Mask" "F.Paste") (roundrect_rratio 0.25))
+  (pad "2" smd custom (at 0.8 0.4 15) (size 0.4 0.4) (property pad_prop_heatsink) (layers "F.Cu" "F.Mask")
+    (options (clearance outline) (anchor rect))
+    (primitives (gr_poly (pts (xy -0.2 -0.2) (xy 0.2 -0.2) (xy 0 0.3)) (width 0) (fill yes))))
+  (pad "" np_thru_hole circle (at 0 -0.9) (size 0.5 0.5) (drill 0.5) (layers "*.Cu" "*.Mask"))
+  (embedded_fonts no)
+  (model "${KICAD10_3DMODEL_DIR}/RichLib.3dshapes/RichPart.step" (offset (xyz 0 0 0.1)) (scale (xyz 1 1 1)) (rotate (xyz 0 0 90)))
+)"#;
+    fs::write(lib_dir.join("RichPart.kicad_mod"), rich_mod).unwrap();
+
+    let legacy_mod = r#"(module "LegacyMod" (layer "F.Cu")
+  (fp_text reference "REF**" (at 0 -1.0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text value "LegacyMod" (at 0 1.0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_rect (start -1.0 -0.8) (end 1.0 0.8) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))
+  (pad "1" smd rect (at -0.5 0) (size 0.4 0.5) (layers "F.Cu" "F.Mask" "F.Paste"))
+)"#;
+    fs::write(lib_dir.join("LegacyMod.kicad_mod"), legacy_mod).unwrap();
+
+    let mut placements = Vec::new();
+    let mut idx = 0usize;
+    for side in [Side::Top, Side::Bottom] {
+        for rot in [0.0, 90.0, 180.0, 270.0] {
+            idx += 1;
+            placements.push(Placement {
+                refdes: format!("U{idx}"),
+                footprint: "RichLib:RichPart".into(),
+                value: format!("V{idx}"),
+                pos: Pt::new(mm(10.0 + idx as f64 * 8.0), mm(15.0)),
+                rot_deg: rot,
+                side,
+                locked: idx == 1,
+                dnp: idx == 2,
+                exclude_from_bom: idx == 2,
+                exclude_from_pos: idx == 2,
+                pin_nets: BTreeMap::from([("1".into(), "VCC".into()), ("2".into(), "GND".into())]),
+                schematic: Some(SchematicMeta {
+                    path: Some(format!("/path-{idx}")),
+                    sheetname: Some("/".into()),
+                    sheetfile: Some("top.kicad_sch".into()),
+                    footprint: Some("RichLib:RichPart".into()),
+                    fields: BTreeMap::from([
+                        ("Datasheet".into(), "https://example.com/rich.pdf".into()),
+                        ("MPN".into(), "RICH-01".into()),
+                    ]),
+                }),
+                ..Default::default()
+            });
+        }
+    }
+    placements.push(Placement {
+        refdes: "U_LEG".into(),
+        footprint: "RichLib:LegacyMod".into(),
+        value: "1k".into(),
+        pos: Pt::new(mm(20.0), mm(30.0)),
+        rot_deg: 90.0,
+        side: Side::Bottom,
+        ..Default::default()
+    });
+    placements.push(Placement {
+        refdes: "R_PARAM".into(),
+        footprint: "C_0402".into(),
+        value: "100nF".into(),
+        pos: Pt::new(mm(30.0), mm(30.0)),
+        ..Default::default()
+    });
+
+    let spec = BoardSpec {
+        name: "raw_fidelity".into(),
+        size_nm: Some([mm(120.0), mm(50.0)]),
+        footprint_libs: vec!["RichLib.pretty".into()],
+        footprints: BTreeMap::from([(
+            "C_0402".into(),
+            FootprintSpec::Chip2Pin {
+                package: "0402".into(),
+                pin_types: BTreeMap::new(),
+            },
+        )]),
+        placements,
+        ..Default::default()
+    };
+
+    let board = BoardIr::from_spec_with_base(&spec, Some(&dir)).expect("from_spec_with_base");
+    assert!(board.footprints["RichLib:RichPart"].kicad_raw.is_some());
+    assert!(board.footprints["C_0402"].kicad_raw.is_none());
+
+    // Non-library footprints must omit `kicad_raw` in JSON so pipeline cache keys stay unchanged.
+    let ir_json = serde_json::to_value(&board).unwrap();
+    assert!(ir_json["footprints"]["C_0402"].get("kicad_raw").is_none());
+    assert!(
+        ir_json["footprints"]["RichLib:RichPart"]
+            .get("kicad_raw")
+            .is_some()
+    );
+
+    let pcb = render_kicad_pcb(&board);
+    assert!(!pcb.contains("(version 20260206)\n\t(generator \"kicad-footprint-generator\")"));
+    assert!(pcb.contains("(descr \"Rich SMD test part\")"));
+    assert!(pcb.contains("(tags \"rich smd arc\")"));
+    assert!(pcb.contains("(solder_mask_margin 0.05)"));
+    assert!(pcb.contains("(duplicate_pad_numbers_are_jumpers no)"));
+    assert!(pcb.contains("(embedded_fonts no)"));
+    assert!(pcb.contains("(property pad_prop_heatsink)"));
+    assert!(!pcb.contains("(property \"pad_prop_heatsink\")"));
+    assert!(pcb.contains("(fp_text user \"${REFERENCE}\""));
+    assert!(pcb.contains(
+        "(attr smd allow_missing_courtyard exclude_from_pos_files exclude_from_bom dnp)"
+    ));
+
+    // Parametric C_0402 courtyard now emits fp_rect instead of 4 fp_lines.
+    let c0402_block = pcb.split("(footprint \"C_0402\"").nth(1).unwrap();
+    assert!(c0402_block.contains("(fp_rect "));
+    assert!(c0402_block.contains("(layer \"F.CrtYd\")"));
+
+    // Top 90 deg (U2): Reference at (0 -1.5 (90+90)=180), Value hidden at (0 1.5 90), Datasheet updated in-place (once).
+    let u2_block = pcb
+        .split("(property \"Reference\" \"U2\"")
+        .nth(1)
+        .unwrap()
+        .split("(footprint ")
+        .next()
+        .unwrap();
+    assert!(u2_block.contains("(at 0 -1.5 180)"));
+    assert!(u2_block.contains("(layer \"F.SilkS\")"));
+    assert!(
+        u2_block.contains("(property \"Value\" \"V2\" (at 0 1.5 90) (layer \"F.Fab\") (hide yes)")
+    );
+    assert!(u2_block.contains("(property \"Datasheet\" \"https://example.com/rich.pdf\""));
+    assert_eq!(u2_block.matches("(property \"Datasheet\"").count(), 1);
+    assert!(u2_block.contains("(property \"MPN\" \"RICH-01\""));
+    assert!(u2_block.contains("(path \"/path-2\")"));
+    assert!(u2_block.contains("(fp_rect (start -1.6 -1.4) (end 1.6 1.4)"));
+    assert!(u2_block.contains("(fp_arc (start -1.0 -0.8) (mid 0.0 -1.2) (end 1.0 -0.8)"));
+
+    // Bottom 90 deg (U6): Y flipped, layers remapped F.*->B.*, Reference rot=(90-90)=0, justify left mirror.
+    let u6_block = pcb
+        .split("(property \"Reference\" \"U6\"")
+        .nth(1)
+        .unwrap()
+        .split("(footprint ")
+        .next()
+        .unwrap();
+    assert!(u6_block.contains("(at 0 1.5 0)"));
+    assert!(u6_block.contains("(layer \"B.SilkS\")"));
+    assert!(u6_block.contains("(justify left mirror)"));
+    assert!(
+        u6_block.contains("(property \"Value\" \"V6\" (at 0 -1.5 90) (layer \"B.Fab\") (hide yes)")
+    );
+    assert!(u6_block.contains("(fp_rect (start -1.6 1.4) (end 1.6 -1.4)"));
+    assert!(u6_block.contains("(layer \"B.CrtYd\")"));
+    assert!(u6_block.contains("(fp_arc (start -1.0 0.8) (mid 0.0 1.2) (end 1.0 0.8)"));
+    assert!(u6_block.contains("(pad \"1\" smd roundrect\n\t\t\t(at -0.8 0.4 60)"));
+    assert!(u6_block.contains("(pad \"2\" smd custom\n\t\t\t(at 0.8 -0.4 75)"));
+
+    // Legacy fp_text module updates reference/value without adding duplicate property nodes.
+    let leg_block = pcb
+        .split("(footprint \"RichLib:LegacyMod\"")
+        .nth(1)
+        .unwrap()
+        .split("(footprint ")
+        .next()
+        .unwrap();
+    assert!(leg_block.contains("(fp_text reference \"U_LEG\" (at 0 1.0 90) (layer \"B.SilkS\")"));
+    assert!(leg_block.contains("(fp_text value \"1k\" (at 0 -1.0 90) (layer \"B.Fab\")"));
+    assert!(!leg_block.contains("(property \"Reference\""));
+    assert!(!leg_block.contains("(property \"Value\""));
+
+    // Re-importing exported .kicad_pcb preserves exact world pad geometry and deduplicates U1..U8 into 1 FootprintDef.
+    let rt = parse_kicad_pcb(&pcb, None).expect("reimport exported pcb");
+    assert_eq!(rt.placements.len(), 10);
+    assert!(rt.footprints.contains_key("RichLib:RichPart"));
+    assert!(
+        !rt.footprints
+            .keys()
+            .any(|k| k.starts_with("RichLib:RichPart#")),
+        "all 8 RichPart placements across Top/Bottom and 0/90/180/270 must deduplicate: {:?}",
+        rt.footprints.keys().collect::<Vec<_>>()
+    );
+    for idx in 1..=8 {
+        let refdes = format!("U{idx}");
+        let orig_pl = board
+            .placements
+            .iter()
+            .find(|p| p.refdes == refdes)
+            .unwrap();
+        let orig_fp = &board.footprints[&orig_pl.footprint];
+        let rt_pl = rt.placements.iter().find(|p| p.refdes == refdes).unwrap();
+        let rt_fp = &rt.footprints[&rt_pl.footprint];
+        assert_eq!(rt_pl.locked, orig_pl.locked);
+        assert_eq!(rt_pl.dnp, orig_pl.dnp);
+        assert_eq!(rt_pl.exclude_from_bom, orig_pl.exclude_from_bom);
+        assert_eq!(rt_pl.exclude_from_pos, orig_pl.exclude_from_pos);
+        assert_eq!(rt_pl.pin_nets, orig_pl.pin_nets);
+        assert_eq!(rt_fp.courtyard, orig_fp.courtyard);
+        assert_eq!(rt_fp.keepouts, orig_fp.keepouts);
+        for (op, rp) in orig_fp.pads.iter().zip(&rt_fp.pads) {
+            let os = pad_to_world_shape(op, orig_pl, 16);
+            let rs = pad_to_world_shape(rp, rt_pl, 16);
+            assert_eq!(os.bbox(), rs.bbox(), "{refdes} pad {}", op.name);
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn opportunistic_kicad_cli_zero_lib_footprint_mismatch() {
+    let sys_libs = std::path::Path::new("/usr/share/kicad/footprints");
+    if !sys_libs
+        .join("Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod")
+        .is_file()
+        || Command::new("kicad-cli").arg("--version").output().is_err()
+    {
+        return;
+    }
+    let dir = test_dir("kicad_cli_fidelity");
+    fs::write(
+        dir.join("fp-lib-table"),
+        "(fp_lib_table (version 7)\n  (lib (name \"Resistor_SMD\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Resistor_SMD.pretty\")(options \"\")(descr \"\"))\n  (lib (name \"Package_DFN_QFN\")(type \"KiCad\")(uri \"/usr/share/kicad/footprints/Package_DFN_QFN.pretty\")(options \"\")(descr \"\"))\n)\n",
+    )
+    .unwrap();
+    let mut placements = Vec::new();
+    let mut idx = 0usize;
+    for fp in [
+        "Resistor_SMD:R_0402_1005Metric",
+        "Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm_EP2.6x2.6mm",
+    ] {
+        for side in [Side::Top, Side::Bottom] {
+            for rot in [0.0, 90.0, 180.0, 270.0] {
+                idx += 1;
+                placements.push(Placement {
+                    refdes: format!("U{idx}"),
+                    footprint: fp.into(),
+                    value: "VAL".into(),
+                    pos: Pt::new(
+                        mm(20.0 + (idx % 4) as f64 * 20.0),
+                        mm(20.0 + (idx / 4) as f64 * 20.0),
+                    ),
+                    rot_deg: rot,
+                    side,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    let spec = BoardSpec {
+        name: "cli_fidelity".into(),
+        size_nm: Some([mm(140.0), mm(120.0)]),
+        footprint_libs: vec![sys_libs.to_string_lossy().into_owned()],
+        placements,
+        ..Default::default()
+    };
+    let board = BoardIr::from_spec(&spec).unwrap();
+    let pcb_path = dir.join("board.kicad_pcb");
+    let drc_path = dir.join("drc.json");
+    fs::write(&pcb_path, render_kicad_pcb(&board)).unwrap();
+    let status = Command::new("kicad-cli")
+        .args([
+            "pcb",
+            "drc",
+            "--severity-all",
+            "--format",
+            "json",
+            "-o",
+            drc_path.to_str().unwrap(),
+            pcb_path.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "kicad-cli pcb drc failed");
+    let rep: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&drc_path).unwrap()).unwrap();
+    let mismatches: Vec<_> = rep["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["type"].as_str() == Some("lib_footprint_mismatch"))
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "unexpected lib_footprint_mismatch: {mismatches:#?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
