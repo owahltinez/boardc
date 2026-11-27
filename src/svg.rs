@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 use crate::drc::DrcReport;
 use crate::fab_assembly::render_assembly_svg;
 use crate::fab_drills::render_drill_map_svg;
-use crate::fab_silk::{
-    is_silk_layer, refdes_local_pos, text_graphic_world_segments, text_stroke_segments,
-};
+use crate::fab_silk::{is_silk_layer, refdes_local_pos};
 use crate::geom::{local_to_board, pad_copper_layers, remap_layer_for_side};
 use crate::ir::{BBoxNm, BoardIr, Graphic, PadKind, Pt, Side, mm, nm_to_mm, safe_slug};
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
+use crate::stroke_text::{text_graphic_segments, text_stroke_segments};
 
 pub(crate) const DEFAULT_SVG_MARGIN_MM: f64 = 2.0;
 
@@ -208,16 +207,16 @@ pub(crate) fn render_graphic_svg(
             }
         }
         Graphic::Text { .. } => {
-            let mut segs = Vec::new();
-            text_graphic_world_segments(g, pl, &mut segs);
-            for (a, b, w) in segs {
-                let (ax, ay) = svg_pt(a, mirror_x);
-                let (bx, by) = svg_pt(b, mirror_x);
-                let _ = writeln!(
-                    out,
-                    r#"  <line x1="{ax:.4}" y1="{ay:.4}" x2="{bx:.4}" y2="{by:.4}" stroke="{color}" stroke-width="{:.4}" stroke-linecap="round" />"#,
-                    nm_to_mm(w.max(50_000))
-                );
+            if let Some((segs, w)) = text_graphic_segments(g) {
+                let sw = nm_to_mm(w.max(50_000));
+                for (a, b) in segs {
+                    let (ax, ay) = svg_pt(map_pt(a), mirror_x);
+                    let (bx, by) = svg_pt(map_pt(b), mirror_x);
+                    let _ = writeln!(
+                        out,
+                        r#"  <line x1="{ax:.4}" y1="{ay:.4}" x2="{bx:.4}" y2="{by:.4}" stroke="{color}" stroke-width="{sw:.4}" stroke-linecap="round" />"#,
+                    );
+                }
             }
         }
     }
@@ -464,7 +463,7 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
                 }
                 if pl.side == side && !pl.dnp && !pl.refdes.is_empty() {
                     let c = refdes_local_pos(board, pl);
-                    for (a, b) in text_stroke_segments(&pl.refdes, c, 700_000) {
+                    for (a, b) in text_stroke_segments(&pl.refdes, c, 700_000, 0.0, false) {
                         let wa = local_to_board(a, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
                         let wb = local_to_board(b, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
                         let (ax, ay) = svg_pt(wa, mirror_x);

@@ -56,7 +56,6 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     }
     let items = root.as_list().ok_or("invalid kicad_pcb list")?;
 
-    let mut name = String::new();
     let mut title: Option<String> = None;
     let mut revision: Option<String> = None;
     let mut layers = Vec::new();
@@ -84,11 +83,10 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
             }
             Some("title_block") => {
                 if let Some(t) = trim_nonempty(child_atom(node, "title")) {
-                    name = t.clone();
-                    title = Some(t);
+                    title = Some(t.to_string());
                 }
                 if let Some(r) = trim_nonempty(child_atom(node, "rev")) {
-                    revision = Some(r);
+                    revision = Some(r.to_string());
                 }
             }
             Some("layers") => layers = parse_layers_block(node),
@@ -128,7 +126,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                 if child_atom(node, "layer") == Some("Edge.Cuts") {
                     collect_poly_or_segment(node, -1, &mut edge_open, &mut edge_closed);
                 } else {
-                    graphics.extend(parse_graphic_node(node, -1, None));
+                    graphics.extend(parse_graphic_node(node, -1, None, None));
                 }
             }
             _ => {}
@@ -220,11 +218,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     }
 
     Ok(BoardIr {
-        name: if name.is_empty() {
-            "kicad_board".into()
-        } else {
-            name
-        },
+        name: title.clone().unwrap_or_else(|| "kicad_board".into()),
         title,
         revision,
         outline,

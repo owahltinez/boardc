@@ -12,12 +12,12 @@ use gerber_types::{
     ZeroOmission,
 };
 
-use crate::fab_silk::text_graphic_world_segments;
 use crate::geom::{ensure_ccw, local_to_board, polygon_area};
 use crate::ir::{BBoxNm, Graphic, Nm, PadDef, PadShape, Placement, Pt, nm_to_mm, safe_slug};
 use crate::shapes::{
     ResolvedShape, circle_poly, pad_to_world_shape, paths64_to_polys, pts_to_path64,
 };
+use crate::stroke_text::text_graphic_segments;
 
 pub(crate) fn gerber_coord_format() -> CoordinateFormat {
     CoordinateFormat::new(ZeroOmission::Leading, CoordinateMode::Absolute, 4, 6)
@@ -335,10 +335,10 @@ impl GerberBuilder {
                 }
             }
             Graphic::Text { .. } => {
-                let mut segs = Vec::new();
-                text_graphic_world_segments(g, pl, &mut segs);
-                for (a, b, w) in segs {
-                    self.stroke_segment(a, b, w);
+                if let Some((segs, w)) = text_graphic_segments(g) {
+                    for (a, b) in segs {
+                        self.stroke_segment(map_pt(a), map_pt(b), w);
+                    }
                 }
             }
         }

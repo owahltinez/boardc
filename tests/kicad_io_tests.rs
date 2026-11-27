@@ -761,6 +761,14 @@ fn export_and_import_kicad_pcb_roundtrips_title_revision_and_graphic_text() {
     assert!(rendered.contains("(layer \"B.SilkS\")"));
     assert!(rendered.contains("(justify mirror)"));
     assert!(rendered.contains("(fp_text user \"PIN1\""));
+    let fp_text_line = rendered
+        .lines()
+        .find(|l| l.contains("(fp_text user \"PIN1\""))
+        .unwrap();
+    assert!(
+        fp_text_line.contains("(unlocked yes)"),
+        "exported fp_text user must include (unlocked yes): {fp_text_line}"
+    );
 
     let rt = parse_kicad_pcb(&rendered, None).expect("reimport rendered kicad_pcb");
     assert_eq!(rt.title.as_deref(), Some("Draco Rev A1"));
@@ -794,16 +802,159 @@ fn export_and_import_kicad_pcb_roundtrips_title_revision_and_graphic_text() {
     assert_eq!(minimal_rt.title.as_deref(), Some("plain_board"));
     assert_eq!(minimal_rt.revision, None);
 
-    // Hidden gr_text is skipped on import.
+    // Hidden gr_text and fp_text (via outer hide or effects hide) are skipped on import.
     let hidden_pcb = r#"(kicad_pcb (version 20241229)
         (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
         (gr_rect (start 0 0) (end 20 20) (stroke (width 0.1)) (layer "Edge.Cuts"))
         (gr_text "HIDDEN" (at 5 -5 0) (layer "F.SilkS") (hide yes) (effects (font (size 1 1) (thickness 0.15))))
+        (gr_text "HIDDEN_EFF_YES" (at 6 -6 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15)) (hide yes)))
+        (gr_text "HIDDEN_EFF_BARE" (at 7 -7 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15)) hide))
+        (footprint "Lib:HideTest" (layer "F.Cu") (at 10 10)
+            (property "Reference" "U1")
+            (fp_text user "H_OUTER" (at 0 0) (layer "F.SilkS") hide (effects (font (size 1 1))))
+            (fp_text user "H_EFF_YES" (at 0 0) (layer "F.SilkS") (effects (font (size 1 1)) (hide yes)))
+            (fp_text user "H_EFF_BARE" (at 0 0) (layer "F.SilkS") (effects (font (size 1 1)) hide))
+            (pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu"))
+        )
     )"#;
+    let parsed_hidden = parse_kicad_pcb(hidden_pcb, None).unwrap();
+    assert!(parsed_hidden.graphics.is_empty());
+    assert!(parsed_hidden.footprints["Lib:HideTest"].graphics.is_empty());
+}
+
+#[test]
+fn kicad_text_size_order_subnm_placeholders_keep_upright_and_non_sided_mirror() {
+    use boardc::ir::{
+        BoardIr, BoardSpec, DEFAULT_TEXT_HEIGHT_NM, DEFAULT_TEXT_STROKE_NM, FootprintSpec,
+        Placement,
+    };
+    use boardc::kicad_export::render_kicad_pcb;
+    use std::collections::BTreeMap;
+
+    // Non-square (size HEIGHT WIDTH) imports HEIGHT (index 1); sub-nm falls back to defaults.
+    let pcb = r#"(kicad_pcb (version 20241229)
+        (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+        (gr_rect (start 0 0) (end 40 30) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (gr_text "NONSQ" (at 5 5 0) (layer "F.SilkS") (effects (font (size 2.032 1.524) (thickness 0.254))))
+        (gr_text "SUBNM" (at 8 5 0) (layer "F.SilkS") (effects (font (size 1e-9 1e-9) (thickness 1e-9))))
+        (footprint "Lib:R_0402" (layer "F.Cu") (at 10 10 0)
+            (property "Reference" "R1")
+            (fp_text user "${REFERENCE}" (at 0 0 0) (layer "F.Fab") (effects (font (size 0.5 0.5) (thickness 0.08))))
+            (pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu"))
+        )
+        (footprint "Lib:R_0402" (layer "F.Cu") (at 20 10 90)
+            (property "Reference" "R2")
+            (fp_text user "${REFERENCE}" (at 0 0 90) (layer "F.Fab") (effects (font (size 0.5 0.5) (thickness 0.08))))
+            (pad "1" smd rect (at -0.5 0 90) (size 0.5 0.5) (layers "F.Cu"))
+        )
+    )"#;
+    let ir = parse_kicad_pcb(pcb, None).expect("parse pcb");
+    assert_eq!(ir.graphics.len(), 2);
+    assert!(matches!(
+        &ir.graphics[0],
+        Graphic::Text { text, height_nm: 2_032_000, stroke_nm: 254_000, .. } if text == "NONSQ"
+    ));
+    assert!(matches!(
+        &ir.graphics[1],
+        Graphic::Text { text, height_nm, stroke_nm, .. }
+            if text == "SUBNM" && *height_nm == DEFAULT_TEXT_HEIGHT_NM && *stroke_nm == DEFAULT_TEXT_STROKE_NM
+    ));
+    // `${REFERENCE}` fp_text is skipped without fragmenting identical footprints across rotations.
+    assert_eq!(ir.footprints.len(), 1);
+    assert!(ir.footprints["Lib:R_0402"].graphics.is_empty());
+
+    // Locked fp_text user applies KeepUpright for (90, 270]; unlocked or 90 deg keeps angle.
+    let fp_mod = parse_kicad_mod(
+        r#"(footprint "KeepTest" (layer "F.Cu")
+            (fp_text user "L180" (at 0 0 180) (layer "F.SilkS") (effects (font (size 1 1))))
+            (fp_text user "L270" (at 0 0 270) (layer "F.SilkS") (effects (font (size 1 1))))
+            (fp_text user "L90" (at 0 0 90) (layer "F.SilkS") (effects (font (size 1 1))))
+            (fp_text user "U180" (at 0 0 180) (unlocked yes) (layer "F.SilkS") (effects (font (size 1 1))))
+        )"#,
+    )
+    .expect("parse keep_upright mod");
+    let rots: Vec<(&str, f64)> = fp_mod
+        .graphics
+        .iter()
+        .map(|g| match g {
+            Graphic::Text { text, rot_deg, .. } => (text.as_str(), *rot_deg),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(
+        rots,
+        vec![
+            ("L180", 0.0),
+            ("L270", 90.0),
+            ("L90", 90.0),
+            ("U180", 180.0)
+        ]
+    );
+
+    // Placed locked fp_text user on F.Cu (fp rot 90, stored 180 -> eff 0 -> local 270) and B.Cu (fp rot 0, stored 270 -> eff 90 -> local 90).
+    let keep_pcb = r#"(kicad_pcb (version 20241229)
+        (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+        (gr_rect (start 0 0) (end 40 30) (stroke (width 0.1)) (layer "Edge.Cuts"))
+        (footprint "Lib:KF" (layer "F.Cu") (at 10 10 90)
+            (property "Reference" "U1")
+            (fp_text user "TOP" (at 0 0 180) (layer "F.SilkS") (effects (font (size 1 1))))
+        )
+        (footprint "Lib:KB" (layer "B.Cu") (at 20 10 0)
+            (property "Reference" "U2")
+            (fp_text user "BOT" (at 0 0 270) (layer "B.SilkS") (effects (font (size 1 1))))
+        )
+    )"#;
+    let keep_ir = parse_kicad_pcb(keep_pcb, None).expect("parse keep_pcb");
+    assert!(matches!(
+        &keep_ir.footprints["Lib:KF"].graphics[0],
+        Graphic::Text { rot_deg, .. } if (*rot_deg - 270.0).abs() < 1e-6
+    ));
+    assert!(matches!(
+        &keep_ir.footprints["Lib:KB"].graphics[0],
+        Graphic::Text { rot_deg, .. } if (*rot_deg - 90.0).abs() < 1e-6
+    ));
+
+    // Non-sided layer (Dwgs.User) on Side::Bottom emits (justify mirror) on export.
+    let mut footprints = BTreeMap::new();
+    footprints.insert(
+        "DWG_FP".into(),
+        FootprintSpec::Custom {
+            pads: Vec::new(),
+            courtyard: Vec::new(),
+            graphics: vec![Graphic::Text {
+                layer: "Dwgs.User".into(),
+                text: "NOTE".into(),
+                pos: Pt::new(0, 0),
+                height_nm: 800_000,
+                stroke_nm: 120_000,
+                rot_deg: 0.0,
+            }],
+            keepouts: Vec::new(),
+            pin_types: BTreeMap::new(),
+        },
+    );
+    let dwg_board = BoardIr::from_spec(&BoardSpec {
+        name: "dwg_bot".into(),
+        size_nm: Some([mm(20.0), mm(20.0)]),
+        footprints,
+        placements: vec![Placement {
+            refdes: "G1".into(),
+            footprint: "DWG_FP".into(),
+            pos: Pt::new(mm(10.0), mm(10.0)),
+            side: Side::Bottom,
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    let dwg_rendered = render_kicad_pcb(&dwg_board);
+    let dwg_line = dwg_rendered
+        .lines()
+        .find(|l| l.contains("(fp_text user \"NOTE\""))
+        .unwrap();
+    assert!(dwg_line.contains("(layer \"Dwgs.User\")"));
     assert!(
-        parse_kicad_pcb(hidden_pcb, None)
-            .unwrap()
-            .graphics
-            .is_empty()
+        dwg_line.contains("(justify mirror)"),
+        "non-sided layer on Side::Bottom must emit (justify mirror): {dwg_line}"
     );
 }

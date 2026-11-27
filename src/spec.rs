@@ -437,8 +437,8 @@ impl BoardIr {
         }
         Ok(Self {
             name: spec.name.clone(),
-            title: trim_nonempty(spec.title.as_deref()),
-            revision: trim_nonempty(spec.revision.as_deref()),
+            title: trim_nonempty(spec.title.as_deref()).map(str::to_string),
+            revision: trim_nonempty(spec.revision.as_deref()).map(str::to_string),
             outline,
             cutouts: spec.cutouts.clone(),
             layers,

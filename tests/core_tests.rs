@@ -574,7 +574,7 @@ pos = { x = 10_000_000, y = 12_000_000 }
     assert_eq!(ws_ir.effective_title(), "fallback_board");
     assert_eq!(ws_ir.effective_revision(), "1");
 
-    // Validation rejects non-positive height_nm/stroke_nm and non-finite rot_deg.
+    // Validation rejects non-positive height_nm/stroke_nm and non-finite rot_deg on board and fp.graphics.
     for bad in [
         boardc::ir::Graphic::Text {
             layer: "F.SilkS".into(),
@@ -605,10 +605,41 @@ pos = { x = 10_000_000, y = 12_000_000 }
         bad_spec.graphics = vec![bad.clone()];
         assert!(BoardIr::from_spec(&bad_spec).is_err());
 
+        let mut bad_fp_spec = ws_spec.clone();
+        bad_fp_spec.footprints.insert(
+            "BAD_FP".into(),
+            FootprintSpec::Custom {
+                pads: Vec::new(),
+                courtyard: Vec::new(),
+                graphics: vec![bad.clone()],
+                keepouts: Vec::new(),
+                pin_types: BTreeMap::new(),
+            },
+        );
+        assert!(BoardIr::from_spec(&bad_fp_spec).is_err());
+
         let mut bad_ir = ws_ir.clone();
-        bad_ir.graphics = vec![bad];
-        save_board_json(&bad_ir, &ir_path).unwrap();
-        assert!(load_board_json(&ir_path).is_err());
+        bad_ir.graphics = vec![bad.clone()];
+        assert!(boardc::spec::validate_board_ir_pins(&bad_ir, &ir_path).is_err());
+        if !matches!(&bad, boardc::ir::Graphic::Text { rot_deg, .. } if !rot_deg.is_finite()) {
+            save_board_json(&bad_ir, &ir_path).unwrap();
+            assert!(load_board_json(&ir_path).is_err());
+        }
+
+        let mut bad_fp_ir = ws_ir.clone();
+        bad_fp_ir.footprints.insert(
+            "BAD_FP".into(),
+            boardc::ir::FootprintDef {
+                name: "BAD_FP".into(),
+                pads: Vec::new(),
+                courtyard: Vec::new(),
+                graphics: vec![bad],
+                keepouts: Vec::new(),
+                models: Vec::new(),
+                pin_types: BTreeMap::new(),
+            },
+        );
+        assert!(boardc::spec::validate_board_ir_pins(&bad_fp_ir, &ir_path).is_err());
     }
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

@@ -8,10 +8,11 @@ use gerber_types::Polarity;
 use crate::fab_gerber::GerberBuilder;
 use crate::geom::{
     EPS_NM, ensure_ccw, local_to_board, polygon_area, polygon_violates_clearance, pts_to_path64,
-    remap_layer_for_side, sin_cos_deg,
+    remap_layer_for_side,
 };
 use crate::ir::{BBoxNm, BoardIr, Graphic, Nm, Placement, PourPoly, Pt, Side};
 use crate::shapes::{ResolvedShape, circle_poly};
+use crate::stroke_text::{text_graphic_segments, text_stroke_segments};
 use crate::zone_scene::{paths_to_pour_polys, pour_poly_area, shape_inflated_poly};
 
 const PIN1_DOT_RADIUS_NM: Nm = 120_000;
@@ -22,47 +23,6 @@ pub(crate) fn is_silk_layer(layer: &str, side: Side) -> bool {
     match side {
         Side::Top => matches!(layer, "F.Silk" | "F.SilkS" | "F.Silkscreen"),
         Side::Bottom => matches!(layer, "B.Silk" | "B.SilkS" | "B.Silkscreen"),
-    }
-}
-
-pub(crate) fn is_bottom_layer(layer: &str) -> bool {
-    layer.starts_with("B.")
-}
-
-pub(crate) fn text_graphic_local_segments(g: &Graphic) -> Option<(Vec<(Pt, Pt)>, Nm)> {
-    let Graphic::Text {
-        layer,
-        text,
-        pos,
-        height_nm,
-        stroke_nm,
-        rot_deg,
-    } = g
-    else {
-        return None;
-    };
-    let segs =
-        text_stroke_segments_transformed(text, *pos, *height_nm, *rot_deg, is_bottom_layer(layer));
-    Some((segs, (*stroke_nm).max(10_000)))
-}
-
-pub(crate) fn text_graphic_world_segments(
-    g: &Graphic,
-    pl: Option<&Placement>,
-    out_segs: &mut Vec<(Pt, Pt, Nm)>,
-) {
-    let Some((segs, w)) = text_graphic_local_segments(g) else {
-        return;
-    };
-    for (a, b) in segs {
-        let (wa, wb) = match pl {
-            Some(pl) => (
-                local_to_board(a, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side),
-                local_to_board(b, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side),
-            ),
-            None => (a, b),
-        };
-        out_segs.push((wa, wb, w));
     }
 }
 
@@ -143,7 +103,11 @@ pub(crate) fn graphic_world_geom(
             }
         }
         Graphic::Text { .. } => {
-            text_graphic_world_segments(g, pl, out_segs);
+            if let Some((segs, w)) = text_graphic_segments(g) {
+                for (a, b) in segs {
+                    out_segs.push((map_pt(a), map_pt(b), w));
+                }
+            }
             None
         }
     }
@@ -165,258 +129,6 @@ pub(crate) fn push_graphic_mask_shapes(
             radius: w.max(10_000) / 2,
         });
     }
-}
-
-/// Returns a 5x7 stroke polyline glyph (coordinates in `[0..=4] x [0..=6]`) for ASCII chars.
-fn glyph_strokes(ch: char) -> &'static [&'static [(u8, u8)]] {
-    match ch.to_ascii_uppercase() {
-        '0' => &[
-            &[
-                (0, 1),
-                (0, 5),
-                (1, 6),
-                (3, 6),
-                (4, 5),
-                (4, 1),
-                (3, 0),
-                (1, 0),
-                (0, 1),
-            ],
-            &[(0, 1), (4, 5)],
-        ],
-        '1' => &[&[(1, 5), (2, 6), (2, 0)], &[(1, 0), (3, 0)]],
-        '2' => &[&[(0, 5), (1, 6), (3, 6), (4, 5), (4, 4), (0, 0), (4, 0)]],
-        '3' => &[
-            &[(0, 5), (1, 6), (3, 6), (4, 5), (4, 4), (3, 3), (1, 3)],
-            &[(3, 3), (4, 2), (4, 1), (3, 0), (1, 0), (0, 1)],
-        ],
-        '4' => &[&[(3, 0), (3, 6), (0, 2), (4, 2)]],
-        '5' => &[&[
-            (4, 6),
-            (0, 6),
-            (0, 3),
-            (3, 3),
-            (4, 2),
-            (4, 1),
-            (3, 0),
-            (1, 0),
-            (0, 1),
-        ]],
-        '6' => &[&[
-            (3, 6),
-            (1, 6),
-            (0, 5),
-            (0, 1),
-            (1, 0),
-            (3, 0),
-            (4, 1),
-            (4, 2),
-            (3, 3),
-            (0, 3),
-        ]],
-        '7' => &[&[(0, 6), (4, 6), (1, 0)]],
-        '8' => &[&[
-            (1, 3),
-            (0, 4),
-            (0, 5),
-            (1, 6),
-            (3, 6),
-            (4, 5),
-            (4, 4),
-            (3, 3),
-            (1, 3),
-            (0, 2),
-            (0, 1),
-            (1, 0),
-            (3, 0),
-            (4, 1),
-            (4, 2),
-            (3, 3),
-        ]],
-        '9' => &[&[
-            (4, 3),
-            (1, 3),
-            (0, 4),
-            (0, 5),
-            (1, 6),
-            (3, 6),
-            (4, 5),
-            (4, 1),
-            (3, 0),
-            (1, 0),
-        ]],
-        'A' => &[&[(0, 0), (0, 4), (2, 6), (4, 4), (4, 0)], &[(0, 2), (4, 2)]],
-        'B' => &[
-            &[(0, 0), (0, 6), (3, 6), (4, 5), (4, 4), (3, 3), (0, 3)],
-            &[(3, 3), (4, 2), (4, 1), (3, 0), (0, 0)],
-        ],
-        'C' => &[&[
-            (4, 5),
-            (3, 6),
-            (1, 6),
-            (0, 5),
-            (0, 1),
-            (1, 0),
-            (3, 0),
-            (4, 1),
-        ]],
-        'D' => &[&[(0, 0), (0, 6), (3, 6), (4, 5), (4, 1), (3, 0), (0, 0)]],
-        'E' => &[&[(4, 6), (0, 6), (0, 0), (4, 0)], &[(0, 3), (3, 3)]],
-        'F' => &[&[(4, 6), (0, 6), (0, 0)], &[(0, 3), (3, 3)]],
-        'G' => &[&[
-            (4, 5),
-            (3, 6),
-            (1, 6),
-            (0, 5),
-            (0, 1),
-            (1, 0),
-            (3, 0),
-            (4, 1),
-            (4, 3),
-            (2, 3),
-        ]],
-        'H' => &[&[(0, 0), (0, 6)], &[(4, 0), (4, 6)], &[(0, 3), (4, 3)]],
-        'I' => &[&[(1, 6), (3, 6)], &[(2, 6), (2, 0)], &[(1, 0), (3, 0)]],
-        'J' => &[&[(4, 6), (4, 1), (3, 0), (1, 0), (0, 1)]],
-        'K' => &[&[(0, 0), (0, 6)], &[(4, 6), (0, 3), (4, 0)]],
-        'L' => &[&[(0, 6), (0, 0), (4, 0)]],
-        'M' => &[&[(0, 0), (0, 6), (2, 3), (4, 6), (4, 0)]],
-        'N' => &[&[(0, 0), (0, 6), (4, 0), (4, 6)]],
-        'O' => &[&[
-            (1, 0),
-            (0, 1),
-            (0, 5),
-            (1, 6),
-            (3, 6),
-            (4, 5),
-            (4, 1),
-            (3, 0),
-            (1, 0),
-        ]],
-        'P' => &[&[(0, 0), (0, 6), (3, 6), (4, 5), (4, 4), (3, 3), (0, 3)]],
-        'Q' => &[
-            &[
-                (1, 0),
-                (0, 1),
-                (0, 5),
-                (1, 6),
-                (3, 6),
-                (4, 5),
-                (4, 1),
-                (3, 0),
-                (1, 0),
-            ],
-            &[(2, 2), (4, 0)],
-        ],
-        'R' => &[
-            &[(0, 0), (0, 6), (3, 6), (4, 5), (4, 4), (3, 3), (0, 3)],
-            &[(2, 3), (4, 0)],
-        ],
-        'S' => &[&[
-            (4, 5),
-            (3, 6),
-            (1, 6),
-            (0, 5),
-            (0, 4),
-            (4, 2),
-            (4, 1),
-            (3, 0),
-            (1, 0),
-            (0, 1),
-        ]],
-        'T' => &[&[(0, 6), (4, 6)], &[(2, 6), (2, 0)]],
-        'U' => &[&[(0, 6), (0, 1), (1, 0), (3, 0), (4, 1), (4, 6)]],
-        'V' => &[&[(0, 6), (2, 0), (4, 6)]],
-        'W' => &[&[(0, 6), (1, 0), (2, 3), (3, 0), (4, 6)]],
-        'X' => &[&[(0, 6), (4, 0)], &[(0, 0), (4, 6)]],
-        'Y' => &[&[(0, 6), (2, 3), (4, 6)], &[(2, 3), (2, 0)]],
-        'Z' => &[&[(0, 6), (4, 6), (0, 0), (4, 0)]],
-        '-' => &[&[(0, 3), (4, 3)]],
-        '_' => &[&[(0, 0), (4, 0)]],
-        '.' => &[&[(2, 0), (2, 1)]],
-        '+' => &[&[(0, 3), (4, 3)], &[(2, 1), (2, 5)]],
-        '/' => &[&[(0, 0), (4, 6)]],
-        ':' => &[&[(2, 1), (2, 2)], &[(2, 4), (2, 5)]],
-        '#' => &[
-            &[(1, 0), (1, 6)],
-            &[(3, 0), (3, 6)],
-            &[(0, 2), (4, 2)],
-            &[(0, 4), (4, 4)],
-        ],
-        _ => &[],
-    }
-}
-
-pub(crate) fn text_stroke_segments_transformed(
-    text: &str,
-    center_local: Pt,
-    char_height_nm: Nm,
-    rot_deg: f64,
-    mirror_x: bool,
-) -> Vec<(Pt, Pt)> {
-    if char_height_nm <= 0 || !rot_deg.is_finite() {
-        return Vec::new();
-    }
-    let lines: Vec<Vec<char>> = text
-        .split('\n')
-        .map(|l| {
-            l.trim_end_matches('\r')
-                .chars()
-                .filter(|c| !c.is_control())
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    if lines.iter().all(|l| l.is_empty()) {
-        return Vec::new();
-    }
-    let h = char_height_nm as f64;
-    let scale_x = h * 0.65 / 4.0;
-    let scale_y = h / 6.0;
-    let char_w = 4.0 * scale_x;
-    let advance = char_w * 1.45;
-    let line_pitch = h * 1.5;
-    let total_h = (lines.len() - 1) as f64 * line_pitch + h;
-    let (s, c) = sin_cos_deg(rot_deg);
-    let x_sign = if mirror_x { -1.0 } else { 1.0 };
-
-    let to_pt = |lx: f64, ly: f64| {
-        let mx = lx * x_sign;
-        let rx = mx * c - ly * s;
-        let ry = mx * s + ly * c;
-        Pt::new(
-            center_local.x + rx.round() as Nm,
-            center_local.y + ry.round() as Nm,
-        )
-    };
-
-    let mut segs = Vec::new();
-    for (line_idx, chars) in lines.iter().enumerate() {
-        if chars.is_empty() {
-            continue;
-        }
-        let total_w = (chars.len() as f64 - 1.0) * advance + char_w;
-        let x0 = -total_w * 0.5;
-        let y0 = total_h * 0.5 - h - (line_idx as f64) * line_pitch;
-        for (i, ch) in chars.iter().enumerate() {
-            let cx = x0 + i as f64 * advance;
-            for poly in glyph_strokes(*ch) {
-                for w in poly.windows(2) {
-                    let a = to_pt(cx + w[0].0 as f64 * scale_x, y0 + w[0].1 as f64 * scale_y);
-                    let b = to_pt(cx + w[1].0 as f64 * scale_x, y0 + w[1].1 as f64 * scale_y);
-                    segs.push((a, b));
-                }
-            }
-        }
-    }
-    segs
-}
-
-pub(crate) fn text_stroke_segments(
-    text: &str,
-    center_local: Pt,
-    char_height_nm: Nm,
-) -> Vec<(Pt, Pt)> {
-    text_stroke_segments_transformed(text, center_local, char_height_nm, 0.0, false)
 }
 
 fn placement_local_bbox(fp: &crate::ir::FootprintDef) -> BBoxNm {
@@ -636,7 +348,7 @@ pub(crate) fn emit_silk_layer(
             }
             if !pl.refdes.is_empty() {
                 let text_center = refdes_local_pos(board, pl);
-                for (a, b) in text_stroke_segments(&pl.refdes, text_center, 700_000) {
+                for (a, b) in text_stroke_segments(&pl.refdes, text_center, 700_000, 0.0, false) {
                     let wa = local_to_board(a, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
                     let wb = local_to_board(b, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
                     raw_segs.push((wa, wb, 120_000));

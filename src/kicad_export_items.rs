@@ -111,19 +111,18 @@ pub(crate) fn write_graphic(
     pl: Option<&Placement>,
     uuids: &mut UuidGen,
 ) {
-    let (tag_prefix, indent, side, y_sign, pl_rot_deg) = match pl {
+    let (tag_prefix, indent, side, y_sign) = match pl {
         Some(p) => (
             "fp",
             "\t\t",
             p.side,
             if p.side == Side::Bottom { 1 } else { -1 },
-            p.rot_deg,
         ),
-        None => ("gr", "\t", Side::Top, -1, 0.0),
+        None => ("gr", "\t", Side::Top, -1),
     };
+    let l = remap_kicad_layer(g.layer(), side);
     match g {
-        Graphic::Line { a, b, width, layer } => {
-            let l = remap_kicad_layer(layer, side);
+        Graphic::Line { a, b, width, .. } => {
             let _ = writeln!(
                 out,
                 "{indent}({tag_prefix}_line (start {:.6} {:.6}) (end {:.6} {:.6}) (stroke (width {:.4}) (type solid)) (layer \"{}\") (uuid \"{}\"))",
@@ -137,13 +136,12 @@ pub(crate) fn write_graphic(
             );
         }
         Graphic::Rect {
-            layer,
             min,
             max,
             width,
             fill,
+            ..
         } => {
-            let l = remap_kicad_layer(layer, side);
             let fill_str = if *fill { "yes" } else { "no" };
             let _ = writeln!(
                 out,
@@ -158,13 +156,12 @@ pub(crate) fn write_graphic(
             );
         }
         Graphic::Circle {
-            layer,
             center,
             radius,
             width,
             fill,
+            ..
         } => {
-            let l = remap_kicad_layer(layer, side);
             let fill_str = if *fill { "yes" } else { "no" };
             let _ = writeln!(
                 out,
@@ -179,15 +176,11 @@ pub(crate) fn write_graphic(
             );
         }
         Graphic::Poly {
-            layer,
-            verts,
-            width,
-            fill,
+            verts, width, fill, ..
         } => {
             if verts.len() < 3 {
                 return;
             }
-            let l = remap_kicad_layer(layer, side);
             let fill_str = if *fill { "yes" } else { "no" };
             let _ = writeln!(out, "{indent}({tag_prefix}_poly");
             write_pts(out, verts, y_sign, &format!("{indent}\t"));
@@ -208,17 +201,17 @@ pub(crate) fn write_graphic(
             stroke_nm,
             rot_deg,
         } => {
-            let l = remap_kicad_layer(layer, side);
-            let (tag_open, abs_rot) = if tag_prefix == "fp" {
-                let r = match side {
-                    Side::Top => pl_rot_deg + *rot_deg,
-                    Side::Bottom => pl_rot_deg - *rot_deg + 180.0,
-                };
-                ("fp_text user", r.rem_euclid(360.0))
-            } else {
-                ("gr_text", rot_deg.rem_euclid(360.0))
+            let (tag_open, abs_rot, unlocked) = match pl {
+                Some(p) => {
+                    let r = match p.side {
+                        Side::Top => p.rot_deg + *rot_deg,
+                        Side::Bottom => p.rot_deg - *rot_deg + 180.0,
+                    };
+                    ("fp_text user", r.rem_euclid(360.0), " (unlocked yes)")
+                }
+                None => ("gr_text", rot_deg.rem_euclid(360.0), ""),
             };
-            let mirror = if l.starts_with("B.") {
+            let mirror = if layer.starts_with("B.") ^ (side == Side::Bottom) {
                 " (justify mirror)"
             } else {
                 ""
@@ -227,7 +220,7 @@ pub(crate) fn write_graphic(
             let t = nm_to_mm((*stroke_nm).max(10_000));
             let _ = writeln!(
                 out,
-                "{indent}({tag_open} \"{}\" (at {:.6} {:.6} {abs_rot:.4}) (layer \"{}\") (uuid \"{}\") (effects (font (size {h:.6} {h:.6}) (thickness {t:.6})){mirror}))",
+                "{indent}({tag_open} \"{}\" (at {:.6} {:.6} {abs_rot:.4}){unlocked} (layer \"{}\") (uuid \"{}\") (effects (font (size {h:.6} {h:.6}) (thickness {t:.6})){mirror}))",
                 esc(text),
                 nm_to_mm(pos.x),
                 nm_to_mm(y_sign * pos.y),

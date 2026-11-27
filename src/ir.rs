@@ -22,10 +22,8 @@ pub fn safe_slug(name: &str) -> String {
     if s.is_empty() { "board".into() } else { s }
 }
 
-pub(crate) fn trim_nonempty(raw: Option<&str>) -> Option<String> {
-    raw.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+pub(crate) fn trim_nonempty(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|s| !s.is_empty())
 }
 
 pub(crate) fn fnv1a_128(bytes: &[u8]) -> u128 {
@@ -310,12 +308,15 @@ pub struct PadDef {
     pub paste_margin_nm: Option<Nm>,
 }
 
+pub const DEFAULT_TEXT_HEIGHT_NM: Nm = 1_000_000;
+pub const DEFAULT_TEXT_STROKE_NM: Nm = 150_000;
+
 fn default_text_height_nm() -> Nm {
-    1_000_000
+    DEFAULT_TEXT_HEIGHT_NM
 }
 
 fn default_text_stroke_nm() -> Nm {
-    150_000
+    DEFAULT_TEXT_STROKE_NM
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -897,18 +898,11 @@ pub struct BoardIr {
 
 impl BoardIr {
     pub fn effective_title(&self) -> &str {
-        self.title
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&self.name)
+        trim_nonempty(self.title.as_deref()).unwrap_or(&self.name)
     }
 
     pub fn revision_trimmed(&self) -> Option<&str> {
-        self.revision
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+        trim_nonempty(self.revision.as_deref())
     }
 
     pub fn effective_revision(&self) -> &str {
