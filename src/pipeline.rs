@@ -29,7 +29,7 @@ use crate::shapes::transform_pad_local_pt;
 use crate::svg::write_board_svgs;
 use crate::zones::{ZoneChoke, ZoneReport, fill_zones};
 
-const CACHE_SCHEMA: &str = "v3";
+const CACHE_SCHEMA: &str = "v4";
 static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Pipeline stage identifier in execution order.

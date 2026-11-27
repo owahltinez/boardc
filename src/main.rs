@@ -361,8 +361,13 @@ struct JsonBoardProbe {
     filled_pours: Option<serde::de::IgnoredAny>,
 }
 
-fn validate_loaded_ir(ir: BoardIr, path: &Path) -> Result<BoardIr, String> {
+fn validate_loaded_ir(mut ir: BoardIr, path: &Path) -> Result<BoardIr, String> {
     boardc::spec::validate_board_ir_pins(&ir, path)?;
+    for (key, nd) in &mut ir.nets {
+        if nd.name.trim().is_empty() {
+            nd.name = key.clone();
+        }
+    }
     Ok(ir)
 }
 

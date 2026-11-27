@@ -217,7 +217,7 @@ fn json_and_toml_spec_roundtrip_and_board_ir_io() {
             name: "VCC".into(),
             class: "Power".into(),
             pins: vec![("R1".into(), "1".into())],
-            ignore_route: false,
+            ..Default::default()
         },
     );
     let mut r1_nets = BTreeMap::new();

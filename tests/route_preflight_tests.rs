@@ -183,9 +183,8 @@ fn route_4layer_board_ir_with_inner_planes_clean_drc() {
             name.into(),
             NetDef {
                 name: name.into(),
-                class: "Default".into(),
-                pins: Vec::new(),
                 ignore_route: ignore,
+                ..Default::default()
             },
         );
     }
@@ -399,8 +398,7 @@ fn length_constraints_propagate_to_viahop() {
             NetDef {
                 name: n.into(),
                 class: "HS".into(),
-                pins: Vec::new(),
-                ignore_route: false,
+                ..Default::default()
             },
         );
     }

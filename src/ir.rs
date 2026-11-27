@@ -451,6 +451,8 @@ pub enum PinType {
     Out,
     Bidir,
     Tri,
+    #[serde(alias = "open_drain")]
+    OpenCollector,
     PowerIn,
     PowerOut,
     Passive,
@@ -464,6 +466,7 @@ impl PinType {
             Self::Out => "out",
             Self::Bidir => "bidir",
             Self::Tri => "tri",
+            Self::OpenCollector => "open_collector",
             Self::PowerIn => "power_in",
             Self::PowerOut => "power_out",
             Self::Passive => "passive",
@@ -800,14 +803,26 @@ pub(crate) fn default_net_class() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NetDef {
     pub name: String,
-    #[serde(default = "default_net_class")]
     pub class: String,
-    #[serde(default)]
     pub pins: Vec<(String, String)>,
-    #[serde(default)]
     pub ignore_route: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub power_driven: bool,
+}
+
+impl Default for NetDef {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            class: default_net_class(),
+            pins: Vec::new(),
+            ignore_route: false,
+            power_driven: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
