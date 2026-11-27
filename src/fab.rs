@@ -18,8 +18,8 @@ use crate::fab_job::emit_gbrjob;
 use crate::fab_silk::{emit_silk_layer, push_graphic_mask_shapes};
 use crate::geom::{pad_copper_layers, pad_world_layers, polygon_area, remap_layer_for_side};
 use crate::ir::{
-    AutoRefdes, BoardIr, FootprintDef, LayerKind, Nm, PadKind, Placement, PourPoly, Side, nm_to_mm,
-    safe_slug,
+    AutoRefdes, BoardIr, FabConfig, FootprintDef, LayerKind, Nm, PadKind, Placement, PourPoly,
+    Side, nm_to_mm, safe_slug,
 };
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
 use crate::svg::DEFAULT_SVG_MARGIN_MM;
@@ -381,11 +381,11 @@ pub fn export_fab(
     out_dir: &Path,
     cfg: &FabOptions,
 ) -> Result<FabManifest, String> {
-    let auto_refdes = cfg.auto_refdes.unwrap_or(board.fab.auto_refdes);
-    let refdes_stroke_nm = cfg.refdes_stroke_nm.unwrap_or(board.fab.refdes_stroke_nm);
-    if refdes_stroke_nm <= 0 {
-        return Err("fab.refdes_stroke_nm must be > 0".into());
-    }
+    let fab = FabConfig {
+        auto_refdes: cfg.auto_refdes.unwrap_or(board.fab.auto_refdes),
+        refdes_stroke_nm: cfg.refdes_stroke_nm.unwrap_or(board.fab.refdes_stroke_nm),
+    };
+    fab.validate()?;
     fs::create_dir_all(out_dir)
         .map_err(|e| format!("failed to create fab dir '{}': {e}", out_dir.display()))?;
     let cu_layers = board.copper_layer_names();
@@ -428,14 +428,7 @@ pub fn export_fab(
             pos: fn_pos,
             index: None,
         });
-        emit_silk_layer(
-            &mut silk_b,
-            board,
-            side,
-            &mask_openings,
-            auto_refdes,
-            refdes_stroke_nm,
-        );
+        emit_silk_layer(&mut silk_b, board, side, &mask_openings, fab);
         silk_b.write_file(&silk_path)?;
         gerber_files.push(silk_path);
     }

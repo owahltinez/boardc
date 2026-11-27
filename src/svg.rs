@@ -8,7 +8,8 @@ use crate::fab_drills::render_drill_map_svg;
 use crate::fab_silk::{is_silk_layer, refdes_world_segments};
 use crate::geom::{local_to_board, pad_copper_layers, remap_layer_for_side};
 use crate::ir::{
-    BBoxNm, BoardIr, DEFAULT_REFDES_STROKE_NM, Graphic, PadKind, Pt, Side, mm, nm_to_mm, safe_slug,
+    BBoxNm, BoardIr, DEFAULT_REFDES_STROKE_NM, Graphic, MIN_REFDES_STROKE_NM, PadKind, Pt, Side,
+    mm, nm_to_mm, safe_slug,
 };
 use crate::shapes::{ResolvedShape, pad_to_world_shape};
 
@@ -434,6 +435,13 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
             _ => None,
         };
         if let Some(side) = silk_side {
+            let stroke_mm = nm_to_mm(if board.fab.refdes_stroke_nm >= MIN_REFDES_STROKE_NM {
+                board.fab.refdes_stroke_nm
+            } else if board.fab.refdes_stroke_nm > 0 {
+                MIN_REFDES_STROKE_NM
+            } else {
+                DEFAULT_REFDES_STROKE_NM
+            });
             out.push_str("  <g id=\"silkscreen\">\n");
             for pl in &board.placements {
                 let Some(fp) = board.footprints.get(&pl.footprint) else {
@@ -445,12 +453,7 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
                     }
                 }
                 if pl.side == side && !pl.dnp {
-                    let stroke_mm = nm_to_mm(if board.fab.refdes_stroke_nm > 0 {
-                        board.fab.refdes_stroke_nm
-                    } else {
-                        DEFAULT_REFDES_STROKE_NM
-                    });
-                    for (wa, wb) in refdes_world_segments(board, pl, board.fab.auto_refdes) {
+                    for (wa, wb) in refdes_world_segments(fp, pl, board.fab.auto_refdes) {
                         let (ax, ay) = svg_pt(wa, mirror_x);
                         let (bx, by) = svg_pt(wb, mirror_x);
                         let _ = writeln!(

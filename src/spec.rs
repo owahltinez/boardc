@@ -189,15 +189,10 @@ pub(crate) fn validate_pin_types_for_footprint(
     Ok(())
 }
 
-pub(crate) fn validate_fab_config(fab: &FabConfig) -> Result<(), String> {
-    if fab.refdes_stroke_nm <= 0 {
-        return Err("fab.refdes_stroke_nm must be > 0".into());
-    }
-    Ok(())
-}
-
 pub fn validate_board_ir_pins(ir: &BoardIr, path: &Path) -> Result<(), String> {
-    validate_fab_config(&ir.fab).map_err(|e| format!("board IR '{}': {e}", path.display()))?;
+    ir.fab
+        .validate()
+        .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
     for (name, fp) in &ir.footprints {
         validate_pin_types_for_footprint("footprint", name, fp, &fp.pin_types)
             .map_err(|e| format!("board IR '{}': {e}", path.display()))?;
@@ -402,7 +397,7 @@ impl BoardIr {
                 spec.stackup.dielectric_nm.len()
             ));
         }
-        validate_fab_config(&spec.fab)?;
+        spec.fab.validate()?;
         let mut rules = spec.rules.clone();
         let mut stackup = spec.stackup.clone();
         // Keep stackup POFV and via-in-pad DRC/routing flags consistent across the pipeline and fab exports.
@@ -428,7 +423,7 @@ impl BoardIr {
             constraints: spec.constraints.clone(),
             graphics: spec.graphics.clone(),
             stackup,
-            fab: spec.fab.clone(),
+            fab: spec.fab,
         })
     }
 }

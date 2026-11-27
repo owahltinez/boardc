@@ -101,6 +101,6 @@ outline = [
 ]
 
 [fab]
-auto_refdes = "upright" # or false / "off" / "rotate" (default)
-refdes_stroke_nm = 150000
+auto_refdes = "upright" # false / "off" suppresses auto refdes & pin-1 dots; "rotate" (default)
+refdes_stroke_nm = 150000 # >= 10000 nm (0.01 mm), default 120000
 ```

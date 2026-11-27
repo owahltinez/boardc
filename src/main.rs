@@ -41,7 +41,6 @@ enum SpecFormat {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum AutoRefdesArg {
-    #[value(alias = "auto")]
     Rotate,
     Upright,
     Off,
@@ -191,13 +190,13 @@ enum Command {
         subtract_soldermask: bool,
         #[arg(long)]
         no_clip_silk: bool,
-        /// Suppress auto-generated component refdes silkscreen text.
+        /// Suppress auto-generated component refdes text and pin-1 dots on silkscreen.
         #[arg(long, conflicts_with = "auto_refdes")]
         no_auto_refdes: bool,
         /// Auto-generated refdes silkscreen mode (rotate, upright, off).
         #[arg(long, value_enum)]
         auto_refdes: Option<AutoRefdesArg>,
-        /// Stroke width in nanometers for auto-generated refdes silkscreen text.
+        /// Stroke width in nanometers for auto-generated refdes silkscreen text (>= 10000).
         #[arg(long, allow_negative_numbers = true)]
         refdes_stroke_nm: Option<Nm>,
         /// Emit top (and mirrored bottom for 2-sided boards) assembly drawing SVGs.
