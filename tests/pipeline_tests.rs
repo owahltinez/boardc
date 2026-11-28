@@ -3449,3 +3449,1199 @@ max_vias = 2
             .any(|v| v.kind == ViolationKind::MaxVias && v.net_a == "SIG_LOCK")
     );
 }
+
+fn pour_split_barbell_board(name: &str, with_routing_guides: bool) -> BoardIr {
+    // 4-layer barbell VDDCORE plane on In2.Cu with a 2.0 mm x 1.2 mm bridge neck (x=14..16, y=14.0..15.2).
+    let mut toml = format!(
+        r#"name = "{name}"
+size_nm = [30000000, 26000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "In1.Cu"
+kind = "plane"
+[[layers]]
+name = "In2.Cu"
+kind = "plane"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD_TOP]
+kind = "custom"
+[[footprints.PAD_TOP.pads]]
+name = "1"
+kind = "smd"
+shape = {{ shape = "circle", diameter = 600000 }}
+pos = {{ x = 0, y = 0 }}
+layers = ["F.Cu"]
+[footprints.PAD_BOT]
+kind = "custom"
+[[footprints.PAD_BOT.pads]]
+name = "1"
+kind = "smd"
+shape = {{ shape = "circle", diameter = 600000 }}
+pos = {{ x = 0, y = 0 }}
+layers = ["B.Cu"]
+[[placements]]
+refdes = "V1"
+footprint = "PAD_TOP"
+pos = {{ x = 7000000, y = 14600000 }}
+locked = true
+pin_nets = {{ "1" = "VDDCORE" }}
+[[placements]]
+refdes = "V2"
+footprint = "PAD_TOP"
+pos = {{ x = 23000000, y = 14600000 }}
+locked = true
+pin_nets = {{ "1" = "VDDCORE" }}
+[[placements]]
+refdes = "A1"
+footprint = "PAD_TOP"
+pos = {{ x = 15000000, y = 5000000 }}
+locked = true
+pin_nets = {{ "1" = "SIG_A" }}
+[[placements]]
+refdes = "A2"
+footprint = "PAD_BOT"
+pos = {{ x = 15000000, y = 22000000 }}
+locked = true
+pin_nets = {{ "1" = "SIG_A" }}
+[[pours]]
+name = "VDDCORE_PLANE"
+net = "VDDCORE"
+layer = "In2.Cu"
+outline = [
+  {{ x = 2000000, y = 7000000 }},
+  {{ x = 14000000, y = 7000000 }},
+  {{ x = 14000000, y = 14000000 }},
+  {{ x = 16000000, y = 14000000 }},
+  {{ x = 16000000, y = 7000000 }},
+  {{ x = 28000000, y = 7000000 }},
+  {{ x = 28000000, y = 21000000 }},
+  {{ x = 16000000, y = 21000000 }},
+  {{ x = 16000000, y = 15200000 }},
+  {{ x = 14000000, y = 15200000 }},
+  {{ x = 14000000, y = 21000000 }},
+  {{ x = 2000000, y = 21000000 }},
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+edge_clearance_nm = 300000
+via_at_smd = true
+"#
+    );
+    if with_routing_guides {
+        // Channel SIG_A through (15, 14.6) on initial route while leaving x<14 and x>16 open for repair detour.
+        toml.push_str(
+            r#"[[keepouts]]
+kind = "track"
+layers = ["B.Cu"]
+poly = [
+  { x = 14000000, y = 11800000 },
+  { x = 16000000, y = 11800000 },
+  { x = 16000000, y = 14300000 },
+  { x = 14000000, y = 14300000 },
+]
+[[keepouts]]
+kind = "track"
+layers = ["F.Cu"]
+poly = [
+  { x = 14000000, y = 14900000 },
+  { x = 16000000, y = 14900000 },
+  { x = 16000000, y = 17400000 },
+  { x = 14000000, y = 17400000 },
+]
+"#,
+        );
+    }
+    let spec: BoardSpec = toml::from_str(&toml).unwrap();
+    BoardIr::from_spec(&spec).unwrap()
+}
+
+#[test]
+fn repair_fixes_pre_routed_plane_pour_split_and_preserves_keepouts() {
+    let mut board = pour_split_barbell_board("pour_split_resume", false);
+    board.keepouts.push(Keepout {
+        kind: KeepoutKind::Placement,
+        layers: vec!["F.Cu".into()],
+        poly: vec![
+            Pt::new(mm(26.0), mm(23.0)),
+            Pt::new(mm(28.0), mm(23.0)),
+            Pt::new(mm(28.0), mm(25.0)),
+            Pt::new(mm(26.0), mm(25.0)),
+        ],
+    });
+    let orig_keepouts = board.keepouts.clone();
+    // Pre-route SIG_A with a single unlocked via at (15.0, 14.6) inside the VDDCORE bridge neck.
+    push_tracks(
+        &mut board,
+        &[
+            ("SIG_A", "F.Cu", (15.0, 5.0), (15.0, 14.6), false),
+            ("SIG_A", "B.Cu", (15.0, 14.6), (15.0, 22.0), false),
+        ],
+    );
+    push_vias(&mut board, &[("SIG_A", (15.0, 14.6), false)]);
+
+    let mut cfg0 = boxed_cfg(0, false);
+    cfg0.route.resume = true;
+    cfg0.route.max_passes = 0;
+    let rep0 = compile_board(board.clone(), &cfg0).unwrap();
+    assert!(!rep0.ok);
+    assert!(!rep0.zones.chokes.is_empty());
+    assert!(
+        rep0.drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::OpenNet && v.net_a == "VDDCORE")
+    );
+
+    let mut cfg3 = boxed_cfg(3, false);
+    cfg3.route.resume = true;
+    cfg3.route.max_passes = 0;
+    let rep = compile_board(board, &cfg3).unwrap();
+    assert!(
+        rep.ok,
+        "expected pour split repair to pass: chokes={:?} drc={:?}",
+        rep.zones.chokes, rep.drc
+    );
+    assert!(rep.drc.passed);
+    assert!(rep.zones.chokes.is_empty());
+    assert!(rep.route.repair_passes_run >= 1);
+    assert_eq!(rep.board.keepouts, orig_keepouts);
+}
+
+#[test]
+fn repair_fixes_fresh_build_plane_pour_split() {
+    let board = pour_split_barbell_board("pour_split_fresh", true);
+    let orig_keepouts = board.keepouts.clone();
+
+    let cfg0 = boxed_cfg(0, false);
+    let rep0 = compile_board(board.clone(), &cfg0).unwrap();
+    assert!(
+        !rep0.ok,
+        "expected fresh build without repair to split VDDCORE pour: zones={:?}",
+        rep0.zones
+    );
+    assert!(
+        !rep0.zones.chokes.is_empty()
+            || rep0
+                .drc
+                .violations
+                .iter()
+                .any(|v| v.kind == ViolationKind::OpenNet && v.net_a == "VDDCORE")
+    );
+
+    let cfg3 = boxed_cfg(3, false);
+    let rep = compile_board(board, &cfg3).unwrap();
+    assert!(
+        rep.ok,
+        "expected fresh build with repair_passes=3 to heal pour split: chokes={:?} drc={:?}",
+        rep.zones.chokes, rep.drc
+    );
+    assert!(rep.drc.passed);
+    assert!(rep.zones.chokes.is_empty());
+    assert!(rep.route.repair_passes_run >= 1);
+    assert_eq!(rep.board.keepouts, orig_keepouts);
+}
+
+#[test]
+fn repair_fixes_single_island_open_net_pour_split_via_fallback() {
+    // T-shaped VDDCORE pour: SIG_A via severs V2's sole spoke, leaving 1 island (0 chokes) + OpenNet.
+    let toml = r#"name = "pour_single_island_open"
+size_nm = [26000000, 20000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "In1.Cu"
+kind = "plane"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD_TOP]
+kind = "custom"
+[[footprints.PAD_TOP.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[footprints.PAD_BOT]
+kind = "custom"
+[[footprints.PAD_BOT.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["B.Cu"]
+[footprints.PAD_THT]
+kind = "custom"
+[[footprints.PAD_THT.pads]]
+name = "1"
+kind = "tht"
+shape = { shape = "circle", diameter = 700000 }
+drill_nm = 400000
+pos = { x = 0, y = 0 }
+layers = ["*.Cu"]
+[[placements]]
+refdes = "V1"
+footprint = "PAD_THT"
+pos = { x = 6000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "V2"
+footprint = "PAD_THT"
+pos = { x = 19000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "A1"
+footprint = "PAD_TOP"
+pos = { x = 18100000, y = 4000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "A2"
+footprint = "PAD_BOT"
+pos = { x = 18100000, y = 16000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[pours]]
+name = "VDDCORE_PLANE"
+net = "VDDCORE"
+layer = "In1.Cu"
+outline = [
+  { x = 2000000, y = 5000000 },
+  { x = 14000000, y = 5000000 },
+  { x = 14000000, y = 9550000 },
+  { x = 19500000, y = 9550000 },
+  { x = 19500000, y = 10450000 },
+  { x = 14000000, y = 10450000 },
+  { x = 14000000, y = 15000000 },
+  { x = 2000000, y = 15000000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = true
+thermal_gap_nm = 200000
+thermal_spoke_nm = 300000
+remove_islands = true
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+edge_clearance_nm = 300000
+via_at_smd = true
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    push_tracks(
+        &mut board,
+        &[
+            ("SIG_A", "F.Cu", (18.1, 4.0), (18.1, 10.0), false),
+            ("SIG_A", "B.Cu", (18.1, 10.0), (18.1, 16.0), false),
+        ],
+    );
+    push_vias(&mut board, &[("SIG_A", (18.1, 10.0), false)]);
+
+    let mut cfg0 = boxed_cfg(0, false);
+    cfg0.route.resume = true;
+    cfg0.route.max_passes = 0;
+    let rep0 = compile_board(board.clone(), &cfg0).unwrap();
+    assert!(!rep0.ok);
+    assert_eq!(rep0.zones.pours[0].island_count, 1);
+    assert!(rep0.zones.chokes.is_empty());
+    assert!(
+        rep0.drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::OpenNet && v.net_a == "VDDCORE")
+    );
+
+    let mut cfg3 = boxed_cfg(3, false);
+    cfg3.route.resume = true;
+    cfg3.route.max_passes = 0;
+    let rep = compile_board(board, &cfg3).unwrap();
+    assert!(
+        rep.ok,
+        "expected OpenNet fallback to repair single-island pour split: chokes={:?} drc={:?}",
+        rep.zones.chokes, rep.drc
+    );
+    assert!(rep.drc.passed);
+    assert!(rep.zones.chokes.is_empty());
+    assert!(rep.route.repair_passes_run >= 1);
+}
+
+#[test]
+fn repair_strict_rollback_when_pour_split_caused_by_locked_via() {
+    let mut board = pour_split_barbell_board("pour_split_locked", false);
+    push_tracks(
+        &mut board,
+        &[
+            ("SIG_A", "F.Cu", (15.0, 5.0), (15.0, 14.6), true),
+            ("SIG_A", "B.Cu", (15.0, 14.6), (15.0, 22.0), true),
+        ],
+    );
+    push_vias(&mut board, &[("SIG_A", (15.0, 14.6), true)]);
+    let orig_keepouts = board.keepouts.clone();
+
+    let mut cfg0 = boxed_cfg(0, false);
+    cfg0.route.resume = true;
+    cfg0.route.max_passes = 0;
+    let rep0 = compile_board(board.clone(), &cfg0).unwrap();
+
+    let mut cfg = boxed_cfg(3, false);
+    cfg.route.resume = true;
+    cfg.route.max_passes = 0;
+    let rep = compile_board(board, &cfg).unwrap();
+    assert!(!rep.ok);
+    assert!(!rep.zones.chokes.is_empty());
+    assert!(rep.route.repair_passes_run <= 3);
+    assert_eq!(rep.board.tracks, rep0.board.tracks);
+    assert_eq!(rep.board.vias, rep0.board.vias);
+    assert_eq!(rep.board.keepouts, orig_keepouts);
+}
+
+#[test]
+fn repair_clean_board_with_pours_runs_zero_repair_passes() {
+    // Wide unobstructed VDDCORE plane pour with repair_passes=3 must run 0 repair passes.
+    let toml = r#"name = "pour_clean_zero_passes"
+size_nm = [26000000, 20000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "In1.Cu"
+kind = "plane"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD_TOP]
+kind = "custom"
+[[footprints.PAD_TOP.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[[placements]]
+refdes = "V1"
+footprint = "PAD_TOP"
+pos = { x = 6000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "V2"
+footprint = "PAD_TOP"
+pos = { x = 20000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "A1"
+footprint = "PAD_TOP"
+pos = { x = 8000000, y = 6000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "A2"
+footprint = "PAD_TOP"
+pos = { x = 18000000, y = 6000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[pours]]
+name = "VDDCORE_PLANE"
+net = "VDDCORE"
+layer = "In1.Cu"
+outline = [
+  { x = 2000000, y = 2000000 },
+  { x = 24000000, y = 2000000 },
+  { x = 24000000, y = 18000000 },
+  { x = 2000000, y = 18000000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+edge_clearance_nm = 300000
+via_at_smd = true
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let board = BoardIr::from_spec(&spec).unwrap();
+    let rep = compile_board(board, &boxed_cfg(3, false)).unwrap();
+    assert!(
+        rep.ok,
+        "expected clean pour board to pass: chokes={:?} drc={:?}",
+        rep.zones.chokes, rep.drc
+    );
+    assert_eq!(rep.route.repair_passes_run, 0);
+}
+
+#[test]
+fn repair_rolls_back_cleanly_when_unlocked_pour_blocker_has_no_detour() {
+    let mut board = pour_split_barbell_board("pour_split_unlocked_rollback", false);
+    let mut tht_fp = board.footprints["PAD_TOP"].clone();
+    tht_fp.name = "PAD_THT".into();
+    tht_fp.pads[0].kind = boardc::ir::PadKind::Tht;
+    tht_fp.pads[0].drill_nm = Some(mm(0.4));
+    tht_fp.pads[0].layers = vec!["*.Cu".into()];
+    board.footprints.insert("PAD_THT".into(), tht_fp);
+    for pl in &mut board.placements {
+        if pl.refdes == "V1" || pl.refdes == "V2" {
+            pl.footprint = "PAD_THT".into();
+        }
+    }
+    // Allow vias only inside a 0.5 mm box at (15.0, 14.6) so any valid SIG_A route splits the neck.
+    board.keepouts.extend([
+        Keepout {
+            kind: KeepoutKind::Via,
+            layers: vec!["F.Cu".into(), "B.Cu".into()],
+            poly: vec![
+                Pt::new(mm(-1.0), mm(-1.0)),
+                Pt::new(mm(31.0), mm(-1.0)),
+                Pt::new(mm(31.0), mm(14.35)),
+                Pt::new(mm(-1.0), mm(14.35)),
+            ],
+        },
+        Keepout {
+            kind: KeepoutKind::Via,
+            layers: vec!["F.Cu".into(), "B.Cu".into()],
+            poly: vec![
+                Pt::new(mm(-1.0), mm(14.85)),
+                Pt::new(mm(31.0), mm(14.85)),
+                Pt::new(mm(31.0), mm(27.0)),
+                Pt::new(mm(-1.0), mm(27.0)),
+            ],
+        },
+        Keepout {
+            kind: KeepoutKind::Via,
+            layers: vec!["F.Cu".into(), "B.Cu".into()],
+            poly: vec![
+                Pt::new(mm(-1.0), mm(14.35)),
+                Pt::new(mm(14.75), mm(14.35)),
+                Pt::new(mm(14.75), mm(14.85)),
+                Pt::new(mm(-1.0), mm(14.85)),
+            ],
+        },
+        Keepout {
+            kind: KeepoutKind::Via,
+            layers: vec!["F.Cu".into(), "B.Cu".into()],
+            poly: vec![
+                Pt::new(mm(15.25), mm(14.35)),
+                Pt::new(mm(31.0), mm(14.35)),
+                Pt::new(mm(31.0), mm(14.85)),
+                Pt::new(mm(15.25), mm(14.85)),
+            ],
+        },
+    ]);
+    let orig_keepouts = board.keepouts.clone();
+    push_tracks(
+        &mut board,
+        &[
+            ("SIG_A", "F.Cu", (15.0, 5.0), (15.0, 14.6), false),
+            ("SIG_A", "B.Cu", (15.0, 14.6), (15.0, 22.0), false),
+        ],
+    );
+    push_vias(&mut board, &[("SIG_A", (15.0, 14.6), false)]);
+
+    let mut cfg0 = boxed_cfg(0, false);
+    cfg0.route.resume = true;
+    cfg0.route.max_passes = 0;
+    let rep0 = compile_board(board.clone(), &cfg0).unwrap();
+
+    let mut cfg3 = boxed_cfg(3, false);
+    cfg3.route.resume = true;
+    cfg3.route.max_passes = 0;
+    let rep = compile_board(board, &cfg3).unwrap();
+    assert!(!rep.ok);
+    assert!(!rep.zones.chokes.is_empty());
+    assert!(rep.route.repair_passes_run >= 1);
+    assert_eq!(rep.board.tracks, rep0.board.tracks);
+    assert_eq!(rep.board.vias, rep0.board.vias);
+    assert_eq!(rep.board.keepouts, orig_keepouts);
+}
+
+#[test]
+fn repair_fixes_signal_layer_pour_split_by_track_without_sealing_pads() {
+    let toml = r#"name = "signal_pour_track_split"
+size_nm = [30000000, 26000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD_TOP]
+kind = "custom"
+[[footprints.PAD_TOP.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[footprints.PAD_THT]
+kind = "custom"
+[[footprints.PAD_THT.pads]]
+name = "1"
+kind = "tht"
+shape = { shape = "circle", diameter = 700000 }
+drill_nm = 400000
+pos = { x = 0, y = 0 }
+layers = ["*.Cu"]
+[[placements]]
+refdes = "V1"
+footprint = "PAD_THT"
+pos = { x = 7000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "V2"
+footprint = "PAD_THT"
+pos = { x = 23000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "A1"
+footprint = "PAD_TOP"
+pos = { x = 15000000, y = 13500000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "A2"
+footprint = "PAD_TOP"
+pos = { x = 15000000, y = 16000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[pours]]
+name = "VDDCORE_TOP"
+net = "VDDCORE"
+layer = "F.Cu"
+outline = [
+  { x = 2000000, y = 7000000 },
+  { x = 14000000, y = 7000000 },
+  { x = 14000000, y = 14000000 },
+  { x = 16000000, y = 14000000 },
+  { x = 16000000, y = 7000000 },
+  { x = 28000000, y = 7000000 },
+  { x = 28000000, y = 21000000 },
+  { x = 16000000, y = 21000000 },
+  { x = 16000000, y = 15200000 },
+  { x = 14000000, y = 15200000 },
+  { x = 14000000, y = 21000000 },
+  { x = 2000000, y = 21000000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+edge_clearance_nm = 300000
+via_at_smd = true
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    push_tracks(
+        &mut board,
+        &[("SIG_A", "F.Cu", (15.0, 13.5), (15.0, 16.0), false)],
+    );
+
+    let mut cfg0 = boxed_cfg(0, false);
+    cfg0.route.resume = true;
+    cfg0.route.max_passes = 0;
+    cfg0.route.ignored_nets.insert("VDDCORE".into());
+    let rep0 = compile_board(board.clone(), &cfg0).unwrap();
+    assert!(!rep0.ok);
+    assert!(rep0.zones.chokes.iter().any(|c| {
+        c.blockers
+            .iter()
+            .any(|b| b.kind == boardc::zones::BlockerKind::Track)
+    }));
+
+    let mut cfg3 = boxed_cfg(3, false);
+    cfg3.route.resume = true;
+    cfg3.route.max_passes = 0;
+    cfg3.route.ignored_nets.insert("VDDCORE".into());
+    let rep = compile_board(board, &cfg3).unwrap();
+    assert!(
+        rep.ok,
+        "expected signal-layer track pour split to heal without sealing pads: chokes={:?} drc={:?}",
+        rep.zones.chokes, rep.drc
+    );
+    assert!(rep.drc.passed);
+    assert!(rep.zones.chokes.is_empty());
+    assert_eq!(rep.route.drc_violations, 0);
+    assert!(rep.route.repair_passes_run >= 1);
+}
+
+#[test]
+fn repair_fixes_narrow_neck_choke() {
+    let mut board = pour_split_barbell_board("pour_narrow_neck", false);
+    // Widen barbell neck to 1.4 mm so SIG_A via leaves one connected island with a < 0.4 mm neck.
+    board.pours[0].outline[8].y = mm(15.4);
+    board.pours[0].outline[9].y = mm(15.4);
+    push_tracks(
+        &mut board,
+        &[
+            ("SIG_A", "F.Cu", (15.0, 5.0), (15.0, 14.7), false),
+            ("SIG_A", "B.Cu", (15.0, 14.7), (15.0, 22.0), false),
+        ],
+    );
+    push_vias(&mut board, &[("SIG_A", (15.0, 14.7), false)]);
+
+    let mut cfg0 = boxed_cfg(0, false);
+    cfg0.route.resume = true;
+    cfg0.route.max_passes = 0;
+    let rep0 = compile_board(board.clone(), &cfg0).unwrap();
+    assert!(!rep0.ok);
+    assert_eq!(rep0.zones.pours[0].island_count, 1);
+    assert_eq!(rep0.zones.chokes.len(), 1);
+    assert_eq!(
+        rep0.zones.chokes[0].kind,
+        boardc::zones::ChokeKind::NarrowNeck
+    );
+
+    let mut cfg3 = boxed_cfg(3, false);
+    cfg3.route.resume = true;
+    cfg3.route.max_passes = 0;
+    let rep = compile_board(board, &cfg3).unwrap();
+    assert!(
+        rep.ok,
+        "expected NarrowNeck choke to heal: chokes={:?} drc={:?}",
+        rep.zones.chokes, rep.drc
+    );
+    assert!(rep.drc.passed);
+    assert!(rep.zones.chokes.is_empty());
+    assert!(rep.route.repair_passes_run >= 1);
+}
+
+#[test]
+fn repair_scopes_reroute_nets_during_pour_repair() {
+    let toml = r#"name = "pour_reroute_nets_scope"
+size_nm = [36000000, 26000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "In1.Cu"
+kind = "plane"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD_TOP]
+kind = "custom"
+[[footprints.PAD_TOP.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[footprints.PAD_BOT]
+kind = "custom"
+[[footprints.PAD_BOT.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["B.Cu"]
+[[placements]]
+refdes = "V1"
+footprint = "PAD_TOP"
+pos = { x = 4000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "V2"
+footprint = "PAD_TOP"
+pos = { x = 14000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "G1"
+footprint = "PAD_TOP"
+pos = { x = 22000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "GND" }
+[[placements]]
+refdes = "G2"
+footprint = "PAD_TOP"
+pos = { x = 32000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "GND" }
+[[placements]]
+refdes = "A1"
+footprint = "PAD_TOP"
+pos = { x = 9000000, y = 5000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "A2"
+footprint = "PAD_BOT"
+pos = { x = 9000000, y = 22000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "B1"
+footprint = "PAD_TOP"
+pos = { x = 27000000, y = 5000000 }
+locked = true
+pin_nets = { "1" = "SIG_B" }
+[[placements]]
+refdes = "B2"
+footprint = "PAD_BOT"
+pos = { x = 27000000, y = 22000000 }
+locked = true
+pin_nets = { "1" = "SIG_B" }
+[[pours]]
+name = "VDDCORE_PLANE"
+net = "VDDCORE"
+layer = "In1.Cu"
+outline = [
+  { x = 2000000, y = 7000000 },
+  { x = 8000000, y = 7000000 },
+  { x = 8000000, y = 14000000 },
+  { x = 10000000, y = 14000000 },
+  { x = 10000000, y = 7000000 },
+  { x = 16000000, y = 7000000 },
+  { x = 16000000, y = 21000000 },
+  { x = 10000000, y = 21000000 },
+  { x = 10000000, y = 15200000 },
+  { x = 8000000, y = 15200000 },
+  { x = 8000000, y = 21000000 },
+  { x = 2000000, y = 21000000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+[[pours]]
+name = "GND_PLANE"
+net = "GND"
+layer = "In1.Cu"
+outline = [
+  { x = 20000000, y = 7000000 },
+  { x = 26000000, y = 7000000 },
+  { x = 26000000, y = 14000000 },
+  { x = 28000000, y = 14000000 },
+  { x = 28000000, y = 7000000 },
+  { x = 34000000, y = 7000000 },
+  { x = 34000000, y = 21000000 },
+  { x = 28000000, y = 21000000 },
+  { x = 28000000, y = 15200000 },
+  { x = 26000000, y = 15200000 },
+  { x = 26000000, y = 21000000 },
+  { x = 20000000, y = 21000000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+edge_clearance_nm = 300000
+via_at_smd = true
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    push_tracks(
+        &mut board,
+        &[
+            ("SIG_A", "F.Cu", (9.0, 5.0), (9.0, 14.6), false),
+            ("SIG_A", "B.Cu", (9.0, 14.6), (9.0, 22.0), false),
+            ("SIG_B", "F.Cu", (27.0, 5.0), (27.0, 14.6), false),
+            ("SIG_B", "B.Cu", (27.0, 14.6), (27.0, 22.0), false),
+        ],
+    );
+    push_vias(
+        &mut board,
+        &[
+            ("SIG_A", (9.0, 14.6), false),
+            ("SIG_B", (27.0, 14.6), false),
+        ],
+    );
+    let orig_sig_b_tracks: Vec<_> = board
+        .tracks
+        .iter()
+        .filter(|t| t.net == "SIG_B")
+        .cloned()
+        .collect();
+    let orig_sig_b_vias: Vec<_> = board
+        .vias
+        .iter()
+        .filter(|v| v.net == "SIG_B")
+        .cloned()
+        .collect();
+
+    let mut cfg = boxed_cfg(3, false);
+    cfg.route.resume = true;
+    cfg.route.max_passes = 0;
+    cfg.route.reroute_nets = Some(HashSet::from(["SIG_A".into()]));
+    let rep = compile_board(board, &cfg).unwrap();
+    assert!(rep.zones.chokes.iter().all(|c| c.net == "GND"));
+    assert!(rep.zones.chokes.iter().any(|c| c.net == "GND"));
+    assert!(rep.route.repair_passes_run >= 1);
+    let rep_sig_b_tracks: Vec<_> = rep
+        .board
+        .tracks
+        .iter()
+        .filter(|t| t.net == "SIG_B")
+        .cloned()
+        .collect();
+    let rep_sig_b_vias: Vec<_> = rep
+        .board
+        .vias
+        .iter()
+        .filter(|v| v.net == "SIG_B")
+        .cloned()
+        .collect();
+    assert_eq!(rep_sig_b_tracks, orig_sig_b_tracks);
+    assert_eq!(rep_sig_b_vias, orig_sig_b_vias);
+}
+
+#[test]
+fn repair_single_net_choking_two_distant_pour_locations() {
+    let toml = r#"name = "single_net_two_distant_chokes"
+size_nm = [36000000, 26000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "In1.Cu"
+kind = "plane"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD_TOP]
+kind = "custom"
+[[footprints.PAD_TOP.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[[placements]]
+refdes = "V1"
+footprint = "PAD_TOP"
+pos = { x = 4000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "V2"
+footprint = "PAD_TOP"
+pos = { x = 14000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "G1"
+footprint = "PAD_TOP"
+pos = { x = 22000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "GND" }
+[[placements]]
+refdes = "G2"
+footprint = "PAD_TOP"
+pos = { x = 32000000, y = 14600000 }
+locked = true
+pin_nets = { "1" = "GND" }
+[[placements]]
+refdes = "A1"
+footprint = "PAD_TOP"
+pos = { x = 9000000, y = 5000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "A2"
+footprint = "PAD_TOP"
+pos = { x = 27000000, y = 5000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[pours]]
+name = "VDDCORE_PLANE"
+net = "VDDCORE"
+layer = "In1.Cu"
+outline = [
+  { x = 2000000, y = 7000000 },
+  { x = 8000000, y = 7000000 },
+  { x = 8000000, y = 14000000 },
+  { x = 10000000, y = 14000000 },
+  { x = 10000000, y = 7000000 },
+  { x = 16000000, y = 7000000 },
+  { x = 16000000, y = 21000000 },
+  { x = 10000000, y = 21000000 },
+  { x = 10000000, y = 15200000 },
+  { x = 8000000, y = 15200000 },
+  { x = 8000000, y = 21000000 },
+  { x = 2000000, y = 21000000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+[[pours]]
+name = "GND_PLANE"
+net = "GND"
+layer = "In1.Cu"
+outline = [
+  { x = 20000000, y = 7000000 },
+  { x = 26000000, y = 7000000 },
+  { x = 26000000, y = 14000000 },
+  { x = 28000000, y = 14000000 },
+  { x = 28000000, y = 7000000 },
+  { x = 34000000, y = 7000000 },
+  { x = 34000000, y = 21000000 },
+  { x = 28000000, y = 21000000 },
+  { x = 28000000, y = 15200000 },
+  { x = 26000000, y = 15200000 },
+  { x = 26000000, y = 21000000 },
+  { x = 20000000, y = 21000000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+edge_clearance_nm = 300000
+via_at_smd = true
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    board.keepouts.extend([
+        Keepout {
+            kind: KeepoutKind::Track,
+            layers: vec!["F.Cu".into()],
+            poly: vec![
+                Pt::new(mm(13.0), mm(0.0)),
+                Pt::new(mm(23.0), mm(0.0)),
+                Pt::new(mm(23.0), mm(20.0)),
+                Pt::new(mm(13.0), mm(20.0)),
+            ],
+        },
+        Keepout {
+            kind: KeepoutKind::Track,
+            layers: vec!["B.Cu".into()],
+            poly: vec![
+                Pt::new(mm(0.0), mm(0.0)),
+                Pt::new(mm(36.0), mm(0.0)),
+                Pt::new(mm(36.0), mm(13.0)),
+                Pt::new(mm(0.0), mm(13.0)),
+            ],
+        },
+    ]);
+    push_tracks(
+        &mut board,
+        &[
+            ("SIG_A", "F.Cu", (9.0, 5.0), (9.0, 14.6), false),
+            ("SIG_A", "B.Cu", (9.0, 14.6), (9.0, 22.0), false),
+            ("SIG_A", "B.Cu", (9.0, 22.0), (27.0, 22.0), false),
+            ("SIG_A", "B.Cu", (27.0, 22.0), (27.0, 14.6), false),
+            ("SIG_A", "F.Cu", (27.0, 14.6), (27.0, 5.0), false),
+        ],
+    );
+    push_vias(
+        &mut board,
+        &[
+            ("SIG_A", (9.0, 14.6), false),
+            ("SIG_A", (27.0, 14.6), false),
+        ],
+    );
+
+    let mut cfg0 = boxed_cfg(0, false);
+    cfg0.route.resume = true;
+    cfg0.route.max_passes = 0;
+    cfg0.route.optimize = false;
+    let rep0 = compile_board(board.clone(), &cfg0).unwrap();
+    assert_eq!(rep0.zones.chokes.len(), 2);
+
+    let mut cfg = boxed_cfg(6, false);
+    cfg.route.resume = true;
+    cfg.route.max_passes = 0;
+    cfg.route.optimize = false;
+    let rep = compile_board(board, &cfg).unwrap();
+    assert!(
+        rep.ok,
+        "expected both distant pour chokes on SIG_A to heal: chokes={:?} drc={:?}",
+        rep.zones.chokes, rep.drc
+    );
+    assert!(rep.drc.passed);
+    assert!(rep.zones.chokes.is_empty());
+    assert!(rep.route.repair_passes_run >= 1);
+}
+
+#[test]
+fn repair_fixes_single_island_open_net_with_offset_power_via_via_at_smd_false() {
+    let toml = r#"name = "pour_single_island_offset_via"
+size_nm = [26000000, 20000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "In1.Cu"
+kind = "plane"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD_TOP]
+kind = "custom"
+[[footprints.PAD_TOP.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[footprints.PAD_BOT]
+kind = "custom"
+[[footprints.PAD_BOT.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["B.Cu"]
+[[placements]]
+refdes = "V1"
+footprint = "PAD_TOP"
+pos = { x = 5000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "V2"
+footprint = "PAD_TOP"
+pos = { x = 20200000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "VDDCORE" }
+[[placements]]
+refdes = "A1"
+footprint = "PAD_TOP"
+pos = { x = 18250000, y = 4000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "A2"
+footprint = "PAD_BOT"
+pos = { x = 18250000, y = 16000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[pours]]
+name = "VDDCORE_PLANE"
+net = "VDDCORE"
+layer = "In1.Cu"
+outline = [
+  { x = 2000000, y = 5000000 },
+  { x = 14000000, y = 5000000 },
+  { x = 14000000, y = 9750000 },
+  { x = 18850000, y = 9750000 },
+  { x = 18850000, y = 10250000 },
+  { x = 14000000, y = 10250000 },
+  { x = 14000000, y = 15000000 },
+  { x = 2000000, y = 15000000 },
+]
+priority = 0
+min_width_nm = 200000
+thermal_relief = false
+remove_islands = true
+[rules]
+track_width_nm = 200000
+clearance_nm = 200000
+via_dia_nm = 450000
+via_drill_nm = 200000
+min_annular_ring_nm = 100000
+hole_to_hole_nm = 200000
+edge_clearance_nm = 300000
+via_at_smd = false
+"#;
+    let spec: BoardSpec = toml::from_str(toml).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    push_tracks(
+        &mut board,
+        &[
+            ("VDDCORE", "F.Cu", (5.0, 10.0), (6.0, 10.0), true),
+            ("VDDCORE", "F.Cu", (20.2, 10.0), (19.0, 10.0), true),
+            ("SIG_A", "F.Cu", (18.25, 4.0), (18.25, 10.0), false),
+            ("SIG_A", "B.Cu", (18.25, 10.0), (18.25, 16.0), false),
+        ],
+    );
+    push_vias(
+        &mut board,
+        &[
+            ("VDDCORE", (6.0, 10.0), true),
+            ("VDDCORE", (19.0, 10.0), true),
+            ("SIG_A", (18.25, 10.0), false),
+        ],
+    );
+
+    let mut cfg0 = boxed_cfg(0, false);
+    cfg0.route.resume = true;
+    cfg0.route.max_passes = 0;
+    let rep0 = compile_board(board.clone(), &cfg0).unwrap();
+    assert!(!rep0.ok);
+    assert_eq!(rep0.zones.pours[0].island_count, 1);
+    assert!(rep0.zones.chokes.is_empty());
+    assert!(
+        rep0.drc
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::OpenNet && v.net_a == "VDDCORE")
+    );
+
+    let mut cfg3 = boxed_cfg(3, false);
+    cfg3.route.resume = true;
+    cfg3.route.max_passes = 0;
+    let rep = compile_board(board, &cfg3).unwrap();
+    assert!(
+        rep.ok,
+        "expected offset-via OpenNet fallback (via_at_smd=false) to heal: chokes={:?} drc={:?}",
+        rep.zones.chokes, rep.drc
+    );
+    assert!(rep.drc.passed);
+    assert!(rep.zones.chokes.is_empty());
+    assert!(rep.route.repair_passes_run >= 1);
+}
