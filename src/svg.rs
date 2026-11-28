@@ -292,19 +292,53 @@ pub(crate) fn write_board_outline(
     );
 }
 
+struct PrecomputedPads {
+    shapes: Vec<ResolvedShape>,
+    by_layer: Vec<Vec<usize>>,
+}
+
+fn precompute_pads(board: &BoardIr, cu_layers: &[String]) -> PrecomputedPads {
+    let mut shapes = Vec::new();
+    let mut by_layer = vec![Vec::new(); cu_layers.len()];
+    for pl in &board.placements {
+        let Some(fp) = board.footprints.get(&pl.footprint) else {
+            continue;
+        };
+        for pad in &fp.pads {
+            if pad.kind == PadKind::Npth {
+                continue;
+            }
+            let pad_layers = pad_copper_layers(pad, pl.side, cu_layers);
+            if pad_layers.is_empty() {
+                continue;
+            }
+            let shape_idx = shapes.len();
+            shapes.push(pad_to_world_shape(pad, pl, 16));
+            for l in &pad_layers {
+                if let Some(li) = cu_layers.iter().position(|c| c == l) {
+                    by_layer[li].push(shape_idx);
+                }
+            }
+        }
+    }
+    PrecomputedPads { shapes, by_layer }
+}
+
 fn draw_copper_layer(
     out: &mut String,
     board: &BoardIr,
-    cu_layers: &[String],
+    pads: &PrecomputedPads,
+    layer_idx: Option<usize>,
     layer: &str,
-    color: &str,
-    mirror_x: bool,
     opacity: f64,
+    mirror_x: bool,
 ) {
+    let color = layer_color(layer, layer_idx.unwrap_or(0));
     let _ = writeln!(
         out,
-        r#"  <g id="layer_{}" opacity="{opacity:.2}">"#,
-        xml_escape(layer)
+        r#"  <g id="layer_{}" opacity="{:.2}">"#,
+        xml_escape(layer),
+        opacity
     );
     for pour in &board.filled_pours {
         if pour.layer != layer {
@@ -333,21 +367,9 @@ fn draw_copper_layer(
             );
         }
     }
-    for pl in &board.placements {
-        let Some(fp) = board.footprints.get(&pl.footprint) else {
-            continue;
-        };
-        for pad in &fp.pads {
-            if pad.kind == PadKind::Npth {
-                continue;
-            }
-            if pad_copper_layers(pad, pl.side, cu_layers)
-                .iter()
-                .any(|l| l == layer)
-            {
-                let shape = pad_to_world_shape(pad, pl, 16);
-                render_shape_svg(out, &shape, color, mirror_x);
-            }
+    if let Some(li) = layer_idx {
+        for &si in &pads.by_layer[li] {
+            render_shape_svg(out, &pads.shapes[si], color, mirror_x);
         }
     }
     for via in &board.vias {
@@ -363,15 +385,13 @@ fn draw_copper_layer(
     out.push_str("  </g>\n");
 }
 
-/// Renders a composite Top/Bottom, single-layer, assembly, or drill-map 2D SVG.
-pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptions) -> String {
-    match cfg.view {
-        SvgView::AssemblyTop => return render_assembly_svg(board, Side::Top, cfg.margin_mm),
-        SvgView::AssemblyBottom => return render_assembly_svg(board, Side::Bottom, cfg.margin_mm),
-        SvgView::DrillMap => return render_drill_map_svg(board, cfg.margin_mm),
-        _ => {}
-    }
-    let cu_layers = board.copper_layer_names();
+fn render_board_svg_with_pads(
+    board: &BoardIr,
+    drc: Option<&DrcReport>,
+    cfg: &SvgOptions,
+    cu_layers: &[String],
+    pads: &PrecomputedPads,
+) -> String {
     let mirror_x = matches!(cfg.view, SvgView::Bottom);
     let margin = sanitize_margin_mm(cfg.margin_mm);
     let (bx0, bx1, by0, by1) = board_svg_bounds(board, mirror_x);
@@ -383,11 +403,11 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
     let mut out = begin_svg(&board.name, min_x, min_y, vw, vh, "#0d1117");
     write_board_outline(&mut out, board, mirror_x, "#14291d", "#facc15", "0.12");
 
-    let mut draw_order: Vec<(usize, &str, f64)> = Vec::new();
+    let mut draw_order: Vec<(Option<usize>, &str, f64)> = Vec::new();
     match &cfg.view {
         SvgView::Layer(target) => {
-            let idx = cu_layers.iter().position(|l| l == target).unwrap_or(0);
-            draw_order.push((idx, target.as_str(), 0.95));
+            let found = cu_layers.iter().position(|l| l == target);
+            draw_order.push((found, target.as_str(), 0.95));
         }
         SvgView::Top | SvgView::Bottom => {
             let (back, front) = if matches!(cfg.view, SvgView::Top) {
@@ -396,29 +416,21 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
                 ("F.Cu", "B.Cu")
             };
             if let Some((i, n)) = cu_layers.iter().enumerate().find(|(_, l)| *l == back) {
-                draw_order.push((i, n.as_str(), 0.35));
+                draw_order.push((Some(i), n.as_str(), 0.35));
             }
             for (i, n) in cu_layers.iter().enumerate() {
                 if n != "F.Cu" && n != "B.Cu" {
-                    draw_order.push((i, n.as_str(), 0.40));
+                    draw_order.push((Some(i), n.as_str(), 0.40));
                 }
             }
             if let Some((i, n)) = cu_layers.iter().enumerate().find(|(_, l)| *l == front) {
-                draw_order.push((i, n.as_str(), 0.92));
+                draw_order.push((Some(i), n.as_str(), 0.92));
             }
         }
         SvgView::AssemblyTop | SvgView::AssemblyBottom | SvgView::DrillMap => unreachable!(),
     }
-    for (idx, name, opacity) in draw_order {
-        draw_copper_layer(
-            &mut out,
-            board,
-            &cu_layers,
-            name,
-            layer_color(name, idx),
-            mirror_x,
-            opacity,
-        );
+    for (layer_idx, layer, opacity) in draw_order {
+        draw_copper_layer(&mut out, board, pads, layer_idx, layer, opacity, mirror_x);
     }
 
     if cfg.show_drills {
@@ -526,6 +538,19 @@ pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptio
     out
 }
 
+/// Renders a composite Top/Bottom, single-layer, assembly, or drill-map 2D SVG.
+pub fn render_board_svg(board: &BoardIr, drc: Option<&DrcReport>, cfg: &SvgOptions) -> String {
+    match cfg.view {
+        SvgView::AssemblyTop => return render_assembly_svg(board, Side::Top, cfg.margin_mm),
+        SvgView::AssemblyBottom => return render_assembly_svg(board, Side::Bottom, cfg.margin_mm),
+        SvgView::DrillMap => return render_drill_map_svg(board, cfg.margin_mm),
+        _ => {}
+    }
+    let cu_layers = board.copper_layer_names();
+    let pads = precompute_pads(board, &cu_layers);
+    render_board_svg_with_pads(board, drc, cfg, &cu_layers, &pads)
+}
+
 /// Convenience wrapper rendering a single layer SVG with optional DRC hotspot overlay.
 pub fn render_layer_svg(board: &BoardIr, layer: &str, drc: Option<&DrcReport>) -> String {
     render_board_svg(
@@ -547,28 +572,41 @@ pub fn write_board_svgs(
     fs::create_dir_all(out_dir)
         .map_err(|e| format!("failed to create svg dir '{}': {e}", out_dir.display()))?;
     let slug = safe_slug(&board.name);
-    let mut written = Vec::new();
+    let cu_layers = board.copper_layer_names();
+    let pads = precompute_pads(board, &cu_layers);
 
+    let mut jobs: Vec<(PathBuf, SvgView)> = Vec::with_capacity(2 + cu_layers.len());
     for (suffix, view) in [("top", SvgView::Top), ("bottom", SvgView::Bottom)] {
-        let path = out_dir.join(format!("{slug}_{suffix}.svg"));
-        let svg = render_board_svg(
-            board,
-            drc,
-            &SvgOptions {
-                view,
-                ..Default::default()
-            },
-        );
-        fs::write(&path, svg).map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
-        written.push(path);
+        jobs.push((out_dir.join(format!("{slug}_{suffix}.svg")), view));
+    }
+    for layer in &cu_layers {
+        jobs.push((
+            out_dir.join(format!("{slug}_{}.svg", safe_slug(layer))),
+            SvgView::Layer(layer.clone()),
+        ));
     }
 
-    for layer in board.copper_layer_names() {
-        let path = out_dir.join(format!("{slug}_{}.svg", safe_slug(&layer)));
-        let svg = render_layer_svg(board, &layer, drc);
-        fs::write(&path, svg).map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
-        written.push(path);
-    }
-
-    Ok(written)
+    std::thread::scope(|s| {
+        let cu_ref = &cu_layers;
+        let pads_ref = &pads;
+        let handles: Vec<_> = jobs
+            .into_iter()
+            .map(|(path, view)| {
+                s.spawn(move || {
+                    let opts = SvgOptions {
+                        view,
+                        ..Default::default()
+                    };
+                    let svg = render_board_svg_with_pads(board, drc, &opts, cu_ref, pads_ref);
+                    fs::write(&path, svg)
+                        .map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
+                    Ok(path)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("svg render worker panicked"))
+            .collect()
+    })
 }

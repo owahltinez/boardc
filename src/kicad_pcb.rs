@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -62,6 +62,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
     let mut net_id_map: HashMap<i64, String> = HashMap::new();
     let mut footprints: BTreeMap<String, FootprintDef> = BTreeMap::new();
     let mut placements = Vec::new();
+    let mut seen_refdes: HashSet<String> = HashSet::new();
     let mut keepouts = Vec::new();
     let mut pours = Vec::new();
     let mut filled_pours = Vec::new();
@@ -110,6 +111,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                 &net_id_map,
                 &mut footprints,
                 &mut placements,
+                &mut seen_refdes,
                 &mut edge_open,
                 &mut edge_closed,
             )?,
@@ -196,10 +198,7 @@ pub(crate) fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<B
                     .unwrap_or_else(default_net_class),
                 ..Default::default()
             });
-            let pair = (pl.refdes.clone(), pin.clone());
-            if !entry.pins.contains(&pair) {
-                entry.pins.push(pair);
-            }
+            entry.pins.push((pl.refdes.clone(), pin.clone()));
         }
     }
     for net_name in tracks
@@ -516,6 +515,7 @@ fn parse_placed_footprint(
     net_id_map: &HashMap<i64, String>,
     footprints: &mut BTreeMap<String, FootprintDef>,
     placements: &mut Vec<Placement>,
+    seen_refdes: &mut HashSet<String>,
     edge_open: &mut Vec<Vec<Pt>>,
     edge_closed: &mut Vec<Vec<Pt>>,
 ) -> Result<(), String> {
@@ -530,14 +530,23 @@ fn parse_placed_footprint(
         .and_then(|at| parse_at(at, -1))
         .unwrap_or((Pt::new(0, 0), 0.0));
     let mut refdes = parse_footprint_prop(node, "Reference", "reference").unwrap_or_default();
-    if refdes.is_empty() || placements.iter().any(|p| p.refdes == refdes) {
+    if refdes.is_empty() || seen_refdes.contains(&refdes) {
         let base = if refdes.is_empty() {
             "FP".to_string()
         } else {
             refdes
         };
-        refdes = format!("{base}#{}", placements.len() + 1);
+        let mut n = placements.len() + 1;
+        loop {
+            let cand = format!("{base}#{n}");
+            if !seen_refdes.contains(&cand) {
+                refdes = cand;
+                break;
+            }
+            n += 1;
+        }
     }
+    seen_refdes.insert(refdes.clone());
     let value = parse_footprint_prop(node, "Value", "value").unwrap_or_default();
 
     for child in node.as_list().into_iter().flatten().skip(1) {

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use clipper2_rust::{
     ClipType, Clipper64, FillRule, Paths64, Point64, difference_64, union_subjects_64,
@@ -7,8 +7,8 @@ use gerber_types::Polarity;
 
 use crate::fab_gerber::GerberBuilder;
 use crate::geom::{
-    EPS_NM, ensure_ccw, local_to_board, polygon_area, polygon_violates_clearance, pts_to_path64,
-    remap_layer_for_side,
+    EPS_NM, GridQueryScratch, SpatialGrid, ensure_ccw, local_to_board, polygon_area,
+    polygon_violates_clearance, pts_to_path64, remap_layer_for_side,
 };
 use crate::ir::{
     AutoRefdes, BBoxNm, BoardIr, FabConfig, FootprintDef, Graphic, Nm, Placement, PourPoly, Pt,
@@ -275,12 +275,22 @@ pub(crate) fn refdes_world_segments(
         .collect()
 }
 
-fn point_hits_mask(p: Pt, radius: Nm, openings: &[ResolvedShape], clr: Nm) -> bool {
+fn point_hits_mask(
+    p: Pt,
+    radius: Nm,
+    openings: &[ResolvedShape],
+    grid: &SpatialGrid,
+    scratch: &mut GridQueryScratch,
+    cands: &mut Vec<usize>,
+    clr: Nm,
+) -> bool {
     let pad = radius + clr;
     let sb = BBoxNm::from_pt(p, pad);
-    openings
-        .iter()
-        .any(|op| op.bbox().intersects(sb) && op.dist_to_circle(p, pad) < 0.0)
+    grid.query_with(sb, scratch, cands);
+    cands.iter().any(|&idx| {
+        let op = &openings[idx];
+        op.bbox().intersects(sb) && op.dist_to_circle(p, pad) < 0.0
+    })
 }
 
 fn shape_hits_opening(sh: &ResolvedShape, op: &ResolvedShape, clr: Nm) -> bool {
@@ -299,10 +309,16 @@ fn shape_hits_opening(sh: &ResolvedShape, op: &ResolvedShape, clr: Nm) -> bool {
 fn clip_filled_shape(
     shape: &ResolvedShape,
     openings: &[ResolvedShape],
+    grid: &SpatialGrid,
+    scratch: &mut GridQueryScratch,
+    cands: &mut Vec<usize>,
     clr: Nm,
 ) -> Option<Vec<PourPoly>> {
+    grid.query_with(shape.bbox().expand(clr), scratch, cands);
+    cands.sort_unstable();
     let mut clip = Paths64::new();
-    for op in openings {
+    for &idx in cands.iter() {
+        let op = &openings[idx];
         if shape_hits_opening(shape, op, clr) {
             let mut poly = shape_inflated_poly(op, clr);
             if poly.len() >= 3 {
@@ -352,54 +368,61 @@ fn emit_clipped_open_path(builder: &mut GerberBuilder, path: &[Point64], width: 
     }
 }
 
+#[derive(Default)]
+struct HitStrokeGroup {
+    segs: Vec<(Pt, Pt)>,
+    hit_openings: BTreeSet<usize>,
+}
+
 fn emit_clipped_strokes(
     builder: &mut GerberBuilder,
     raw_segs: Vec<(Pt, Pt, Nm)>,
     openings: &[ResolvedShape],
+    grid: &SpatialGrid,
+    scratch: &mut GridQueryScratch,
+    cands: &mut Vec<usize>,
     clr: Nm,
 ) {
-    let mut by_width: BTreeMap<Nm, Vec<(Pt, Pt)>> = BTreeMap::new();
+    let mut by_width: BTreeMap<Nm, HitStrokeGroup> = BTreeMap::new();
     for (a, b, width) in raw_segs {
         let w = width.max(10_000);
         let r = w / 2;
         if a == b {
-            if !point_hits_mask(a, r, openings, clr) {
+            if !point_hits_mask(a, r, openings, grid, scratch, cands, clr) {
                 builder.stroke_segment(a, b, w);
             }
             continue;
         }
         let delta = r + clr;
         let sb = BBoxNm::from_pts(&[a, b]).expand(delta + 2);
-        let hits = openings
-            .iter()
-            .any(|op| op.bbox().intersects(sb) && op.dist_to_capsule(a, b, delta) < EPS_NM);
-        if hits {
-            by_width.entry(w).or_default().push((a, b));
-        } else {
+        grid.query_with(sb, scratch, cands);
+        cands.retain(|&idx| {
+            let op = &openings[idx];
+            op.bbox().intersects(sb) && op.dist_to_capsule(a, b, delta) < EPS_NM
+        });
+        if cands.is_empty() {
             builder.stroke_segment(a, b, w);
+        } else {
+            let group = by_width.entry(w).or_default();
+            group.segs.push((a, b));
+            group.hit_openings.extend(cands.iter().copied());
         }
     }
 
-    for (w, segs) in by_width {
+    for (w, group) in by_width {
         let delta = w / 2 + clr;
-        let mut group_bb = BBoxNm::from_pts(&[segs[0].0, segs[0].1]);
-        for &(a, b) in &segs[1..] {
-            group_bb = group_bb.union(BBoxNm::from_pts(&[a, b]));
-        }
-        let query_bb = group_bb.expand(delta + 2_000);
         let mut raw_clips = Paths64::new();
-        for op in openings {
-            if op.bbox().intersects(query_bb) {
-                let mut poly = shape_inflated_poly(op, delta);
-                if poly.len() >= 3 {
-                    ensure_ccw(&mut poly);
-                    raw_clips.push(pts_to_path64(&poly));
-                }
+        for idx in group.hit_openings {
+            let mut poly = shape_inflated_poly(&openings[idx], delta);
+            if poly.len() >= 3 {
+                ensure_ccw(&mut poly);
+                raw_clips.push(pts_to_path64(&poly));
             }
         }
         // Union overlapping clips first so shared interior edges never confuse open-path difference.
         let clips = union_subjects_64(&raw_clips, FillRule::NonZero);
-        let open_subjects: Paths64 = segs
+        let open_subjects: Paths64 = group
+            .segs
             .iter()
             .map(|&(a, b)| vec![Point64::new(a.x, a.y), Point64::new(b.x, b.y)])
             .collect();
@@ -448,12 +471,29 @@ pub(crate) fn emit_silk_layer(
         }
     });
 
+    if mask_openings.is_empty() {
+        for (g, pl, _) in filled_graphics {
+            builder.emit_graphic(g, pl);
+        }
+        for (dot_world, radius) in pin1_dots {
+            builder.flash_circle(dot_world, radius * 2);
+        }
+        for (a, b, w) in raw_segs {
+            builder.stroke_segment(a, b, w);
+        }
+        return;
+    }
+
+    let grid = SpatialGrid::new(mask_openings.iter().map(ResolvedShape::bbox), 2_000_000);
+    let mut scratch = GridQueryScratch::default();
+    let mut cands = Vec::new();
+
     // Emit clipped filled regions (with Clear holes) first so Clear polarity never erases strokes or dots.
     let mut clipped_polys: Vec<PourPoly> = Vec::new();
     let mut unclipped_filled: Vec<(&Graphic, Option<&Placement>)> = Vec::new();
     for (g, pl, sh) in filled_graphics {
-        if !mask_openings.is_empty()
-            && let Some(polys) = clip_filled_shape(&sh, mask_openings, clr)
+        if let Some(polys) =
+            clip_filled_shape(&sh, mask_openings, &grid, &mut scratch, &mut cands, clr)
         {
             clipped_polys.extend(polys);
         } else {
@@ -472,16 +512,123 @@ pub(crate) fn emit_silk_layer(
     }
 
     for (dot_world, radius) in pin1_dots {
-        if mask_openings.is_empty() || !point_hits_mask(dot_world, radius, mask_openings, clr) {
+        if !point_hits_mask(
+            dot_world,
+            radius,
+            mask_openings,
+            &grid,
+            &mut scratch,
+            &mut cands,
+            clr,
+        ) {
             builder.flash_circle(dot_world, radius * 2);
         }
     }
 
-    if mask_openings.is_empty() {
-        for (a, b, w) in raw_segs {
-            builder.stroke_segment(a, b, w);
-        }
-    } else {
-        emit_clipped_strokes(builder, raw_segs, mask_openings, clr);
+    emit_clipped_strokes(
+        builder,
+        raw_segs,
+        mask_openings,
+        &grid,
+        &mut scratch,
+        &mut cands,
+        clr,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{LayerDef, LayerKind, mm};
+    use gerber_types::FileFunction;
+
+    #[test]
+    fn hit_only_mask_inflation_leaves_distant_openings_untouched() {
+        let mut board = BoardIr {
+            name: "silk_hit_test".into(),
+            title: None,
+            revision: None,
+            outline: vec![
+                Pt::new(0, 0),
+                Pt::new(mm(30.0), 0),
+                Pt::new(mm(30.0), mm(10.0)),
+                Pt::new(0, mm(10.0)),
+            ],
+            cutouts: Vec::new(),
+            layers: vec![LayerDef {
+                name: "F.Cu".into(),
+                kind: LayerKind::Signal,
+                side: Some(Side::Top),
+                thickness_nm: None,
+            }],
+            footprints: BTreeMap::new(),
+            placements: Vec::new(),
+            keepouts: Vec::new(),
+            pours: Vec::new(),
+            filled_pours: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            net_classes: BTreeMap::new(),
+            nets: BTreeMap::new(),
+            rules: Default::default(),
+            constraints: Default::default(),
+            graphics: vec![
+                Graphic::Line {
+                    layer: "F.SilkS".into(),
+                    a: Pt::new(mm(2.0), mm(5.0)),
+                    b: Pt::new(mm(28.0), mm(5.0)),
+                    width: mm(0.15),
+                },
+                Graphic::Line {
+                    layer: "F.SilkS".into(),
+                    a: Pt::new(mm(12.0), mm(2.0)),
+                    b: Pt::new(mm(18.0), mm(2.0)),
+                    width: mm(0.15),
+                },
+            ],
+            stackup: Default::default(),
+            fab: FabConfig {
+                auto_refdes: AutoRefdes::Off,
+                ..Default::default()
+            },
+        };
+        board.rules.silk_clearance_nm = mm(0.1);
+
+        let hit_left = ResolvedShape::Circle {
+            center: Pt::new(mm(4.0), mm(5.0)),
+            radius: mm(0.5),
+        };
+        let hit_right = ResolvedShape::Circle {
+            center: Pt::new(mm(26.0), mm(5.0)),
+            radius: mm(0.5),
+        };
+        // Inside Line 1's bbox, 2um outside clearance so circumscribed 32-gon would clip if inflated.
+        let unhit_inside_bb = ResolvedShape::Circle {
+            center: Pt::new(mm(15.0), mm(4.323)),
+            radius: mm(0.5),
+        };
+        let distant_outside = ResolvedShape::Circle {
+            center: Pt::new(mm(15.0), mm(9.0)),
+            radius: mm(1.0),
+        };
+
+        let tmp =
+            std::env::temp_dir().join(format!("boardc_silk_hit_test_{}.gbr", std::process::id()));
+        let render = |openings: &[ResolvedShape]| -> String {
+            let mut b = GerberBuilder::new(FileFunction::Legend {
+                pos: gerber_types::Position::Top,
+                index: None,
+            });
+            emit_silk_layer(&mut b, &board, Side::Top, openings, board.fab);
+            b.write_file(&tmp).unwrap();
+            let s = std::fs::read_to_string(&tmp).unwrap();
+            let _ = std::fs::remove_file(&tmp);
+            s
+        };
+
+        let with_hit_only = render(&[hit_left.clone(), hit_right.clone()]);
+        let with_distant = render(&[hit_left, hit_right, unhit_inside_bb, distant_outside]);
+        assert_eq!(with_hit_only, with_distant);
+        assert!(with_hit_only.contains("D01*"));
     }
 }
