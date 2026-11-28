@@ -4,8 +4,11 @@ use serde::Deserialize;
 
 use crate::drc::{Hotspot, Severity, Violation, ViolationKind};
 use crate::erc::{is_unconnected_net, net_def_pin_index};
-use crate::geom::{EPS_NM, UnionFind, local_to_board, pad_copper_layers, pad_to_world_shape};
-use crate::ir::{BoardIr, Nm, PadDef, PadKind, Pt, Side, mm, um};
+use crate::geom::{
+    EPS_NM, GridQueryScratch, SpatialGrid, UnionFind, local_to_board, pad_copper_layers,
+    pad_to_world_shape,
+};
+use crate::ir::{BBoxNm, BoardIr, Nm, PadDef, PadKind, Pt, Side, mm, um};
 
 const KICAD_CLUSTER_RADIUS_NM: Nm = 2_000_000;
 
@@ -35,22 +38,6 @@ fn violation_items(v: &Violation) -> impl Iterator<Item = (&str, &str)> {
         .filter(|s| !s.is_empty())
         .map(|s| (s, v.net_b.as_str()));
     a.into_iter().chain(b)
-}
-
-fn shares_localized_object(a: &Violation, b: &Violation, cluster_radius_nm: Nm) -> bool {
-    let dist = a.pos_nm.dist(b.pos_nm);
-    let track_limit = (cluster_radius_nm.max(1_000_000) as f64) * 4.0;
-    for (ia, _) in violation_items(a) {
-        if !is_local_item(ia) {
-            continue;
-        }
-        for (ib, _) in violation_items(b) {
-            if ia == ib && (is_point_local_item(ia) || dist <= track_limit) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn build_action_hint(
@@ -229,16 +216,76 @@ pub(crate) fn cluster_hotspots(
     };
     let n = violations.len();
     let mut uf = UnionFind::new(n);
-    let r_f = cluster_radius_nm.max(0) as f64;
+    let r_nm = cluster_radius_nm.max(0);
+    let r_f = r_nm as f64;
+    let grid = SpatialGrid::new(
+        violations.iter().map(|v| BBoxNm::from_pt(v.pos_nm, 0)),
+        r_nm.max(250_000),
+    );
+    let mut scratch = GridQueryScratch::default();
+    let mut cands = Vec::new();
     for i in 0..n {
-        for j in (i + 1)..n {
-            if uf.find(i) == uf.find(j) {
-                continue;
-            }
-            if violations[i].pos_nm.dist(violations[j].pos_nm) <= r_f
-                || shares_localized_object(&violations[i], &violations[j], cluster_radius_nm)
-            {
+        let pi = violations[i].pos_nm;
+        grid.query_with(BBoxNm::from_pt(pi, r_nm), &mut scratch, &mut cands);
+        for &j in &cands {
+            if j > i && uf.find(i) != uf.find(j) && pi.dist(violations[j].pos_nm) <= r_f {
                 uf.union(i, j);
+            }
+        }
+    }
+
+    let track_limit = (cluster_radius_nm.max(1_000_000) as f64) * 4.0;
+    let track_limit_nm = track_limit.ceil() as Nm;
+    let mut by_item: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, v) in violations.iter().enumerate() {
+        for (item, _) in violation_items(v) {
+            if is_local_item(item) {
+                by_item.entry(item).or_default().push(i);
+            }
+        }
+    }
+    for (item, idxs) in by_item {
+        if idxs.len() <= 1 {
+            continue;
+        }
+        if is_point_local_item(item) {
+            let first = idxs[0];
+            for &j in &idxs[1..] {
+                uf.union(first, j);
+            }
+        } else if idxs.len() <= 32 {
+            for a in 0..idxs.len() {
+                for b in (a + 1)..idxs.len() {
+                    let (ia, ib) = (idxs[a], idxs[b]);
+                    if uf.find(ia) != uf.find(ib)
+                        && violations[ia].pos_nm.dist(violations[ib].pos_nm) <= track_limit
+                    {
+                        uf.union(ia, ib);
+                    }
+                }
+            }
+        } else {
+            let sub_grid = SpatialGrid::new(
+                idxs.iter()
+                    .map(|&vi| BBoxNm::from_pt(violations[vi].pos_nm, 0)),
+                track_limit_nm.max(250_000),
+            );
+            for (loc_a, &ia) in idxs.iter().enumerate() {
+                let pa = violations[ia].pos_nm;
+                sub_grid.query_with(
+                    BBoxNm::from_pt(pa, track_limit_nm),
+                    &mut scratch,
+                    &mut cands,
+                );
+                for &loc_b in &cands {
+                    if loc_b <= loc_a {
+                        continue;
+                    }
+                    let ib = idxs[loc_b];
+                    if uf.find(ia) != uf.find(ib) && pa.dist(violations[ib].pos_nm) <= track_limit {
+                        uf.union(ia, ib);
+                    }
+                }
             }
         }
     }
@@ -359,6 +406,8 @@ pub(crate) fn cluster_hotspots(
             .then_with(|| b.violation_count.cmp(&a.violation_count))
             .then_with(|| a.centroid_nm.x.cmp(&b.centroid_nm.x))
             .then_with(|| a.centroid_nm.y.cmp(&b.centroid_nm.y))
+            .then_with(|| a.root_cause_item.cmp(&b.root_cause_item))
+            .then_with(|| a.root_cause_net.cmp(&b.root_cause_net))
     });
     hotspots
 }
@@ -463,7 +512,61 @@ fn description_fallback(desc: &str) -> String {
         .to_string()
 }
 
-fn map_kicad_item_to_board(board: &BoardIr, item: &KicadItem, units: &str) -> (String, Pt, String) {
+struct KicadMapIndex {
+    via_grid: SpatialGrid,
+    track_grid: SpatialGrid,
+    pad_items: Vec<(Pt, String)>,
+    pad_grid: SpatialGrid,
+    max_via_radius: Nm,
+}
+
+impl KicadMapIndex {
+    fn new(board: &BoardIr) -> Self {
+        let max_via_radius = board
+            .vias
+            .iter()
+            .map(|v| (v.diameter / 2).max(200_000))
+            .max()
+            .unwrap_or(200_000);
+        let via_grid = SpatialGrid::new(
+            board.vias.iter().map(|v| BBoxNm::from_pt(v.pos, 0)),
+            500_000,
+        );
+        let track_grid = SpatialGrid::new(
+            board.tracks.iter().map(|t| BBoxNm::from_pts(&[t.a, t.b])),
+            500_000,
+        );
+        let mut pad_items = Vec::new();
+        for pl in &board.placements {
+            if let Some(fp) = board.footprints.get(&pl.footprint) {
+                for pad in &fp.pads {
+                    let wp = local_to_board(pad.pos, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
+                    pad_items.push((wp, format!("{}.{}", pl.refdes, pad.name)));
+                }
+            }
+        }
+        let pad_grid = SpatialGrid::new(
+            pad_items.iter().map(|(p, _)| BBoxNm::from_pt(*p, 0)),
+            500_000,
+        );
+        Self {
+            via_grid,
+            track_grid,
+            pad_items,
+            pad_grid,
+            max_via_radius,
+        }
+    }
+}
+
+fn map_kicad_item_to_board(
+    board: &BoardIr,
+    idx: &KicadMapIndex,
+    scratch: &mut GridQueryScratch,
+    cands: &mut Vec<usize>,
+    item: &KicadItem,
+    units: &str,
+) -> (String, Pt, String) {
     let net = extract_bracket_net(&item.description);
     // KiCad coordinates are Y-down; BoardIr canonical coordinates are Y-up.
     let pos = item
@@ -489,29 +592,37 @@ fn map_kicad_item_to_board(board: &BoardIr, item: &KicadItem, units: &str) -> (S
         }
     }
 
-    if desc.starts_with("Via")
-        && let Some((vi, v)) = board
-            .vias
+    if desc.starts_with("Via") {
+        idx.via_grid
+            .query_with(BBoxNm::from_pt(pos, 300_000), scratch, cands);
+        if let Some((vi, v)) = cands
             .iter()
-            .enumerate()
+            .map(|&vi| (vi, &board.vias[vi]))
             .filter(|(_, v)| net.is_empty() || v.net == net)
-            .min_by(|(_, a), (_, b)| a.pos.dist_sq(pos).total_cmp(&b.pos.dist_sq(pos)))
-        && v.pos.dist(pos) <= 300_000.0
-    {
-        return (format!("via#{vi}"), pos, net);
+            .min_by(|(ia, a), (ib, b)| {
+                a.pos
+                    .dist_sq(pos)
+                    .total_cmp(&b.pos.dist_sq(pos))
+                    .then_with(|| ia.cmp(ib))
+            })
+            && v.pos.dist(pos) <= 300_000.0
+        {
+            return (format!("via#{vi}"), pos, net);
+        }
     }
 
     if desc.starts_with("Track") {
         let layer = extract_layer(desc);
-        if let Some((ti, d)) = board
-            .tracks
+        idx.track_grid
+            .query_with(BBoxNm::from_pt(pos, 300_000), scratch, cands);
+        if let Some((ti, d)) = cands
             .iter()
-            .enumerate()
+            .map(|&i| (i, &board.tracks[i]))
             .filter(|(_, t)| {
                 (layer.is_empty() || t.layer == layer) && (net.is_empty() || t.net == net)
             })
             .map(|(i, t)| (i, crate::geom::point_to_segment_dist(pos, t.a, t.b)))
-            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
             && d <= 300_000.0
         {
             return (format!("track#{ti}"), pos, net);
@@ -536,26 +647,31 @@ fn map_kicad_item_to_board(board: &BoardIr, item: &KicadItem, units: &str) -> (S
         return (description_fallback(desc), pos, net);
     }
 
-    // Fallback spatial match across vias, pads, and tracks.
-    let mut best: Option<(f64, String)> = None;
-    for (vi, v) in board.vias.iter().enumerate() {
+    // Fallback spatial match across vias and pads.
+    let mut best: Option<(f64, u8, usize, String)> = None;
+    let is_better = |d: f64, kind: u8, item_idx: usize, cur: &Option<(f64, u8, usize, String)>| {
+        cur.as_ref()
+            .is_none_or(|b| d < b.0 || (d == b.0 && (kind, item_idx) < (b.1, b.2)))
+    };
+    idx.via_grid
+        .query_with(BBoxNm::from_pt(pos, idx.max_via_radius), scratch, cands);
+    for &vi in cands.iter() {
+        let v = &board.vias[vi];
         let d = v.pos.dist(pos);
-        if d <= (v.diameter / 2).max(200_000) as f64 && best.as_ref().is_none_or(|b| d < b.0) {
-            best = Some((d, format!("via#{vi}")));
+        if d <= (v.diameter / 2).max(200_000) as f64 && is_better(d, 0, vi, &best) {
+            best = Some((d, 0, vi, format!("via#{vi}")));
         }
     }
-    for pl in &board.placements {
-        if let Some(fp) = board.footprints.get(&pl.footprint) {
-            for pad in &fp.pads {
-                let wp = local_to_board(pad.pos, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side);
-                let d = wp.dist(pos);
-                if d <= 250_000.0 && best.as_ref().is_none_or(|b| d < b.0) {
-                    best = Some((d, format!("{}.{}", pl.refdes, pad.name)));
-                }
-            }
+    idx.pad_grid
+        .query_with(BBoxNm::from_pt(pos, 250_000), scratch, cands);
+    for &pi in cands.iter() {
+        let (wp, ref label) = idx.pad_items[pi];
+        let d = wp.dist(pos);
+        if d <= 250_000.0 && is_better(d, 1, pi, &best) {
+            best = Some((d, 1, pi, label.clone()));
         }
     }
-    if let Some((_, label)) = best {
+    if let Some((_, _, _, label)) = best {
         return (label, pos, net);
     }
 
@@ -603,6 +719,9 @@ pub(crate) fn cluster_kicad_drc_json(
     let doc: KicadDrcDoc = serde_json::from_str(kicad_drc_json)
         .map_err(|e| format!("failed to parse KiCad DRC JSON: {e}"))?;
     let units = doc.coordinate_units.as_str();
+    let map_idx = KicadMapIndex::new(board);
+    let mut scratch = GridQueryScratch::default();
+    let mut cands = Vec::new();
     let mut violations = Vec::new();
     for kv in doc.violations.into_iter().chain(doc.unconnected_items) {
         let kind = map_kicad_kind(&kv.kind);
@@ -614,7 +733,7 @@ pub(crate) fn cluster_kicad_drc_json(
         let mapped: Vec<(String, Pt, String)> = kv
             .items
             .iter()
-            .map(|it| map_kicad_item_to_board(board, it, units))
+            .map(|it| map_kicad_item_to_board(board, &map_idx, &mut scratch, &mut cands, it, units))
             .collect();
         let layer = kv
             .items
@@ -664,4 +783,54 @@ pub(crate) fn cluster_kicad_drc_json(
         &violations,
         KICAD_CLUSTER_RADIUS_NM,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_violation(pos: Pt, item_a: &str, item_b: Option<&str>) -> Violation {
+        Violation {
+            kind: ViolationKind::Clearance,
+            severity: Severity::Error,
+            layer: "F.Cu".into(),
+            pos_nm: pos,
+            measured_nm: 50_000,
+            required_nm: 150_000,
+            item_a: item_a.into(),
+            item_b: item_b.map(str::to_string),
+            net_a: "N1".into(),
+            net_b: "N2".into(),
+            message: "test".into(),
+        }
+    }
+
+    #[test]
+    fn cluster_hotspots_spatial_point_local_and_track_limit() {
+        let mut violations = vec![
+            // Two spatially close violations (within 1mm radius).
+            mk_violation(Pt::new(0, 0), "via#0", Some("U1.1")),
+            mk_violation(Pt::new(800_000, 0), "via#1", Some("U1.2")),
+            // Far away violation sharing point-local item "via#0" merges into cluster 0.
+            mk_violation(Pt::new(20_000_000, 0), "via#0", None),
+            // Two track#0 violations within 4*radius (4mm) merge together, third at 10mm stays separate.
+            mk_violation(Pt::new(0, 20_000_000), "track#0", Some("U2.1")),
+            mk_violation(Pt::new(3_500_000, 20_000_000), "track#0", Some("U2.2")),
+            mk_violation(Pt::new(10_000_000, 20_000_000), "track#0", Some("U2.3")),
+        ];
+        // Also exercise > 32 violations sharing one track (sub_grid path).
+        for k in 0..40 {
+            violations.push(mk_violation(
+                Pt::new(50_000_000 + k * 2_000_000, 50_000_000),
+                "track#99",
+                None,
+            ));
+        }
+        let hotspots = cluster_hotspots(None, &violations, 1_000_000);
+        assert_eq!(hotspots.len(), 4);
+        assert_eq!(hotspots[0].violation_count, 40);
+        assert_eq!(hotspots[1].violation_count, 3);
+        assert_eq!(hotspots[2].violation_count, 2);
+        assert_eq!(hotspots[3].violation_count, 1);
+    }
 }

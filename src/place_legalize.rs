@@ -87,6 +87,15 @@ fn translate_shape(shape: &ResolvedShape, d: Pt) -> ResolvedShape {
             b: Pt::new(b.x + d.x, b.y + d.y),
             radius: *radius,
         },
+        ResolvedShape::RoundRect {
+            corners,
+            radius,
+            bbox,
+        } => ResolvedShape::RoundRect {
+            corners: corners.map(|p| Pt::new(p.x + d.x, p.y + d.y)),
+            radius: *radius,
+            bbox: translate_bbox(*bbox, d),
+        },
         ResolvedShape::Poly { verts, bbox } => ResolvedShape::Poly {
             verts: translate_pts(verts, d),
             bbox: translate_bbox(*bbox, d),

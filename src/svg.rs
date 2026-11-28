@@ -112,6 +112,13 @@ pub(crate) fn render_shape_svg(
                 nm_to_mm(*radius * 2)
             );
         }
+        ResolvedShape::RoundRect { .. } => {
+            let verts = shape.to_polygon(16);
+            if verts.len() >= 3 {
+                let d = poly_path_d(&verts, mirror_x);
+                let _ = writeln!(out, r#"  <path d="{d}" fill="{color}" />"#);
+            }
+        }
         ResolvedShape::Poly { verts, .. } if verts.len() >= 3 => {
             let d = poly_path_d(verts, mirror_x);
             let _ = writeln!(out, r#"  <path d="{d}" fill="{color}" />"#);

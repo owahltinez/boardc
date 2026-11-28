@@ -16,6 +16,7 @@ use crate::geom::{ensure_ccw, local_to_board, polygon_area};
 use crate::ir::{BBoxNm, Graphic, Nm, PadDef, PadShape, Placement, Pt, nm_to_mm, safe_slug};
 use crate::shapes::{
     ResolvedShape, circle_poly, pad_to_world_shape, paths64_to_polys, pts_to_path64,
+    shape_to_world_shape,
 };
 use crate::stroke_text::text_graphic_segments;
 
@@ -213,6 +214,9 @@ impl GerberBuilder {
                 } else {
                     self.flash_poly_verts(&shape.to_polygon(16), mid);
                 }
+            }
+            ResolvedShape::RoundRect { .. } => {
+                self.flash_poly_verts(&shape.to_polygon(16), anchor);
             }
             ResolvedShape::Poly { verts, bbox } => {
                 if let Some((w, h, center)) = axis_aligned_rect_dims(verts, *bbox) {
@@ -469,11 +473,12 @@ pub(crate) fn pad_world_shape_with_margin(
             PadShape::Poly { verts: poly }
         }
     };
-    let tmp = PadDef {
-        shape: expanded_shape,
-        ..pad.clone()
-    };
-    Some(pad_to_world_shape(&tmp, pl, 16))
+    Some(shape_to_world_shape(
+        &expanded_shape,
+        pad.pos,
+        pad.rot_deg,
+        pl,
+    ))
 }
 
 pub(crate) fn pad_anchor_world(pad: &PadDef, pl: &Placement) -> Pt {

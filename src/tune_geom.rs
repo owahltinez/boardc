@@ -105,6 +105,18 @@ pub(crate) fn project_shape_interval(
             let (s0, s1, m) = (proj(*pa), proj(*pb), *radius as f64 + m_base);
             (s0.min(s1) - m, s0.max(s1) + m)
         }
+        ResolvedShape::RoundRect {
+            corners, radius, ..
+        } => {
+            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &c in corners {
+                let s = proj(c);
+                lo = lo.min(s);
+                hi = hi.max(s);
+            }
+            let m = *radius as f64 + m_base;
+            (lo - m, hi + m)
+        }
         ResolvedShape::Poly { verts, .. } => {
             let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
             for &v in verts {

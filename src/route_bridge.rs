@@ -33,6 +33,9 @@ pub(crate) fn shape_to_viahop(shape: &ResolvedShape) -> Shape {
             b: pt_to_viahop(*b),
             radius: nm_to_um(*radius),
         },
+        ResolvedShape::RoundRect { .. } => {
+            Shape::polygon(shape.to_polygon(16).into_iter().map(pt_to_viahop).collect())
+        }
         ResolvedShape::Poly { verts, .. } => {
             Shape::polygon(verts.iter().map(|&p| pt_to_viahop(p)).collect())
         }

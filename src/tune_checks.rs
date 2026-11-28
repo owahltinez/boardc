@@ -5,7 +5,8 @@ use crate::drc_scene::{
     collect_pads, collect_pours, collect_vias, compute_max_clearance,
 };
 use crate::geom::{
-    EPS_NM, SpatialGrid, point_in_polygon, point_to_segment_dist, segment_to_segment_dist,
+    EPS_NM, GridQueryScratch, SpatialGrid, point_in_polygon, point_to_segment_dist,
+    segment_to_segment_dist,
 };
 use crate::ir::{BBoxNm, BoardIr, Nm, PadKind, Pt, Side, Track, same_named_net};
 use crate::poly_index::{IndexedRing, indexed_shape_edge_clearance};
@@ -48,7 +49,7 @@ fn build_mask_layer_index(
     if items.is_empty() {
         return None;
     }
-    let grid = SpatialGrid::from_bboxes(items.iter().map(|(_, _, bb)| *bb), 2_000_000);
+    let grid = SpatialGrid::new(items.iter().map(|(_, _, bb)| *bb), 2_000_000);
     Some(MaskLayerIndex { items, grid })
 }
 
@@ -67,10 +68,12 @@ pub(crate) struct TuneScene<'a> {
     pours: Vec<PourItem<'a>>,
     pub(crate) tracks: Vec<Option<Track>>,
     track_grid: SpatialGrid,
+    extra_tracks: Vec<usize>,
     mask_to_copper: Option<Nm>,
     top_masks: Option<MaskLayerIndex>,
     bot_masks: Option<MaskLayerIndex>,
     max_clr: Nm,
+    scratch: GridQueryScratch,
     candidates: Vec<usize>,
 }
 
@@ -89,7 +92,7 @@ impl<'a> TuneScene<'a> {
             .map(|c| IndexedRing::new(c))
             .collect();
         let pads = collect_pads(board, &cu_layers);
-        let vias = collect_vias(board);
+        let vias = collect_vias(board, &cu_layers);
         let drills = collect_drills(board, &pads, &vias, &cu_layers);
         let pours = collect_pours(board);
         let keepouts = collect_keepouts(board);
@@ -108,21 +111,23 @@ impl<'a> TuneScene<'a> {
             board,
             outline_idx,
             cutout_idxs,
-            pad_grid: SpatialGrid::from_bboxes(pads.iter().map(|p| p.bbox), 2_000_000),
+            pad_grid: SpatialGrid::new(pads.iter().map(|p| p.bbox), 2_000_000),
             pads,
-            via_grid: SpatialGrid::from_bboxes(vias.iter().map(|v| v.bbox), 2_000_000),
+            via_grid: SpatialGrid::new(vias.iter().map(|v| v.bbox), 2_000_000),
             vias,
-            drill_grid: SpatialGrid::from_bboxes(drills.iter().map(|d| d.bbox), 2_000_000),
+            drill_grid: SpatialGrid::new(drills.iter().map(|d| d.bbox), 2_000_000),
             drills,
-            keepout_grid: SpatialGrid::from_bboxes(keepouts.iter().map(|k| k.bbox), 2_000_000),
+            keepout_grid: SpatialGrid::new(keepouts.iter().map(|k| k.bbox), 2_000_000),
             keepouts,
             pours,
-            track_grid: SpatialGrid::from_bboxes(board.tracks.iter().map(track_bbox), 2_000_000),
+            track_grid: SpatialGrid::new(board.tracks.iter().map(track_bbox), 2_000_000),
+            extra_tracks: Vec::new(),
             tracks: board.tracks.iter().cloned().map(Some).collect(),
             mask_to_copper,
             top_masks,
             bot_masks,
             max_clr,
+            scratch: GridQueryScratch::default(),
             candidates: Vec::new(),
         }
     }
@@ -201,7 +206,9 @@ impl<'a> TuneScene<'a> {
         let q = seg_bbox.expand(2);
         let mut intervals = Vec::new();
 
-        self.track_grid.query(q, &mut self.candidates);
+        self.track_grid
+            .query_with(q, &mut self.scratch, &mut self.candidates);
+        self.candidates.extend(self.extra_tracks.iter().copied());
         for &ti in &self.candidates {
             let Some(t) = (ti != orig_idx).then(|| self.tracks[ti].as_ref()).flatten() else {
                 continue;
@@ -223,7 +230,8 @@ impl<'a> TuneScene<'a> {
             }
         }
 
-        self.via_grid.query(q, &mut self.candidates);
+        self.via_grid
+            .query_with(q, &mut self.scratch, &mut self.candidates);
         for &vi in &self.candidates {
             let v = &self.vias[vi];
             if same_named_net(net, &v.net)
@@ -234,7 +242,8 @@ impl<'a> TuneScene<'a> {
             }
         }
 
-        self.pad_grid.query(q, &mut self.candidates);
+        self.pad_grid
+            .query_with(q, &mut self.scratch, &mut self.candidates);
         for &pi in &self.candidates {
             let p = &self.pads[pi];
             if p.kind == PadKind::Npth || !same_named_net(net, &p.net) {
@@ -279,7 +288,7 @@ impl<'a> TuneScene<'a> {
     pub(crate) fn commit_replacement(&mut self, orig_idx: usize, new_tracks: Vec<Track>) {
         self.tracks[orig_idx] = None;
         for t in new_tracks {
-            self.track_grid.push(track_bbox(&t));
+            self.extra_tracks.push(self.tracks.len());
             self.tracks.push(Some(t));
         }
     }
@@ -334,7 +343,8 @@ impl<'a> TuneScene<'a> {
             }
         }
 
-        self.keepout_grid.query(seg_bbox, &mut self.candidates);
+        self.keepout_grid
+            .query_with(seg_bbox, &mut self.scratch, &mut self.candidates);
         for &ki in &self.candidates {
             let ko = &self.keepouts[ki];
             if ko.kind.blocks_tracks()
@@ -359,7 +369,9 @@ impl<'a> TuneScene<'a> {
             dist >= req as f64 - EPS_NM
         };
 
-        self.track_grid.query(q_bbox, &mut self.candidates);
+        self.track_grid
+            .query_with(q_bbox, &mut self.scratch, &mut self.candidates);
+        self.candidates.extend(self.extra_tracks.iter().copied());
         for &ti in &self.candidates {
             let Some(o) = (ti != orig_idx).then(|| self.tracks[ti].as_ref()).flatten() else {
                 continue;
@@ -376,7 +388,8 @@ impl<'a> TuneScene<'a> {
             }
         }
 
-        self.pad_grid.query(q_bbox, &mut self.candidates);
+        self.pad_grid
+            .query_with(q_bbox, &mut self.scratch, &mut self.candidates);
         for &pi in &self.candidates {
             let pad = &self.pads[pi];
             if pad.kind == PadKind::Npth || !pad.layers.iter().any(|l| l == layer) {
@@ -396,7 +409,8 @@ impl<'a> TuneScene<'a> {
             }
         }
 
-        self.via_grid.query(q_bbox, &mut self.candidates);
+        self.via_grid
+            .query_with(q_bbox, &mut self.scratch, &mut self.candidates);
         for &vi in &self.candidates {
             let via = &self.vias[vi];
             if !self.board.vias[vi].touches_layer(layer, &self.board.layers) {
@@ -419,7 +433,8 @@ impl<'a> TuneScene<'a> {
         }
 
         let hole_clr = self.board.rules.effective_hole_clearance_nm();
-        self.drill_grid.query(q_bbox, &mut self.candidates);
+        self.drill_grid
+            .query_with(q_bbox, &mut self.scratch, &mut self.candidates);
         for &di in &self.candidates {
             let d = &self.drills[di];
             if (!d.is_npth && same_named_net(&d.net, net)) || !d.layers.iter().any(|l| l == layer) {
@@ -449,13 +464,15 @@ impl<'a> TuneScene<'a> {
 
         if let Some(m2c) = self.mask_to_copper {
             let masks = match layer {
-                "F.Cu" => self.top_masks.as_mut(),
-                "B.Cu" => self.bot_masks.as_mut(),
+                "F.Cu" => self.top_masks.as_ref(),
+                "B.Cu" => self.bot_masks.as_ref(),
                 _ => None,
             };
             if let Some(masks) = masks {
                 let mq = seg_bbox.expand(m2c);
-                masks.grid.query(mq, &mut self.candidates);
+                masks
+                    .grid
+                    .query_with(mq, &mut self.scratch, &mut self.candidates);
                 for &mi in &self.candidates {
                     let (m_net, m_shape, m_bbox) = &masks.items[mi];
                     if !same_named_net(net, m_net)

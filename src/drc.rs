@@ -9,14 +9,14 @@ use crate::drc_copper::{
 };
 use crate::drc_dangling;
 use crate::drc_layout::{check_courtyards_and_component_edges, check_keepouts};
-use crate::drc_mask::check_mask_to_copper;
+use crate::drc_mask::{MaskOpening, check_mask_to_copper, collect_mask_openings};
 use crate::drc_rules::{check_drill_rules, check_edge_clearances};
 use crate::drc_scene::{
-    collect_drills, collect_keepouts, collect_pads, collect_pours, collect_tracks, collect_vias,
-    compute_max_clearance,
+    BoardEdgeIndex, DrcInputs, collect_drc_grids, collect_drills, collect_keepouts, collect_pads,
+    collect_pours, collect_tracks, collect_vias, compute_max_clearance,
 };
 use crate::drc_silk::check_silkscreen;
-use crate::ir::{BoardIr, Nm, Pt};
+use crate::ir::{BoardIr, Nm, Pt, Side};
 
 pub const DEFAULT_CLUSTER_RADIUS_NM: Nm = 2_000_000;
 
@@ -103,43 +103,95 @@ pub struct DrcReport {
 pub fn check_board_drc(board: &BoardIr) -> DrcReport {
     let cu_layers = board.copper_layer_names();
     let pads = collect_pads(board, &cu_layers);
-    let tracks = collect_tracks(board);
-    let vias = collect_vias(board);
+    let tracks = collect_tracks(board, &cu_layers);
+    let vias = collect_vias(board, &cu_layers);
     let drills = collect_drills(board, &pads, &vias, &cu_layers);
     let pours = collect_pours(board);
     let keepouts = collect_keepouts(board);
+    let grids = collect_drc_grids(&cu_layers, &pads, &vias, &tracks);
+    let edge_idx = BoardEdgeIndex::new(board);
     let max_clr = compute_max_clearance(board, &pours);
+
+    let mask_needs_openings = board.rules.mask_to_copper_nm.is_some_and(|v| v >= 0);
+    let silk_needs_openings = board.rules.silk_to_mask_nm.is_some_and(|v| v >= 0);
+    let shared_openings: Option<(Vec<MaskOpening<'_>>, Vec<MaskOpening<'_>>)> =
+        (mask_needs_openings || silk_needs_openings).then(|| {
+            let top = if cu_layers.iter().any(|l| l == "F.Cu") || silk_needs_openings {
+                collect_mask_openings(
+                    board,
+                    &cu_layers,
+                    &pads,
+                    &vias,
+                    Side::Top,
+                    silk_needs_openings,
+                )
+            } else {
+                Vec::new()
+            };
+            let bot = if cu_layers.iter().any(|l| l == "B.Cu") || silk_needs_openings {
+                collect_mask_openings(
+                    board,
+                    &cu_layers,
+                    &pads,
+                    &vias,
+                    Side::Bottom,
+                    silk_needs_openings,
+                )
+            } else {
+                Vec::new()
+            };
+            (top, bot)
+        });
+    let openings_ref = shared_openings
+        .as_ref()
+        .map(|(t, b)| (t.as_slice(), b.as_slice()));
+    let inputs = DrcInputs {
+        cu_layers: &cu_layers,
+        tracks: &tracks,
+        pads: &pads,
+        vias: &vias,
+        pours: &pours,
+        grids: &grids,
+        max_clr,
+    };
 
     let mut violations = std::thread::scope(|s| {
         let h_copper = s.spawn(|| {
             let mut v = Vec::new();
-            check_track_rules_and_clearances(board, &tracks, &pads, &vias, max_clr, &mut v);
-            check_pad_to_pad_clearances(board, &pads, max_clr, &mut v);
-            check_via_to_via_and_pad(board, &pads, &vias, &cu_layers, max_clr, &mut v);
-            check_mask_to_copper(board, &cu_layers, &tracks, &pads, &vias, &pours, &mut v);
+            check_track_rules_and_clearances(board, &inputs, &mut v);
+            check_pad_to_pad_clearances(board, &inputs, &mut v);
+            check_via_to_via_and_pad(board, &inputs, &mut v);
+            check_mask_to_copper(board, &inputs, openings_ref, &mut v);
             v
         });
         let h_pours = s.spawn(|| {
             let mut v = Vec::new();
-            check_pour_clearances(board, &tracks, &pads, &vias, &pours, max_clr, &mut v);
+            check_pour_clearances(board, &inputs, &mut v);
             v
         });
-        let h_drills =
-            s.spawn(|| check_drill_rules(board, &tracks, &pads, &vias, &drills, &pours, max_clr));
+        let h_drills = s.spawn(|| check_drill_rules(board, &inputs, &drills));
         let h_layout = s.spawn(|| {
             let mut v = Vec::new();
-            check_edge_clearances(board, &tracks, &pads, &vias, &pours, &mut v);
-            check_keepouts(board, &tracks, &pads, &vias, &pours, &keepouts, &mut v);
-            check_courtyards_and_component_edges(board, &keepouts, &mut v);
+            check_edge_clearances(
+                board,
+                &tracks,
+                &pads,
+                &vias,
+                &pours,
+                edge_idx.as_ref(),
+                &mut v,
+            );
+            check_keepouts(board, &inputs, &keepouts, &mut v);
+            check_courtyards_and_component_edges(board, &keepouts, edge_idx.as_ref(), &mut v);
             check_constraints(board, &pads, &mut v);
-            check_silkscreen(board, &cu_layers, &pads, &vias, &mut v);
+            check_silkscreen(board, edge_idx.as_ref(), openings_ref, &mut v);
             v
         });
         let h_conn = s.spawn(|| {
             let mut v =
                 drc_connect::check_connectivity(board, &cu_layers, &tracks, &pads, &vias, &pours);
             v.extend(drc_dangling::check_dangling(
-                board, &cu_layers, &tracks, &pads, &vias, &pours,
+                board, &cu_layers, &tracks, &pads, &vias, &pours, &grids,
             ));
             v
         });

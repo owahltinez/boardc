@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::drc::{Severity, Violation, ViolationKind};
-use crate::drc_scene::{PadItem, PourItem, TrackItem, ViaItem};
-use crate::geom::{SpatialGrid, point_to_segment_dist, segment_to_segment_dist};
+use crate::drc_scene::{DrcGrids, PadItem, PourItem, TrackItem, ViaItem};
+use crate::geom::{GridQueryScratch, SpatialGrid, point_to_segment_dist, segment_to_segment_dist};
 use crate::ir::{BBoxNm, BoardIr, Nm, PadKind, Pt, same_named_net};
 use crate::shapes::ResolvedShape;
 
@@ -14,13 +14,13 @@ pub(crate) struct CopperContext<'a> {
     cu_layers: &'a [String],
     pads: &'a [PadItem],
     tht_barrels: Vec<Option<ResolvedShape>>,
-    pad_grid: SpatialGrid,
+    pad_grid_override: Option<SpatialGrid>,
     vias: &'a [ViaItem],
     via_spanned_idx: Vec<Vec<usize>>,
-    via_grid: SpatialGrid,
     pours: &'a [PourItem<'a>],
     tracks: &'a [TrackItem<'a>],
-    track_grid: SpatialGrid,
+    grids: &'a DrcGrids,
+    scratch: GridQueryScratch,
     candidates: Vec<usize>,
     pub(crate) alive_tracks: Vec<bool>,
     pub(crate) alive_vias: Vec<bool>,
@@ -34,29 +34,38 @@ impl<'a> CopperContext<'a> {
         vias: &'a [ViaItem],
         pours: &'a [PourItem<'a>],
         tracks: &'a [TrackItem<'a>],
+        grids: &'a DrcGrids,
     ) -> Self {
         let mut tht_barrels = Vec::with_capacity(pads.len());
-        let pad_grid = SpatialGrid::from_bboxes(
-            pads.iter().map(|pad| {
-                if pad.kind == PadKind::Tht
-                    && let Some(drill) = pad.drill_nm
-                    && drill > 0
-                    && pad.layers.len() < cu_layers.len()
-                {
-                    let barrel = ResolvedShape::Circle {
-                        center: pad.center,
-                        radius: drill / 2,
-                    };
-                    let bb = pad.bbox.union(barrel.bbox());
-                    tht_barrels.push(Some(barrel));
-                    bb
-                } else {
-                    tht_barrels.push(None);
-                    pad.bbox
+        let mut barrel_exceeds_pad = false;
+        for pad in pads {
+            if pad.kind == PadKind::Tht
+                && let Some(drill) = pad.drill_nm
+                && drill > 0
+                && pad.layers.len() < cu_layers.len()
+            {
+                let barrel = ResolvedShape::Circle {
+                    center: pad.center,
+                    radius: drill / 2,
+                };
+                if barrel.bbox().union(pad.bbox) != pad.bbox {
+                    barrel_exceeds_pad = true;
                 }
-            }),
-            2_000_000,
-        );
+                tht_barrels.push(Some(barrel));
+            } else {
+                tht_barrels.push(None);
+            }
+        }
+        let pad_grid_override = barrel_exceeds_pad.then(|| {
+            SpatialGrid::new(
+                pads.iter().enumerate().map(|(i, pad)| {
+                    tht_barrels[i]
+                        .as_ref()
+                        .map_or(pad.bbox, |b| pad.bbox.union(b.bbox()))
+                }),
+                2_000_000,
+            )
+        });
         let via_spanned_idx = board
             .vias
             .iter()
@@ -71,17 +80,23 @@ impl<'a> CopperContext<'a> {
             cu_layers,
             pads,
             tht_barrels,
-            pad_grid,
+            pad_grid_override,
             vias,
             via_spanned_idx,
-            via_grid: SpatialGrid::from_bboxes(vias.iter().map(|v| v.bbox), 2_000_000),
             pours,
             tracks,
-            track_grid: SpatialGrid::from_bboxes(tracks.iter().map(|t| t.bbox), 2_000_000),
+            grids,
+            scratch: GridQueryScratch::default(),
             candidates: Vec::new(),
             alive_tracks: vec![true; tracks.len()],
             alive_vias: vec![true; vias.len()],
         }
+    }
+
+    fn pad_grid(&self) -> &SpatialGrid {
+        self.pad_grid_override
+            .as_ref()
+            .unwrap_or(&self.grids.pad_grid)
     }
 
     fn pad_shape_on_layer(&self, pad_idx: usize, layer: &str) -> Option<&ResolvedShape> {
@@ -110,9 +125,10 @@ impl<'a> CopperContext<'a> {
             return false;
         }
         let q = BBoxNm::from_pt(p, 2);
+        let mut scratch = std::mem::take(&mut self.scratch);
         let mut cands = std::mem::take(&mut self.candidates);
 
-        self.pad_grid.query(q, &mut cands);
+        self.pad_grid().query_with(q, &mut scratch, &mut cands);
         let hit_pad = cands.iter().any(|&pi| {
             same_named_net(&self.pads[pi].net, tr.net)
                 && self
@@ -121,7 +137,7 @@ impl<'a> CopperContext<'a> {
         });
 
         let hit_via = !hit_pad && {
-            self.via_grid.query(q, &mut cands);
+            self.grids.via_grid.query_with(q, &mut scratch, &mut cands);
             cands.iter().any(|&vi| {
                 self.alive_vias[vi]
                     && same_named_net(&self.vias[vi].net, tr.net)
@@ -143,17 +159,35 @@ impl<'a> CopperContext<'a> {
         };
 
         let hit_track = !hit_pad && !hit_via && !hit_pour && {
-            self.track_grid.query(q, &mut cands);
-            cands.iter().any(|&oi| {
-                oi != track_idx
-                    && self.alive_tracks[oi]
-                    && self.tracks[oi].layer == tr.layer
-                    && same_named_net(self.tracks[oi].net, tr.net)
-                    && point_to_segment_dist(p, self.tracks[oi].a, self.tracks[oi].b)
-                        <= TOUCH_TOL_NM
-            })
+            if let Some(li) = tr.layer_idx {
+                let (layer_idxs, layer_grid) = &self.grids.tracks_by_layer[li];
+                layer_grid.query_with(q, &mut scratch, &mut cands);
+                cands.iter().any(|&loc_oi| {
+                    let oi = layer_idxs[loc_oi];
+                    oi != track_idx
+                        && self.alive_tracks[oi]
+                        && same_named_net(self.tracks[oi].net, tr.net)
+                        && self.tracks[oi].bbox.intersects(q)
+                        && point_to_segment_dist(p, self.tracks[oi].a, self.tracks[oi].b)
+                            <= TOUCH_TOL_NM
+                })
+            } else {
+                self.grids
+                    .track_grid
+                    .query_with(q, &mut scratch, &mut cands);
+                cands.iter().any(|&oi| {
+                    oi != track_idx
+                        && self.alive_tracks[oi]
+                        && self.tracks[oi].layer == tr.layer
+                        && same_named_net(self.tracks[oi].net, tr.net)
+                        && self.tracks[oi].bbox.intersects(q)
+                        && point_to_segment_dist(p, self.tracks[oi].a, self.tracks[oi].b)
+                            <= TOUCH_TOL_NM
+                })
+            }
         };
 
+        self.scratch = scratch;
         self.candidates = cands;
         hit_pad || hit_via || hit_pour || hit_track
     }
@@ -168,24 +202,30 @@ impl<'a> CopperContext<'a> {
         let q = tr.bbox.expand(PRUNE_PAD_NM);
         let min_hits = if anchor.is_some() { 1 } else { 2 };
         let mut hits = 0usize;
+        let mut scratch = std::mem::take(&mut self.scratch);
         let mut cands = std::mem::take(&mut self.candidates);
         let anc_pt = anchor.map(|center| ResolvedShape::Circle { center, radius: 0 });
 
         let mut hit = false;
-        self.track_grid.query(q, &mut cands);
+        self.grids
+            .track_grid
+            .query_with(q, &mut scratch, &mut cands);
         for &oi in &cands {
             if oi == track_idx || !self.alive_tracks[oi] {
                 continue;
             }
             let other = &self.tracks[oi];
+            if other.layer != tr.layer
+                || !same_named_net(other.net, tr.net)
+                || !other.bbox.intersects(q)
+            {
+                continue;
+            }
             let copper_touch = tr.shape.dist_to_shape(&other.shape) <= tol
                 && anchor.is_none_or(|anc| other.shape.dist_to_point(anc) > tol);
             let centerline_touch = segment_to_segment_dist(tr.a, tr.b, other.a, other.b) <= tol
                 && anchor.is_none_or(|anc| point_to_segment_dist(anc, other.a, other.b) > tol);
-            if other.layer == tr.layer
-                && same_named_net(other.net, tr.net)
-                && (copper_touch || centerline_touch)
-            {
+            if copper_touch || centerline_touch {
                 hits += 1;
                 if hits >= min_hits {
                     hit = true;
@@ -195,8 +235,15 @@ impl<'a> CopperContext<'a> {
         }
 
         if !hit {
-            self.pad_grid.query(q, &mut cands);
+            self.pad_grid().query_with(q, &mut scratch, &mut cands);
             for &pi in &cands {
+                if !self.pads[pi].bbox.intersects(q)
+                    && self.tht_barrels[pi]
+                        .as_ref()
+                        .is_none_or(|b| !b.bbox().intersects(q))
+                {
+                    continue;
+                }
                 if same_named_net(&self.pads[pi].net, tr.net)
                     && self.pad_shape_on_layer(pi, tr.layer).is_some_and(|shape| {
                         shape.dist_to_shape(&tr.shape) <= tol
@@ -213,12 +260,15 @@ impl<'a> CopperContext<'a> {
         }
 
         if !hit {
-            self.via_grid.query(q, &mut cands);
+            self.grids.via_grid.query_with(q, &mut scratch, &mut cands);
             for &vi in &cands {
                 if !self.alive_vias[vi] {
                     continue;
                 }
                 let via = &self.vias[vi];
+                if !via.bbox.intersects(q) {
+                    continue;
+                }
                 if same_named_net(&via.net, tr.net)
                     && self.via_touches_layer(vi, tr.layer)
                     && via.shape.dist_to_shape(&tr.shape) <= tol
@@ -237,6 +287,7 @@ impl<'a> CopperContext<'a> {
             for pour in self.pours {
                 if pour.layer == tr.layer
                     && same_named_net(pour.net, tr.net)
+                    && pour.bbox.intersects(q)
                     && pour.indexed.dist_to_shape_bounded(&tr.shape, PRUNE_PAD_NM) <= tol
                     && anc_pt
                         .as_ref()
@@ -251,6 +302,7 @@ impl<'a> CopperContext<'a> {
             }
         }
 
+        self.scratch = scratch;
         self.candidates = cands;
         hit
     }
@@ -263,9 +315,10 @@ impl<'a> CopperContext<'a> {
         let spanned = &self.via_spanned_idx[via_idx];
         let q = via.bbox.expand(2);
         let mut found = Vec::new();
+        let mut scratch = std::mem::take(&mut self.scratch);
         let mut cands = std::mem::take(&mut self.candidates);
 
-        self.pad_grid.query(q, &mut cands);
+        self.pad_grid().query_with(q, &mut scratch, &mut cands);
         for &pi in &cands {
             if !same_named_net(&self.pads[pi].net, &via.net) || self.pads[pi].kind == PadKind::Npth
             {
@@ -291,13 +344,15 @@ impl<'a> CopperContext<'a> {
         }
 
         if found.len() < 2 {
-            self.track_grid.query(q, &mut cands);
+            self.grids
+                .track_grid
+                .query_with(q, &mut scratch, &mut cands);
             for &ti in &cands {
                 if !self.alive_tracks[ti] {
                     continue;
                 }
                 let tr = &self.tracks[ti];
-                if !same_named_net(tr.net, &via.net) {
+                if !same_named_net(tr.net, &via.net) || !tr.bbox.intersects(q) {
                     continue;
                 }
                 if let Some(&li) = spanned.iter().find(|&&li| self.cu_layers[li] == tr.layer)
@@ -314,7 +369,7 @@ impl<'a> CopperContext<'a> {
 
         if found.len() < 2 {
             for pour in self.pours {
-                if !same_named_net(pour.net, &via.net) {
+                if !same_named_net(pour.net, &via.net) || !pour.bbox.intersects(q) {
                     continue;
                 }
                 if let Some(&li) = spanned.iter().find(|&&li| self.cu_layers[li] == pour.layer)
@@ -329,6 +384,7 @@ impl<'a> CopperContext<'a> {
             }
         }
 
+        self.scratch = scratch;
         self.candidates = cands;
         found
     }
@@ -353,13 +409,15 @@ impl<'a> CopperContext<'a> {
         }
 
         let mut via_adj = vec![Vec::new(); n];
+        let mut scratch = std::mem::take(&mut self.scratch);
         let mut cands = std::mem::take(&mut self.candidates);
         for vi in 0..n {
             if !self.alive_vias[vi] || self.vias[vi].net.is_empty() {
                 continue;
             }
-            self.via_grid
-                .query(self.vias[vi].bbox.expand(2), &mut cands);
+            self.grids
+                .via_grid
+                .query_with(self.vias[vi].bbox.expand(2), &mut scratch, &mut cands);
             for &vj in &cands {
                 if vj <= vi || !self.alive_vias[vj] {
                     continue;
@@ -375,6 +433,7 @@ impl<'a> CopperContext<'a> {
                 }
             }
         }
+        self.scratch = scratch;
         self.candidates = cands;
 
         let mut visited = vec![0u32; n];
@@ -462,8 +521,9 @@ pub(crate) fn check_dangling(
     pads: &[PadItem],
     vias: &[ViaItem],
     pours: &[PourItem<'_>],
+    grids: &DrcGrids,
 ) -> Vec<Violation> {
-    let mut ctx = CopperContext::new(board, cu_layers, pads, vias, pours, tracks);
+    let mut ctx = CopperContext::new(board, cu_layers, pads, vias, pours, tracks, grids);
     let mut out = Vec::new();
 
     for (ti, tr) in tracks.iter().enumerate() {

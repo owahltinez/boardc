@@ -2,13 +2,13 @@ use std::borrow::Cow;
 
 use crate::drc::{Violation, ViolationKind};
 use crate::drc_scene::{
-    ClearanceHit, PadItem, PourItem, TrackItem, ViaItem, push_clearance_violation,
+    ClearanceHit, DrcInputs, PadItem, PourItem, ViaItem, push_clearance_violation,
 };
 use crate::fab_gerber::pad_world_shape_with_margin;
 use crate::fab_silk::push_graphic_mask_shapes;
 use crate::geom::{
-    EPS_NM, SpatialGrid, closest_pt_on_segment, pad_world_layers, polys_overlap_area,
-    remap_layer_for_side,
+    EPS_NM, GridQueryScratch, SpatialGrid, closest_pt_on_segment, pad_world_layers,
+    polys_overlap_area, remap_layer_for_side,
 };
 use crate::ir::{BBoxNm, BoardIr, Graphic, Nm, PadKind, Placement, Pt, Side, same_named_net};
 use crate::shapes::ResolvedShape;
@@ -186,16 +186,24 @@ fn pour_violates_mask(pour: &PourItem<'_>, shape: &ResolvedShape, req: Nm) -> Op
 
 pub(crate) fn check_mask_to_copper(
     board: &BoardIr,
-    cu_layers: &[String],
-    tracks: &[TrackItem<'_>],
-    pads: &[PadItem],
-    vias: &[ViaItem],
-    pours: &[PourItem<'_>],
+    inputs: &DrcInputs<'_>,
+    shared_openings: Option<(&[MaskOpening<'_>], &[MaskOpening<'_>])>,
     out: &mut Vec<Violation>,
 ) {
-    let Some(req) = board.rules.mask_to_copper_nm.filter(|&v| v >= 0) else {
+    let (cu_layers, tracks, pads, vias, pours) = (
+        inputs.cu_layers,
+        inputs.tracks,
+        inputs.pads,
+        inputs.vias,
+        inputs.pours,
+    );
+    let (Some(req), Some((top, bot))) = (
+        board.rules.mask_to_copper_nm.filter(|&v| v >= 0),
+        shared_openings,
+    ) else {
         return;
     };
+    let mut scratch = GridQueryScratch::default();
     let mut candidates = Vec::new();
 
     for side in [Side::Top, Side::Bottom] {
@@ -203,7 +211,10 @@ pub(crate) fn check_mask_to_copper(
         if !cu_layers.iter().any(|l| l == cu_layer) {
             continue;
         }
-        let openings = collect_mask_openings(board, cu_layers, pads, vias, side, false);
+        let openings = match side {
+            Side::Top => top,
+            Side::Bottom => bot,
+        };
         if openings.is_empty() {
             continue;
         }
@@ -246,13 +257,15 @@ pub(crate) fn check_mask_to_copper(
                 });
             }
         }
-        let target_bboxes: Vec<BBoxNm> = targets.iter().map(|t| t.bbox).collect();
-        let mut target_grid = SpatialGrid::new(&target_bboxes, 2_000_000);
+        let target_grid = SpatialGrid::new(targets.iter().map(|t| t.bbox), 2_000_000);
         let side_pours: Vec<&PourItem<'_>> = pours.iter().filter(|p| p.layer == cu_layer).collect();
 
-        for op in &openings {
+        for op in openings {
+            if matches!(op.owner, MaskOwner::Graphic(_)) {
+                continue;
+            }
             let q = op.bbox.expand(req);
-            target_grid.query(q, &mut candidates);
+            target_grid.query_with(q, &mut scratch, &mut candidates);
             for &ti in &candidates {
                 let target = &targets[ti];
                 if !target.bbox.intersects(q) || same_named_net(op.net, target.net) {
