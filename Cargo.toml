@@ -1,6 +1,6 @@
 [package]
 name = "boardc"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Headless native Rust PCB compiler: IR, placement legalizer, zone filler, viahop router, DRC clusterer, and Gerber/Excellon/BOM/CPL emitter"
 license = "MIT"
