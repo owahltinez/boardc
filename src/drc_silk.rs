@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 
 use crate::drc::{Severity, Violation, ViolationKind};
-use crate::drc_mask::{MaskOpening, MaskOwner, collect_mask_openings, shape_violates_mask};
-use crate::drc_scene::{ClearanceHit, PadItem, ViaItem, push_clearance_violation};
+use crate::drc_mask::{MaskOpening, MaskOwner, shape_violates_mask};
+use crate::drc_scene::{BoardEdgeIndex, ClearanceHit, push_clearance_violation};
 use crate::fab_silk::{SilkElement, for_each_silk_element, push_graphic_mask_shapes};
-use crate::geom::{EPS_NM, SpatialGrid, closest_pt_on_segment, segment_pair_midpoint};
-use crate::ir::{BBoxNm, BoardIr, Nm, Pt, Side};
+use crate::geom::{
+    EPS_NM, GridQueryScratch, SpatialGrid, closest_pt_on_segment, segment_pair_midpoint,
+};
+use crate::ir::{BoardIr, Nm, Pt, Side};
 use crate::poly_index::{IndexedRing, indexed_shape_edge_clearance};
 use crate::shapes::ResolvedShape;
 
@@ -73,15 +75,15 @@ fn check_silk_to_mask(
     if openings.is_empty() {
         return;
     }
-    let mask_bboxes: Vec<BBoxNm> = openings.iter().map(|o| o.bbox).collect();
-    let mut mask_grid = SpatialGrid::new(&mask_bboxes, 2_000_000);
+    let mask_grid = SpatialGrid::new(openings.iter().map(|o| o.bbox), 2_000_000);
+    let mut scratch = GridQueryScratch::default();
     let mut candidates = Vec::new();
 
     for item in silk_items {
         let mut best_by_mask: BTreeMap<MaskOwner, (usize, f64, Pt)> = BTreeMap::new();
         for sh in &item.shapes {
             let q = sh.bbox().expand(req);
-            mask_grid.query(q, &mut candidates);
+            mask_grid.query_with(q, &mut scratch, &mut candidates);
             for &mi in &candidates {
                 let op = &openings[mi];
                 if !op.bbox.intersects(q) {
@@ -180,27 +182,15 @@ fn check_silk_to_edge(
 
 pub(crate) fn check_silkscreen(
     board: &BoardIr,
-    cu_layers: &[String],
-    pads: &[PadItem],
-    vias: &[ViaItem],
+    edge_idx: Option<&BoardEdgeIndex>,
+    shared_openings: Option<(&[MaskOpening<'_>], &[MaskOpening<'_>])>,
     out: &mut Vec<Violation>,
 ) {
     let mask_req = board.rules.silk_to_mask_nm.filter(|&v| v >= 0);
-    let edge_rings = board
-        .rules
-        .silk_to_edge_nm
-        .filter(|&v| v >= 0 && board.outline.len() >= 3)
-        .map(|req| {
-            let outline = IndexedRing::new(&board.outline);
-            let cutouts: Vec<IndexedRing> = board
-                .cutouts
-                .iter()
-                .filter(|c| c.len() >= 3)
-                .map(|c| IndexedRing::new(c))
-                .collect();
-            (req, outline, cutouts)
-        });
-    if mask_req.is_none() && edge_rings.is_none() {
+    let edge_req = board.rules.silk_to_edge_nm.filter(|&v| v >= 0);
+    if (mask_req.is_none() || shared_openings.is_none())
+        && (edge_req.is_none() || edge_idx.is_none())
+    {
         return;
     }
 
@@ -213,12 +203,15 @@ pub(crate) fn check_silkscreen(
             Side::Top => "F.SilkS",
             Side::Bottom => "B.SilkS",
         };
-        if let Some(req) = mask_req {
-            let openings = collect_mask_openings(board, cu_layers, pads, vias, side, true);
-            check_silk_to_mask(&silk_items, &openings, silk_layer, req, out);
+        if let (Some(req), Some((top, bot))) = (mask_req, shared_openings) {
+            let openings = match side {
+                Side::Top => top,
+                Side::Bottom => bot,
+            };
+            check_silk_to_mask(&silk_items, openings, silk_layer, req, out);
         }
-        if let Some((req, ref outline, ref cutouts)) = edge_rings {
-            check_silk_to_edge(&silk_items, outline, cutouts, silk_layer, req, out);
+        if let (Some(req), Some(e)) = (edge_req, edge_idx) {
+            check_silk_to_edge(&silk_items, &e.outline, &e.cutouts, silk_layer, req, out);
         }
     }
 }

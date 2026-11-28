@@ -299,55 +299,199 @@ pub fn polygon_to_polygon_dist(a: &[Pt], b: &[Pt]) -> f64 {
     min_d
 }
 
-pub(crate) struct SpatialGrid {
-    cell_nm: Nm,
-    cells: HashMap<(i64, i64), Vec<usize>>,
-    globals: Vec<usize>,
+#[derive(Default)]
+pub(crate) struct GridQueryScratch {
     seen: Vec<u32>,
     stamp: u32,
 }
 
+enum GridStorage {
+    Dense {
+        origin_gx: i64,
+        origin_gy: i64,
+        cols: usize,
+        rows: usize,
+        offsets: Vec<u32>,
+        items: Vec<u32>,
+    },
+    Sparse(HashMap<(i64, i64), Vec<u32>>),
+}
+
+pub(crate) struct SpatialGrid {
+    cell_nm: Nm,
+    len: usize,
+    globals: Vec<u32>,
+    storage: GridStorage,
+}
+
 impl SpatialGrid {
-    pub(crate) fn from_bboxes(bboxes: impl IntoIterator<Item = BBoxNm>, cell_nm: Nm) -> Self {
-        let mut grid = Self {
-            cell_nm: cell_nm.max(250_000),
-            cells: HashMap::new(),
-            globals: Vec::new(),
-            seen: Vec::new(),
-            stamp: 0,
-        };
+    pub(crate) fn new(bboxes: impl IntoIterator<Item = BBoxNm>, cell_nm: Nm) -> Self {
+        let cell_nm = cell_nm.max(250_000);
+        let mut globals = Vec::new();
+        let mut entries: Vec<(u32, i64, i64, i64, i64)> = Vec::new();
+        let mut min_gx = i64::MAX;
+        let mut max_gx = i64::MIN;
+        let mut min_gy = i64::MAX;
+        let mut max_gy = i64::MIN;
+        let mut len = 0usize;
+
         for b in bboxes {
-            grid.push(b);
-        }
-        grid
-    }
-
-    pub(crate) fn new(bboxes: &[BBoxNm], cell_nm: Nm) -> Self {
-        Self::from_bboxes(bboxes.iter().copied(), cell_nm)
-    }
-
-    pub(crate) fn push(&mut self, b: BBoxNm) {
-        let idx = self.seen.len();
-        self.seen.push(0);
-        let x0 = b.min_x.div_euclid(self.cell_nm);
-        let x1 = b.max_x.div_euclid(self.cell_nm);
-        let y0 = b.min_y.div_euclid(self.cell_nm);
-        let y1 = b.max_y.div_euclid(self.cell_nm);
-        let dx = x1.saturating_sub(x0).saturating_add(1);
-        let dy = y1.saturating_sub(y0).saturating_add(1);
-        if dx <= 0 || dy <= 0 || dx.saturating_mul(dy) > 256 {
-            self.globals.push(idx);
-        } else {
-            for gx in x0..=x1 {
-                for gy in y0..=y1 {
-                    self.cells.entry((gx, gy)).or_default().push(idx);
-                }
+            let idx = len as u32;
+            len += 1;
+            let x0 = b.min_x.div_euclid(cell_nm);
+            let x1 = b.max_x.div_euclid(cell_nm);
+            let y0 = b.min_y.div_euclid(cell_nm);
+            let y1 = b.max_y.div_euclid(cell_nm);
+            let dx = x1.saturating_sub(x0).saturating_add(1);
+            let dy = y1.saturating_sub(y0).saturating_add(1);
+            if dx <= 0 || dy <= 0 || dx.saturating_mul(dy) > 256 {
+                globals.push(idx);
+            } else {
+                min_gx = min_gx.min(x0);
+                max_gx = max_gx.max(x1);
+                min_gy = min_gy.min(y0);
+                max_gy = max_gy.max(y1);
+                entries.push((idx, x0, x1, y0, y1));
             }
         }
+
+        if entries.is_empty() {
+            return Self {
+                cell_nm,
+                len,
+                globals,
+                storage: GridStorage::Dense {
+                    origin_gx: 0,
+                    origin_gy: 0,
+                    cols: 0,
+                    rows: 0,
+                    offsets: Vec::new(),
+                    items: Vec::new(),
+                },
+            };
+        }
+
+        let span_x = max_gx.saturating_sub(min_gx).saturating_add(1);
+        let span_y = max_gy.saturating_sub(min_gy).saturating_add(1);
+        let storage = if span_x > 0 && span_y > 0 && span_x.saturating_mul(span_y) <= 262_144 {
+            let cols = span_x as usize;
+            let rows = span_y as usize;
+            let n_cells = cols * rows;
+            let mut offsets = vec![0u32; n_cells + 1];
+            for &(_, x0, x1, y0, y1) in &entries {
+                let cx0 = (x0 - min_gx) as usize;
+                let cx1 = (x1 - min_gx) as usize;
+                let cy0 = (y0 - min_gy) as usize;
+                let cy1 = (y1 - min_gy) as usize;
+                for cy in cy0..=cy1 {
+                    let row = cy * cols;
+                    for cx in cx0..=cx1 {
+                        offsets[row + cx + 1] += 1;
+                    }
+                }
+            }
+            for i in 1..=n_cells {
+                offsets[i] += offsets[i - 1];
+            }
+            let mut items = vec![0u32; offsets[n_cells] as usize];
+            for &(idx, x0, x1, y0, y1) in &entries {
+                let cx0 = (x0 - min_gx) as usize;
+                let cx1 = (x1 - min_gx) as usize;
+                let cy0 = (y0 - min_gy) as usize;
+                let cy1 = (y1 - min_gy) as usize;
+                for cy in cy0..=cy1 {
+                    let row = cy * cols;
+                    for cx in cx0..=cx1 {
+                        let cell = row + cx;
+                        let pos = offsets[cell] as usize;
+                        items[pos] = idx;
+                        offsets[cell] += 1;
+                    }
+                }
+            }
+            offsets.copy_within(0..n_cells, 1);
+            offsets[0] = 0;
+            GridStorage::Dense {
+                origin_gx: min_gx,
+                origin_gy: min_gy,
+                cols,
+                rows,
+                offsets,
+                items,
+            }
+        } else {
+            let mut map: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
+            for &(idx, x0, x1, y0, y1) in &entries {
+                for gx in x0..=x1 {
+                    for gy in y0..=y1 {
+                        map.entry((gx, gy)).or_default().push(idx);
+                    }
+                }
+            }
+            GridStorage::Sparse(map)
+        };
+
+        Self {
+            cell_nm,
+            len,
+            globals,
+            storage,
+        }
     }
 
-    pub(crate) fn query(&mut self, bbox: BBoxNm, out: &mut Vec<usize>) {
+    #[inline]
+    fn cell_slice(&self, gx: i64, gy: i64) -> &[u32] {
+        match &self.storage {
+            GridStorage::Dense {
+                origin_gx,
+                origin_gy,
+                cols,
+                rows,
+                offsets,
+                items,
+            } => {
+                let cx = gx - *origin_gx;
+                let cy = gy - *origin_gy;
+                if cx < 0 || cy < 0 || cx >= *cols as i64 || cy >= *rows as i64 {
+                    return &[];
+                }
+                let cell = (cy as usize) * (*cols) + (cx as usize);
+                &items[offsets[cell] as usize..offsets[cell + 1] as usize]
+            }
+            GridStorage::Sparse(map) => map.get(&(gx, gy)).map_or(&[], Vec::as_slice),
+        }
+    }
+
+    /// Queries all candidate indices intersecting `pt` without any scratch buffer.
+    pub(crate) fn query_point_any(&self, pt: Pt, mut pred: impl FnMut(usize) -> bool) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        for &idx in &self.globals {
+            if pred(idx as usize) {
+                return true;
+            }
+        }
+        let gx = pt.x.div_euclid(self.cell_nm);
+        let gy = pt.y.div_euclid(self.cell_nm);
+        for &idx in self.cell_slice(gx, gy) {
+            if pred(idx as usize) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn query_with(
+        &self,
+        bbox: BBoxNm,
+        scratch: &mut GridQueryScratch,
+        out: &mut Vec<usize>,
+    ) {
         out.clear();
+        if self.len == 0 {
+            return;
+        }
         let x0 = bbox.min_x.div_euclid(self.cell_nm);
         let x1 = bbox.max_x.div_euclid(self.cell_nm);
         let y0 = bbox.min_y.div_euclid(self.cell_nm);
@@ -355,27 +499,34 @@ impl SpatialGrid {
         let dx = x1.saturating_sub(x0).saturating_add(1);
         let dy = y1.saturating_sub(y0).saturating_add(1);
         if dx <= 0 || dy <= 0 || dx.saturating_mul(dy) > 256 {
-            out.extend(0..self.seen.len());
+            out.extend(0..self.len);
             return;
         }
-        self.stamp = self.stamp.wrapping_add(1);
-        if self.stamp == 0 {
-            self.seen.fill(0);
-            self.stamp = 1;
+        if x0 == x1 && y0 == y1 && self.globals.is_empty() {
+            out.extend(self.cell_slice(x0, y0).iter().map(|&idx| idx as usize));
+            return;
         }
-        let s = self.stamp;
+        if scratch.seen.len() < self.len {
+            scratch.seen.resize(self.len, 0);
+        }
+        scratch.stamp = scratch.stamp.wrapping_add(1);
+        if scratch.stamp == 0 {
+            scratch.seen[..self.len].fill(0);
+            scratch.stamp = 1;
+        }
+        let s = scratch.stamp;
         for &idx in &self.globals {
-            self.seen[idx] = s;
-            out.push(idx);
+            let ui = idx as usize;
+            scratch.seen[ui] = s;
+            out.push(ui);
         }
         for gx in x0..=x1 {
             for gy in y0..=y1 {
-                if let Some(list) = self.cells.get(&(gx, gy)) {
-                    for &idx in list {
-                        if self.seen[idx] != s {
-                            self.seen[idx] = s;
-                            out.push(idx);
-                        }
+                for &idx in self.cell_slice(gx, gy) {
+                    let ui = idx as usize;
+                    if scratch.seen[ui] != s {
+                        scratch.seen[ui] = s;
+                        out.push(ui);
                     }
                 }
             }
@@ -529,12 +680,19 @@ pub(crate) fn shape_edge_clearance(
     outline: &[Pt],
     cutouts: &[Vec<Pt>],
 ) -> (f64, bool) {
-    let ref_pt = shape.ref_pt();
-    let inside_outline = point_in_polygon(ref_pt, outline);
-    let strictly_in_cutout = cutouts
+    let pt_off_board = |p: Pt| {
+        !point_in_polygon(p, outline)
+            || cutouts
+                .iter()
+                .any(|c| point_in_polygon(p, c) && point_to_polygon_edge_dist(p, c) > EPS_NM)
+    };
+    if pt_off_board(shape.ref_pt()) {
+        return (0.0, true);
+    }
+    let encloses_cutout = cutouts
         .iter()
-        .any(|c| point_in_polygon(ref_pt, c) && point_to_polygon_edge_dist(ref_pt, c) > EPS_NM);
-    if !inside_outline || strictly_in_cutout {
+        .any(|c| !c.is_empty() && c.iter().all(|&p| shape.contains_pt(p)));
+    if encloses_cutout {
         return (0.0, true);
     }
     let mut min_d = shape.dist_to_polygon_edge(outline);
@@ -542,27 +700,89 @@ pub(crate) fn shape_edge_clearance(
         min_d = min_d.min(shape.dist_to_polygon_edge(c));
     }
     if min_d > 0.0 {
-        let encloses_cutout = cutouts
-            .iter()
-            .any(|c| c.first().is_some_and(|&p| shape.dist_to_point(p) == 0.0));
-        return if encloses_cutout {
-            (0.0, true)
-        } else {
-            (min_d, false)
-        };
+        return (min_d, false);
     }
     let off_board = match shape {
         ResolvedShape::Circle { .. } => min_d < -EPS_NM,
         ResolvedShape::Capsule { a, b, .. } => {
-            min_d < -EPS_NM
-                || !point_in_polygon(*a, outline)
-                || !point_in_polygon(*b, outline)
-                || cutouts.iter().any(|c| {
-                    (point_in_polygon(*a, c) && point_to_polygon_edge_dist(*a, c) > EPS_NM)
-                        || (point_in_polygon(*b, c) && point_to_polygon_edge_dist(*b, c) > EPS_NM)
-                })
+            min_d < -EPS_NM || pt_off_board(*a) || pt_off_board(*b)
+        }
+        ResolvedShape::RoundRect { corners, .. } => {
+            min_d < -EPS_NM || corners.iter().any(|&c| pt_off_board(c))
         }
         ResolvedShape::Poly { verts, .. } => poly_extends_outside_board(verts, outline, cutouts),
     };
     (0.0, off_board)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spatial_grid_empty_globals_single_cell_and_sparse() {
+        let mut scratch = GridQueryScratch::default();
+        let mut out = Vec::new();
+
+        // Empty grid.
+        let empty = SpatialGrid::new(std::iter::empty(), 1_000_000);
+        empty.query_with(
+            BBoxNm::new(0, 0, 1_000_000, 1_000_000),
+            &mut scratch,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(!empty.query_point_any(Pt::new(0, 0), |_| true));
+
+        // Globals-only grid (item spans > 256 cells).
+        let globals = SpatialGrid::new([BBoxNm::new(0, 0, 20_000_000, 20_000_000)], 1_000_000);
+        globals.query_with(
+            BBoxNm::new(500_000, 500_000, 600_000, 600_000),
+            &mut scratch,
+            &mut out,
+        );
+        assert_eq!(out, vec![0]);
+        assert!(globals.query_point_any(Pt::new(15_000_000, 15_000_000), |i| i == 0));
+
+        // Single-cell fast path (no globals, query within one cell).
+        let dense = SpatialGrid::new(
+            [
+                BBoxNm::new(100_000, 100_000, 200_000, 200_000),
+                BBoxNm::new(300_000, 300_000, 400_000, 400_000),
+            ],
+            1_000_000,
+        );
+        assert!(matches!(dense.storage, GridStorage::Dense { .. }));
+        dense.query_with(
+            BBoxNm::new(150_000, 150_000, 350_000, 350_000),
+            &mut scratch,
+            &mut out,
+        );
+        assert_eq!(out, vec![0, 1]);
+
+        // Sparse storage when span_x * span_y > 262_144.
+        let sparse = SpatialGrid::new(
+            [
+                BBoxNm::new(0, 0, 100_000, 100_000),
+                BBoxNm::new(1_000_000_000, 1_000_000_000, 1_000_100_000, 1_000_100_000),
+            ],
+            1_000_000,
+        );
+        assert!(matches!(sparse.storage, GridStorage::Sparse(_)));
+        sparse.query_with(BBoxNm::new(0, 0, 50_000, 50_000), &mut scratch, &mut out);
+        assert_eq!(out, vec![0]);
+        sparse.query_with(
+            BBoxNm::new(1_000_000_000, 1_000_000_000, 1_000_050_000, 1_000_050_000),
+            &mut scratch,
+            &mut out,
+        );
+        assert_eq!(out, vec![1]);
+        sparse.query_with(
+            BBoxNm::new(500_000_000, 500_000_000, 500_100_000, 500_100_000),
+            &mut scratch,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(sparse.query_point_any(Pt::new(1_000_050_000, 1_000_050_000), |i| i == 1));
+    }
 }

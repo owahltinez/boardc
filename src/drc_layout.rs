@@ -1,10 +1,12 @@
 use crate::drc::{Severity, Violation, ViolationKind};
-use crate::drc_scene::{KeepoutItem, PadItem, PourItem, TrackItem, ViaItem};
+use crate::drc_scene::{BoardEdgeIndex, DrcInputs, KeepoutItem};
 use crate::geom::{
-    EPS_NM, courtyard_world_polygon, point_in_polygon, polygon_to_polygon_dist,
-    polygon_violates_clearance, polys_overlap_area, pour_poly_overlaps_poly, shape_edge_clearance,
+    EPS_NM, GridQueryScratch, SpatialGrid, courtyard_world_polygon, point_in_polygon,
+    polygon_to_polygon_dist, polygon_violates_clearance, polys_overlap_area,
+    pour_poly_overlaps_poly,
 };
 use crate::ir::{BBoxNm, BoardIr, Nm, PadKind, Pt, Side};
+use crate::poly_index::indexed_shape_edge_clearance;
 use crate::shapes::ResolvedShape;
 
 pub(crate) fn keepout_matches_layer(layers: &[String], layer: &str) -> bool {
@@ -41,16 +43,29 @@ fn push_keepout(
 
 pub(crate) fn check_keepouts(
     board: &BoardIr,
-    tracks: &[TrackItem<'_>],
-    pads: &[PadItem],
-    vias: &[ViaItem],
-    pours: &[PourItem<'_>],
+    inputs: &DrcInputs<'_>,
     keepouts: &[KeepoutItem],
     out: &mut Vec<Violation>,
 ) {
+    if keepouts.is_empty() {
+        return;
+    }
+    let (tracks, pads, vias, pours, grids) = (
+        inputs.tracks,
+        inputs.pads,
+        inputs.vias,
+        inputs.pours,
+        inputs.grids,
+    );
+    let mut scratch = GridQueryScratch::default();
+    let mut candidates = Vec::new();
     for ko in keepouts {
         if ko.kind.blocks_tracks() {
-            for tr in tracks {
+            grids
+                .track_grid
+                .query_with(ko.bbox, &mut scratch, &mut candidates);
+            for &ti in &candidates {
+                let tr = &tracks[ti];
                 if !keepout_matches_layer(&ko.layers, tr.layer) || !tr.bbox.intersects(ko.bbox) {
                     continue;
                 }
@@ -70,7 +85,11 @@ pub(crate) fn check_keepouts(
             }
         }
         if ko.kind.blocks_vias() {
-            for (vi, via) in vias.iter().enumerate() {
+            grids
+                .via_grid
+                .query_with(ko.bbox, &mut scratch, &mut candidates);
+            for &vi in &candidates {
+                let via = &vias[vi];
                 let raw_via = &board.vias[vi];
                 let ok_layer = ko.layers.is_empty()
                     || ko
@@ -94,7 +113,11 @@ pub(crate) fn check_keepouts(
             }
         }
         if ko.kind.blocks_pads() {
-            for pad in pads {
+            grids
+                .pad_grid
+                .query_with(ko.bbox, &mut scratch, &mut candidates);
+            for &pi in &candidates {
+                let pad = &pads[pi];
                 if pad.kind == PadKind::Npth || !pad.bbox.intersects(ko.bbox) {
                     continue;
                 }
@@ -148,6 +171,7 @@ pub(crate) fn check_keepouts(
 pub(crate) fn check_courtyards_and_component_edges(
     board: &BoardIr,
     keepouts: &[KeepoutItem],
+    edge_idx: Option<&BoardEdgeIndex>,
     out: &mut Vec<Violation>,
 ) {
     let mut courtyards: Vec<(usize, Vec<Pt>, BBoxNm)> = Vec::new();
@@ -166,12 +190,24 @@ pub(crate) fn check_courtyards_and_component_edges(
     }
 
     let cy_clr = board.rules.courtyard_clearance_nm;
+    let cy_grid = SpatialGrid::new(courtyards.iter().map(|c| c.2), 2_000_000);
+    let ko_grid = (!keepouts.is_empty())
+        .then(|| SpatialGrid::new(keepouts.iter().map(|k| k.bbox), 2_000_000));
+    let mut scratch = GridQueryScratch::default();
+    let mut candidates = Vec::new();
+
     for i in 0..courtyards.len() {
         let (ia, ref cya, bba) = courtyards[i];
         let pla = &board.placements[ia];
-        for (ib, cyb, bbb) in &courtyards[(i + 1)..] {
-            let plb = &board.placements[*ib];
-            if pla.side != plb.side || !bba.expand(cy_clr).intersects(*bbb) {
+        let bba_exp = bba.expand(cy_clr);
+        cy_grid.query_with(bba_exp, &mut scratch, &mut candidates);
+        for &j in &candidates {
+            if j <= i {
+                continue;
+            }
+            let (ib, ref cyb, bbb) = courtyards[j];
+            let plb = &board.placements[ib];
+            if pla.side != plb.side || !bba_exp.intersects(bbb) {
                 continue;
             }
             if polygon_violates_clearance(cya, cyb, cy_clr) {
@@ -194,33 +230,40 @@ pub(crate) fn check_courtyards_and_component_edges(
                 });
             }
         }
-        for ko in keepouts {
-            if ko.kind.blocks_placement()
-                && keepout_matches_side(&ko.layers, pla.side)
-                && bba.intersects(ko.bbox)
-                && !ko.label.starts_with(&format!("{}.", pla.refdes))
-                && polys_overlap_area(cya, &ko.poly) > 0.0
-            {
-                out.push(Violation {
-                    kind: ViolationKind::Keepout,
-                    severity: Severity::Error,
-                    layer: pla.side.cu_layer().to_string(),
-                    pos_nm: pla.pos,
-                    measured_nm: 0,
-                    required_nm: 1,
-                    item_a: pla.refdes.clone(),
-                    item_b: Some(ko.label.clone()),
-                    net_a: String::new(),
-                    net_b: String::new(),
-                    message: format!("placement {} violates {}", pla.refdes, ko.label),
-                });
+        if let Some(ref kg) = ko_grid {
+            kg.query_with(bba, &mut scratch, &mut candidates);
+            for &ki in &candidates {
+                let ko = &keepouts[ki];
+                if ko.kind.blocks_placement()
+                    && keepout_matches_side(&ko.layers, pla.side)
+                    && bba.intersects(ko.bbox)
+                    && !ko
+                        .label
+                        .strip_prefix(&pla.refdes)
+                        .is_some_and(|rest| rest.starts_with('.'))
+                    && polys_overlap_area(cya, &ko.poly) > 0.0
+                {
+                    out.push(Violation {
+                        kind: ViolationKind::Keepout,
+                        severity: Severity::Error,
+                        layer: pla.side.cu_layer().to_string(),
+                        pos_nm: pla.pos,
+                        measured_nm: 0,
+                        required_nm: 1,
+                        item_a: pla.refdes.clone(),
+                        item_b: Some(ko.label.clone()),
+                        net_a: String::new(),
+                        net_b: String::new(),
+                        message: format!("placement {} violates {}", pla.refdes, ko.label),
+                    });
+                }
             }
         }
-        if board.outline.len() >= 3 {
+        if let Some(edge) = edge_idx {
             let violation_meas = if !pla.allow_edge_overhang {
                 let cy_shape = ResolvedShape::polygon(cya.clone());
                 let (dist, off_board) =
-                    shape_edge_clearance(&cy_shape, &board.outline, &board.cutouts);
+                    indexed_shape_edge_clearance(&cy_shape, &edge.outline, &edge.cutouts, cy_clr);
                 if off_board {
                     Some(0)
                 } else if cy_clr > 0 && dist < cy_clr as f64 - EPS_NM {

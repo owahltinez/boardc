@@ -1,20 +1,20 @@
 use std::collections::BTreeSet;
 
 use clipper2_rust::{
-    EndType, FillRule, JoinType, Paths64, difference_64, inflate_paths_64, intersect_64,
+    ClipType, EndType, FillRule, JoinType, Paths64, difference_64, inflate_paths_64, intersect_64,
     simplify_paths, union_subjects_64,
 };
 
 use crate::geom::{
-    ensure_ccw, path64_to_pts, point_to_polygon_dist, polygon_to_polygon_dist, pts_to_path64,
-    segment_to_polygon_dist,
+    GridQueryScratch, SpatialGrid, ensure_ccw, path64_to_pts, point_to_polygon_dist,
+    polygon_to_polygon_dist, pts_to_path64, segment_to_polygon_dist,
 };
 use crate::ir::{BBoxNm, BoardIr, FilledPour, Nm, PourPoly, PourSpec, Pt};
 use crate::poly_index::{IndexedPour, IndexedRing};
 use crate::zone_scene::{
-    ARC_TOLERANCE, LayerScene, Obstacle, add_cutout_obstacles, build_board_copper_region,
-    collect_layer_scene, indexed_pour_intersects_terminal, match_pour_specs, paths_to_pour_polys,
-    pour_poly_area, pour_poly_to_paths64,
+    ARC_TOLERANCE, LayerScene, Obstacle, add_cutout_obstacles, boolean_op_to_pour_polys,
+    build_board_copper_region, collect_layer_scene, indexed_pour_intersects_terminal,
+    match_pour_specs, paths_to_pour_polys, pour_poly_area, pour_poly_to_paths64,
 };
 use crate::zones::{BlockerRef, ChokeKind, ZoneChoke};
 
@@ -99,6 +99,14 @@ fn obstacle_touches_ring(obs: &Obstacle, obs_pts: &[Pt], ring: &IndexedRing, mar
     ring.min_dist_to_poly_edges_bounded(obs_pts, obs.cleared_bbox, margin) <= margin as f64
 }
 
+fn get_obs_poly<'a>(
+    obstacles: &[Obstacle],
+    cache: &'a mut [Option<Vec<Pt>>],
+    idx: usize,
+) -> &'a [Pt] {
+    cache[idx].get_or_insert_with(|| path64_to_pts(&obstacles[idx].cleared_poly))
+}
+
 fn find_split_blockers(
     ring_a: &IndexedRing,
     ring_b: &IndexedRing,
@@ -108,29 +116,43 @@ fn find_split_blockers(
 ) -> Vec<BlockerRef> {
     let mid = Pt::new((pa.x + pb.x) / 2, (pa.y + pb.y) / 2);
     let margin = 120_000;
-    let obs_polys: Vec<Vec<Pt>> = obstacles
-        .iter()
-        .map(|o| path64_to_pts(&o.cleared_poly))
-        .collect();
+    let mut obs_polys: Vec<Option<Vec<Pt>>> = vec![None; obstacles.len()];
 
-    let touches_a: Vec<bool> = obstacles
-        .iter()
-        .enumerate()
-        .map(|(i, o)| obstacle_touches_ring(o, &obs_polys[i], ring_a, margin))
-        .collect();
-    let touches_b: Vec<bool> = obstacles
-        .iter()
-        .enumerate()
-        .map(|(i, o)| obstacle_touches_ring(o, &obs_polys[i], ring_b, margin))
-        .collect();
+    let ring_a_exp = ring_a.bbox.expand(margin);
+    let ring_b_exp = ring_b.bbox.expand(margin);
+    let mut touches_a = vec![false; obstacles.len()];
+    let mut touches_b = vec![false; obstacles.len()];
+    for (i, o) in obstacles.iter().enumerate() {
+        if ring_a_exp.intersects(o.cleared_bbox) {
+            let pts = get_obs_poly(obstacles, &mut obs_polys, i);
+            touches_a[i] = obstacle_touches_ring(o, pts, ring_a, margin);
+        }
+        if ring_b_exp.intersects(o.cleared_bbox) {
+            let pts = get_obs_poly(obstacles, &mut obs_polys, i);
+            touches_b[i] = obstacle_touches_ring(o, pts, ring_b, margin);
+        }
+    }
 
+    let grid = SpatialGrid::new(obstacles.iter().map(|o| o.cleared_bbox), 2_000_000);
+    let mut scratch = GridQueryScratch::default();
+    let mut cands = Vec::new();
     let mut adj = vec![Vec::new(); obstacles.len()];
     for i in 0..obstacles.len() {
         let bi = obstacles[i].cleared_bbox.expand(margin);
-        for j in (i + 1)..obstacles.len() {
-            if bi.intersects(obstacles[j].cleared_bbox)
-                && polygon_to_polygon_dist(&obs_polys[i], &obs_polys[j]) <= margin as f64
-            {
+        grid.query_with(bi, &mut scratch, &mut cands);
+        for &j in &cands {
+            if j <= i || !bi.intersects(obstacles[j].cleared_bbox) {
+                continue;
+            }
+            if obs_polys[i].is_none() {
+                obs_polys[i] = Some(path64_to_pts(&obstacles[i].cleared_poly));
+            }
+            if obs_polys[j].is_none() {
+                obs_polys[j] = Some(path64_to_pts(&obstacles[j].cleared_poly));
+            }
+            let pi = obs_polys[i].as_deref().unwrap();
+            let pj = obs_polys[j].as_deref().unwrap();
+            if polygon_to_polygon_dist(pi, pj) <= margin as f64 {
                 adj[i].push(j);
                 adj[j].push(i);
             }
@@ -152,7 +174,8 @@ fn find_split_blockers(
             if !obs.cleared_bbox.intersects(seg_box) {
                 continue;
             }
-            let d = segment_to_polygon_dist(pa, pb, &obs_polys[i]);
+            let pts = get_obs_poly(obstacles, &mut obs_polys, i);
+            let d = segment_to_polygon_dist(pa, pb, pts);
             if d <= gap_limit {
                 refs.push(blocker_ref(obs, mid));
             }
@@ -176,7 +199,7 @@ fn bridge_connected_thermal_moats(
     if !sp.thermal_relief || sp.thermal_gap_nm <= 0 || term_indices.is_empty() {
         return island_paths.clone();
     }
-    let mut moats = Paths64::new();
+    let mut term_polys = Paths64::new();
     let mut moat_bbox: Option<BBoxNm> = None;
     for &t_idx in term_indices {
         let term = &scene.terminals[t_idx];
@@ -185,18 +208,19 @@ fn bridge_connected_thermal_moats(
         }
         let tb = term.bbox.expand(sp.thermal_gap_nm + 10_000);
         moat_bbox = Some(moat_bbox.map_or(tb, |prev| prev.union(tb)));
-        moats.extend(inflate_paths_64(
-            &vec![term.poly.clone()],
-            sp.thermal_gap_nm as f64 + 5_000.0,
-            JoinType::Round,
-            EndType::Polygon,
-            2.0,
-            ARC_TOLERANCE,
-        ));
+        term_polys.push(term.poly.clone());
     }
     let Some(mb) = moat_bbox else {
         return island_paths.clone();
     };
+    let moats = inflate_paths_64(
+        &term_polys,
+        sp.thermal_gap_nm as f64 + 5_000.0,
+        JoinType::Round,
+        EndType::Polygon,
+        2.0,
+        ARC_TOLERANCE,
+    );
     let clipped_moats = if sp.outline.len() >= 3 && !board_region.is_empty() {
         let mut out = sp.outline.clone();
         ensure_ccw(&mut out);
@@ -374,12 +398,11 @@ fn check_island_narrow_neck(
             ARC_TOLERANCE,
         )
     };
-    let opened = if dilated.is_empty() {
-        Paths64::new()
+    let opened_polys = if dilated.is_empty() {
+        Vec::new()
     } else {
-        intersect_64(&dilated, &test_paths, FillRule::NonZero)
+        boolean_op_to_pour_polys(ClipType::Intersection, &dilated, &test_paths)
     };
-    let opened_polys = paths_to_pour_polys(&opened);
     let opened_idx: Vec<IndexedPour> = opened_polys.iter().map(IndexedPour::new).collect();
 
     let min_comp_area = (ctx.min_neck_width as f64 * 0.25).powi(2);
@@ -415,8 +438,11 @@ fn check_island_narrow_neck(
         return None;
     }
 
-    let dropped_paths = difference_64(&test_paths, &opened, FillRule::NonZero);
-    let dropped_polys = paths_to_pour_polys(&dropped_paths);
+    let mut opened_paths = Paths64::new();
+    for p in &opened_polys {
+        opened_paths.extend(pour_poly_to_paths64(p));
+    }
+    let dropped_polys = boolean_op_to_pour_polys(ClipType::Difference, &test_paths, &opened_paths);
     let mut best_bridge: Option<&PourPoly> = None;
     if opened_idx.len() >= 2 {
         for dp in &dropped_polys {
@@ -505,15 +531,27 @@ fn check_island_narrow_neck(
     })
 }
 
+pub(crate) struct PourChokeInput<'a> {
+    pub board_region: &'a Paths64,
+    pub scene: &'a LayerScene,
+    pub indexed_islands: &'a [IndexedPour],
+    pub precomputed_island_terms: Option<&'a [Vec<usize>]>,
+    pub min_neck_override: Option<Nm>,
+}
+
 pub(crate) fn analyze_single_pour_chokes(
     board: &BoardIr,
     filled: &FilledPour,
     spec: Option<&PourSpec>,
-    board_region: &Paths64,
-    scene: &LayerScene,
-    indexed_islands: &[IndexedPour],
-    min_neck_override: Option<Nm>,
+    input: &PourChokeInput<'_>,
 ) -> Vec<ZoneChoke> {
+    let (board_region, scene, indexed_islands, precomputed_island_terms, min_neck_override) = (
+        input.board_region,
+        input.scene,
+        input.indexed_islands,
+        input.precomputed_island_terms,
+        input.min_neck_override,
+    );
     let mut chokes = Vec::new();
     let pour_name = spec
         .filter(|s| !s.name.is_empty())
@@ -523,18 +561,24 @@ pub(crate) fn analyze_single_pour_chokes(
     let min_neck_width = min_neck_override
         .unwrap_or_else(|| (base_min_width * 2).max(board.net_track_width(&filled.net) * 2));
 
-    let island_terms: Vec<Vec<usize>> = indexed_islands
-        .iter()
-        .map(|ip| {
-            scene
-                .terminals
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| indexed_pour_intersects_terminal(ip, t))
-                .map(|(i, _)| i)
-                .collect()
-        })
-        .collect();
+    let computed_terms: Vec<Vec<usize>>;
+    let island_terms: &[Vec<usize>] = if let Some(pre) = precomputed_island_terms {
+        pre
+    } else {
+        computed_terms = indexed_islands
+            .iter()
+            .map(|ip| {
+                scene
+                    .terminals
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| indexed_pour_intersects_terminal(ip, t))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .collect();
+        &computed_terms
+    };
 
     if filled.polys.len() >= 2 {
         let main_idx = (0..filled.polys.len())
@@ -644,8 +688,21 @@ pub(crate) fn analyze_zone_chokes_with_min_neck(
                 let region_ref = &board_region;
                 s.spawn(move || {
                     let pour_clr_opt = spec.and_then(|s| s.clearance_nm);
-                    let mut scene =
-                        collect_layer_scene(board, &filled.layer, &filled.net, pour_clr_opt);
+                    let base_min_width = spec.map(|s| s.min_width_nm).unwrap_or(200_000);
+                    let min_neck_width = min_neck_override.unwrap_or_else(|| {
+                        (base_min_width * 2).max(board.net_track_width(&filled.net) * 2)
+                    });
+                    let scene_margin = 500_000.max(min_neck_width + 150_000);
+                    let outline_bbox = spec
+                        .filter(|s| s.outline.len() >= 3)
+                        .map(|s| BBoxNm::from_pts(&s.outline).expand(scene_margin));
+                    let mut scene = collect_layer_scene(
+                        board,
+                        &filled.layer,
+                        &filled.net,
+                        pour_clr_opt,
+                        outline_bbox,
+                    );
                     add_cutout_obstacles(board, &mut scene.obstacles);
                     let indexed: Vec<IndexedPour> =
                         filled.polys.iter().map(IndexedPour::new).collect();
@@ -653,10 +710,13 @@ pub(crate) fn analyze_zone_chokes_with_min_neck(
                         board,
                         filled,
                         spec,
-                        region_ref,
-                        &scene,
-                        &indexed,
-                        min_neck_override,
+                        &PourChokeInput {
+                            board_region: region_ref,
+                            scene: &scene,
+                            indexed_islands: &indexed,
+                            precomputed_island_terms: None,
+                            min_neck_override,
+                        },
                     )
                 })
             })
@@ -668,4 +728,134 @@ pub(crate) fn analyze_zone_chokes_with_min_neck(
     });
 
     results.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::Via;
+
+    #[test]
+    fn analyze_zone_chokes_handles_stub_outline_and_boundary_blockers() {
+        // Case 1: Stub PourSpec outline (len < 3) must not cull blockers far from (0, 0).
+        let mut stub_board: BoardIr = serde_json::from_str(
+            r#"{"name":"t","outline":[],"layers":[],"footprints":{},"placements":[]}"#,
+        )
+        .unwrap();
+        stub_board.outline = vec![
+            Pt::new(0, 0),
+            Pt::new(30_000_000, 0),
+            Pt::new(30_000_000, 10_000_000),
+            Pt::new(0, 10_000_000),
+        ];
+        stub_board.pours.push(PourSpec {
+            name: "GND".into(),
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            outline: vec![Pt::new(0, 0), Pt::new(100_000, 0)],
+            ..Default::default()
+        });
+        stub_board.vias.push(Via {
+            net: "SIG".into(),
+            pos: Pt::new(20_000_000, 5_000_000),
+            diameter: 600_000,
+            drill: 300_000,
+            layers: ("F.Cu".into(), "B.Cu".into()),
+            locked: false,
+            tented: true,
+        });
+        stub_board.filled_pours.push(FilledPour {
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            priority: 0,
+            polys: vec![
+                PourPoly {
+                    outer: vec![
+                        Pt::new(18_000_000, 4_000_000),
+                        Pt::new(19_500_000, 4_000_000),
+                        Pt::new(19_500_000, 6_000_000),
+                        Pt::new(18_000_000, 6_000_000),
+                    ],
+                    holes: Vec::new(),
+                },
+                PourPoly {
+                    outer: vec![
+                        Pt::new(20_500_000, 4_000_000),
+                        Pt::new(22_000_000, 4_000_000),
+                        Pt::new(22_000_000, 6_000_000),
+                        Pt::new(20_500_000, 6_000_000),
+                    ],
+                    holes: Vec::new(),
+                },
+            ],
+        });
+        let stub_chokes = analyze_zone_chokes_with_min_neck(&stub_board, None);
+        assert_eq!(stub_chokes.len(), 1);
+        assert!(!stub_chokes[0].blockers.is_empty());
+
+        // Case 2: Blocker via just outside outline_bbox is kept via choke-search margin.
+        let mut bnd_board: BoardIr = serde_json::from_str(
+            r#"{"name":"t","outline":[],"layers":[],"footprints":{},"placements":[]}"#,
+        )
+        .unwrap();
+        bnd_board.outline = vec![
+            Pt::new(0, 0),
+            Pt::new(10_000_000, 0),
+            Pt::new(10_000_000, 10_000_000),
+            Pt::new(0, 10_000_000),
+        ];
+        bnd_board.rules.clearance_nm = 100_000;
+        let pour_outline = vec![
+            Pt::new(1_000_000, 1_000_000),
+            Pt::new(9_000_000, 1_000_000),
+            Pt::new(9_000_000, 5_000_000),
+            Pt::new(1_000_000, 5_000_000),
+        ];
+        bnd_board.pours.push(PourSpec {
+            name: "PWR".into(),
+            net: "VCC".into(),
+            layer: "F.Cu".into(),
+            outline: pour_outline,
+            ..Default::default()
+        });
+        // Via cleared_bbox min_y = 5_250_000 - 200_000 = 5_050_000 > pour max_y (5_000_000), within 120um margin.
+        bnd_board.vias.push(Via {
+            net: "SIG".into(),
+            pos: Pt::new(5_000_000, 5_250_000),
+            diameter: 200_000,
+            drill: 100_000,
+            layers: ("F.Cu".into(), "B.Cu".into()),
+            locked: false,
+            tented: true,
+        });
+        bnd_board.filled_pours.push(FilledPour {
+            net: "VCC".into(),
+            layer: "F.Cu".into(),
+            priority: 0,
+            polys: vec![
+                PourPoly {
+                    outer: vec![
+                        Pt::new(1_000_000, 1_000_000),
+                        Pt::new(4_900_000, 1_000_000),
+                        Pt::new(4_900_000, 5_000_000),
+                        Pt::new(1_000_000, 5_000_000),
+                    ],
+                    holes: Vec::new(),
+                },
+                PourPoly {
+                    outer: vec![
+                        Pt::new(5_100_000, 1_000_000),
+                        Pt::new(9_000_000, 1_000_000),
+                        Pt::new(9_000_000, 5_000_000),
+                        Pt::new(5_100_000, 5_000_000),
+                    ],
+                    holes: Vec::new(),
+                },
+            ],
+        });
+        let bnd_chokes = analyze_zone_chokes_with_min_neck(&bnd_board, None);
+        assert_eq!(bnd_chokes.len(), 1);
+        assert_eq!(bnd_chokes[0].blockers.len(), 1);
+        assert!(bnd_chokes[0].blockers[0].label.starts_with("via#0"));
+    }
 }

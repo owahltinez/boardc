@@ -11,7 +11,10 @@ use viahop::{
 
 use crate::drc_constraints::count_length_violations;
 use crate::drc_dangling::CopperContext;
-use crate::drc_scene::{PourItem, collect_pads, collect_pours, collect_tracks, collect_vias};
+use crate::drc_scene::{
+    NetClearance, PourItem, collect_drc_grids, collect_pads, collect_pours, collect_tracks,
+    collect_vias, layer_mask_for_name,
+};
 use crate::geom::EPS_NM;
 use crate::ir::{BoardIr, Nm, PourPoly, Pt, Track, Via, nm_to_um, um};
 use crate::poly_index::IndexedPour;
@@ -282,7 +285,7 @@ fn prune_dead_end_stubs(
     let (alive_tracks, alive_vias) = {
         let cu_layers = board.copper_layer_names();
         let pads = collect_pads(board, &cu_layers);
-        let vias = collect_vias(board);
+        let vias = collect_vias(board, &cu_layers);
         let unfilled_polys: Vec<(&str, &str, PourPoly)> = if board.filled_pours.is_empty() {
             board
                 .pours
@@ -309,22 +312,27 @@ fn prune_dead_end_stubs(
                 .map(|(id, (net, layer, poly))| {
                     let indexed = IndexedPour::new(poly);
                     let bbox = indexed.outer.bbox;
+                    let (layer_idx, layer_mask) = layer_mask_for_name(layer, &cu_layers);
                     PourItem {
                         label: format!("unfilled_pour#{id}"),
                         net,
                         layer,
+                        layer_idx,
+                        layer_mask,
                         poly,
                         bbox,
                         indexed,
                         clearance_override: None,
+                        clr: NetClearance::of(board, net),
                     }
                 })
                 .collect()
         } else {
             collect_pours(board)
         };
-        let tracks = collect_tracks(board);
-        let mut ctx = CopperContext::new(board, &cu_layers, &pads, &vias, &pours, &tracks);
+        let tracks = collect_tracks(board, &cu_layers);
+        let grids = collect_drc_grids(&cu_layers, &pads, &vias, &tracks);
+        let mut ctx = CopperContext::new(board, &cu_layers, &pads, &vias, &pours, &tracks, &grids);
         let mut pruned_at: HashMap<(&str, &str, Pt), f64> = HashMap::new();
 
         loop {

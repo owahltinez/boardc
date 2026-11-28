@@ -9,7 +9,8 @@ use crate::drc_constraints::check_cap_proximity;
 use crate::drc_layout::{check_courtyards_and_component_edges, check_keepouts};
 use crate::drc_rules::check_edge_clearances;
 use crate::drc_scene::{
-    collect_keepouts, collect_pads, collect_pours, collect_tracks, collect_vias,
+    BoardEdgeIndex, DrcInputs, collect_drc_grids, collect_keepouts, collect_pads, collect_pours,
+    collect_tracks, collect_vias,
 };
 use crate::erc::{ErcViolation, check_board_erc};
 use crate::ir::{BoardIr, LayerKind, Pt};
@@ -92,23 +93,41 @@ pub fn run_preflight(
     let cu_layers = board.copper_layer_names();
 
     let pads = collect_pads(board, &cu_layers);
-    let tracks = collect_tracks(board);
-    let vias = collect_vias(board);
+    let tracks = collect_tracks(board, &cu_layers);
+    let vias = collect_vias(board, &cu_layers);
     let pours = collect_pours(board);
     let keepouts = collect_keepouts(board);
+    let edge_idx = BoardEdgeIndex::new(board);
 
     let mut layout_violations = Vec::new();
-    check_courtyards_and_component_edges(board, &keepouts, &mut layout_violations);
-    check_keepouts(
+    check_courtyards_and_component_edges(
+        board,
+        &keepouts,
+        edge_idx.as_ref(),
+        &mut layout_violations,
+    );
+    if !keepouts.is_empty() {
+        let grids = collect_drc_grids(&cu_layers, &pads, &vias, &tracks);
+        let drc_inputs = DrcInputs {
+            cu_layers: &cu_layers,
+            tracks: &tracks,
+            pads: &pads,
+            vias: &vias,
+            pours: &pours,
+            grids: &grids,
+            max_clr: 0,
+        };
+        check_keepouts(board, &drc_inputs, &keepouts, &mut layout_violations);
+    }
+    check_edge_clearances(
         board,
         &tracks,
         &pads,
         &vias,
         &pours,
-        &keepouts,
+        edge_idx.as_ref(),
         &mut layout_violations,
     );
-    check_edge_clearances(board, &tracks, &pads, &vias, &pours, &mut layout_violations);
     check_cap_proximity(board, &pads, &mut layout_violations);
 
     let vboard = to_viahop_board(board, ignored_nets, None)?;

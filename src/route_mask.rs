@@ -69,7 +69,7 @@ fn offset_mask_shapes(
             b: pt_to_viahop(*b),
             radius: nm_to_um((*radius + offset_nm).max(0)),
         }],
-        ResolvedShape::Poly { verts, .. } => match pad.shape {
+        ResolvedShape::RoundRect { .. } | ResolvedShape::Poly { .. } => match pad.shape {
             PadShape::Rect { width, height } | PadShape::RoundRect { width, height, .. } => {
                 let wm = width + 2 * margin_nm;
                 let hm = height + 2 * margin_nm;
@@ -117,7 +117,8 @@ fn offset_mask_shapes(
                 )]
             }
             _ => {
-                let paths = vec![pts_to_path64(verts)];
+                let poly = mask_shape.to_polygon(16);
+                let paths = vec![pts_to_path64(&poly)];
                 let out = if offset_nm > 0 {
                     inflate_round_outer(&paths, offset_nm)
                 } else if margin_nm > 0 {
