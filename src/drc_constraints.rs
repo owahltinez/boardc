@@ -319,8 +319,37 @@ pub(crate) fn count_length_violations(board: &BoardIr) -> usize {
     out.len()
 }
 
-pub(crate) fn check_constraints(board: &BoardIr, pads: &[PadItem], out: &mut Vec<Violation>) {
-    let net_lengths = collect_net_lengths(board);
+fn check_max_vias(
+    board: &BoardIr,
+    vias_by_net: &HashMap<&str, Vec<usize>>,
+    out: &mut Vec<Violation>,
+) {
+    for rule in &board.constraints.max_vias {
+        for net in &rule.nets {
+            let Some(vis) = vias_by_net.get(net.as_str()) else {
+                continue;
+            };
+            let count = vis.len();
+            if count > rule.max_vias {
+                out.push(Violation {
+                    kind: ViolationKind::MaxVias,
+                    severity: Severity::Error,
+                    layer: String::new(),
+                    pos_nm: board.vias[vis[0]].pos,
+                    measured_nm: count as Nm,
+                    required_nm: rule.max_vias as Nm,
+                    item_a: format!("net:{net}"),
+                    item_b: None,
+                    net_a: net.clone(),
+                    net_b: String::new(),
+                    message: format!("net {net} has {count} vias > max {}", rule.max_vias),
+                });
+            }
+        }
+    }
+}
+
+fn collect_net_positions<'a>(board: &'a BoardIr, pads: &'a [PadItem]) -> BTreeMap<&'a str, Pt> {
     let mut net_pos: BTreeMap<&str, Pt> = BTreeMap::new();
     for t in &board.tracks {
         net_pos
@@ -332,6 +361,31 @@ pub(crate) fn check_constraints(board: &BoardIr, pads: &[PadItem], out: &mut Vec
             net_pos.entry(pad.net.as_str()).or_insert(pad.center);
         }
     }
+    net_pos
+}
+
+pub(crate) fn check_repair_constraints(
+    board: &BoardIr,
+    pads: &[PadItem],
+    out: &mut Vec<Violation>,
+) {
+    if !board.constraints.max_lengths.is_empty() || !board.constraints.match_groups.is_empty() {
+        let net_lengths = collect_net_lengths(board);
+        let net_pos = collect_net_positions(board, pads);
+        check_length_constraints(board, &net_lengths, &net_pos, out);
+    }
+    if !board.constraints.max_vias.is_empty() {
+        let mut vias_by_net: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (vi, v) in board.vias.iter().enumerate() {
+            vias_by_net.entry(v.net.as_str()).or_default().push(vi);
+        }
+        check_max_vias(board, &vias_by_net, out);
+    }
+}
+
+pub(crate) fn check_constraints(board: &BoardIr, pads: &[PadItem], out: &mut Vec<Violation>) {
+    let net_lengths = collect_net_lengths(board);
+    let net_pos = collect_net_positions(board, pads);
 
     check_length_constraints(board, &net_lengths, &net_pos, out);
 
@@ -445,29 +499,7 @@ pub(crate) fn check_constraints(board: &BoardIr, pads: &[PadItem], out: &mut Vec
         }
     }
 
-    for rule in &board.constraints.max_vias {
-        for net in &rule.nets {
-            let Some(vis) = vias_by_net.get(net.as_str()) else {
-                continue;
-            };
-            let count = vis.len();
-            if count > rule.max_vias {
-                out.push(Violation {
-                    kind: ViolationKind::MaxVias,
-                    severity: Severity::Error,
-                    layer: String::new(),
-                    pos_nm: board.vias[vis[0]].pos,
-                    measured_nm: count as Nm,
-                    required_nm: rule.max_vias as Nm,
-                    item_a: format!("net:{net}"),
-                    item_b: None,
-                    net_a: net.clone(),
-                    net_b: String::new(),
-                    message: format!("net {net} has {count} vias > max {}", rule.max_vias),
-                });
-            }
-        }
-    }
+    check_max_vias(board, &vias_by_net, out);
 
     for rule in &board.constraints.bga_shadows {
         let Some(&bga_idx) = pl_by_refdes.get(rule.bga_refdes.as_str()) else {

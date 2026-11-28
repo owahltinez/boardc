@@ -348,6 +348,23 @@ impl IndexedPour {
         self.outer.contains_pt(pt) && self.find_hole_containing_pt(pt).is_none()
     }
 
+    /// Exact minimum distance from `pt` to any outer or hole boundary edge within `max_dist`.
+    pub(crate) fn min_dist_to_boundary_bounded(&self, pt: Pt, max_dist: Nm) -> f64 {
+        let shape = ResolvedShape::Circle {
+            center: pt,
+            radius: 0,
+        };
+        let mut best = self.outer.min_dist_to_shape_bounded(&shape, max_dist);
+        let q = BBoxNm::from_pt(pt, max_dist.max(0));
+        self.any_hole_in_bbox(q, |h| {
+            if h.bbox.intersects(q) {
+                best = best.min(h.min_dist_to_shape_bounded(&shape, max_dist));
+            }
+            false
+        });
+        best
+    }
+
     /// Exact distance from a resolved shape to this pour if within `max_dist`, else `f64::INFINITY`.
     pub(crate) fn dist_to_shape_bounded(&self, shape: &ResolvedShape, max_dist: Nm) -> f64 {
         if self.outer.pts.len() < 3 {

@@ -2,12 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::f64::consts::PI;
 
 use crate::drc::{DEFAULT_CLUSTER_RADIUS_NM, Violation};
-use crate::geom::{
-    local_to_board, pad_copper_layers, pad_to_world_shape, point_in_polygon, point_to_polygon_dist,
-    point_to_segment_dist, segment_to_polygon_dist,
-};
-use crate::ir::{BoardIr, Keepout, KeepoutKind, Nm, PadKind, PourSpec, Pt};
-use crate::shapes::{capsule_poly, circle_poly};
+use crate::geom::{local_to_board, pad_copper_layers, pad_to_world_shape, point_to_segment_dist};
+use crate::ir::{BBoxNm, BoardIr, Keepout, KeepoutKind, Nm, PadKind, PourSpec, Pt};
+use crate::poly_index::{IndexedPour, IndexedRing};
+use crate::shapes::{ResolvedShape, capsule_poly, circle_poly};
 use crate::zones::{BlockerKind, ZoneChoke};
 
 const KEEPOUT_EXPAND_STEP_NM: Nm = 250_000;
@@ -301,21 +299,49 @@ fn parse_blocker_idx(label: &str, prefix: &str) -> Option<usize> {
     label.strip_prefix(prefix)?.split(':').next()?.parse().ok()
 }
 
-fn pt_touches_filled_pour(board: &BoardIr, net: &str, layer: &str, pt: Pt, radius: Nm) -> bool {
-    let tol = (radius.max(0) as f64) + 2_000.0;
-    for fp in &board.filled_pours {
-        if fp.net != net || fp.layer != layer {
-            continue;
+fn pt_touches_indexed_pours(pours: &[IndexedPour], pt: Pt, radius: Nm) -> bool {
+    let tol = radius.max(0) + 2_000;
+    let shape = ResolvedShape::Circle {
+        center: pt,
+        radius: tol,
+    };
+    pours.iter().any(|ip| {
+        if !ip.outer.bbox.expand(tol).contains_pt(pt) {
+            return false;
         }
-        for poly in &fp.polys {
-            if point_to_polygon_dist(pt, &poly.outer) <= tol
-                && !poly.holes.iter().any(|h| point_in_polygon(pt, h))
-            {
-                return true;
-            }
+        if ip.outer.contains_pt(pt) {
+            return ip.contains_pt(pt);
         }
+        ip.outer.min_dist_to_shape_bounded(&shape, 0) <= 0.0
+    })
+}
+
+fn outline_pt_within(outline: &IndexedRing, pt: Pt, max_dist: f64) -> bool {
+    let limit = max_dist.ceil() as Nm;
+    if !outline.bbox.expand(limit).contains_pt(pt) {
+        return false;
     }
-    false
+    if outline.contains_pt(pt) {
+        return true;
+    }
+    let shape = ResolvedShape::Circle {
+        center: pt,
+        radius: 0,
+    };
+    outline.min_dist_to_shape_bounded(&shape, limit) <= max_dist
+}
+
+fn outline_seg_within(outline: &IndexedRing, a: Pt, b: Pt, max_dist: f64) -> bool {
+    let limit = max_dist.ceil() as Nm;
+    let sb = BBoxNm::from_pts(&[a, b]).expand(limit);
+    if !outline.bbox.intersects(sb) {
+        return false;
+    }
+    if outline.contains_pt(a) || outline.contains_pt(b) {
+        return true;
+    }
+    let shape = ResolvedShape::Capsule { a, b, radius: 0 };
+    outline.min_dist_to_shape_bounded(&shape, limit) <= max_dist
 }
 
 fn collect_open_fallback_hotspot(
@@ -348,12 +374,19 @@ fn collect_open_fallback_hotspot(
 
     let mut best: Option<(f64, PourHotspot, Vec<Pt>)> = None;
     for spec in specs {
+        let outline_idx = IndexedRing::new(&spec.outline);
+        let indexed_pours: Vec<IndexedPour> = board
+            .filled_pours
+            .iter()
+            .filter(|fp| fp.net == spec.net && fp.layer == spec.layer)
+            .flat_map(|fp| fp.polys.iter().map(IndexedPour::new))
+            .collect();
         let pad_disconnected: Vec<Pt> = open_pads
             .iter()
             .filter(|p| {
                 p.layers.iter().any(|l| l == &spec.layer)
-                    && !pt_touches_filled_pour(board, &spec.net, &spec.layer, p.pos, p.radius)
-                    && point_to_polygon_dist(p.pos, &spec.outline) <= max_outline_dist
+                    && !pt_touches_indexed_pours(&indexed_pours, p.pos, p.radius)
+                    && outline_pt_within(&outline_idx, p.pos, max_outline_dist)
             })
             .map(|p| p.pos)
             .collect();
@@ -363,8 +396,8 @@ fn collect_open_fallback_hotspot(
             .filter(|v| {
                 v.net == spec.net
                     && v.touches_layer(&spec.layer, &board.layers)
-                    && !pt_touches_filled_pour(board, &spec.net, &spec.layer, v.pos, v.diameter / 2)
-                    && point_to_polygon_dist(v.pos, &spec.outline) <= max_outline_dist
+                    && !pt_touches_indexed_pours(&indexed_pours, v.pos, v.diameter / 2)
+                    && outline_pt_within(&outline_idx, v.pos, max_outline_dist)
             })
             .map(|v| {
                 let d = pad_centers
@@ -402,7 +435,7 @@ fn collect_open_fallback_hotspot(
             }
             let pour_clr = board.pour_pair_clearance(&spec.net, spec.clearance_nm, &via.net);
             let margin = (via.diameter / 2 + pour_clr + 50_000) as f64;
-            if point_to_polygon_dist(via.pos, &spec.outline) > margin {
+            if !outline_pt_within(&outline_idx, via.pos, margin) {
                 continue;
             }
             let dist = focus
@@ -433,7 +466,7 @@ fn collect_open_fallback_hotspot(
             }
             let pour_clr = board.pour_pair_clearance(&spec.net, spec.clearance_nm, &tr.net);
             let margin = (tr.width / 2 + pour_clr + 50_000) as f64;
-            if segment_to_polygon_dist(tr.a, tr.b, &spec.outline) > margin {
+            if !outline_seg_within(&outline_idx, tr.a, tr.b, margin) {
                 continue;
             }
             let mut best_pt = tr.a;

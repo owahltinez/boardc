@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use crate::drc::{Violation, ViolationKind};
 use crate::drc_scene::{
     ClearanceHit, DrcInputs, PadItem, PourItem, ViaItem, push_clearance_violation,
@@ -24,9 +22,9 @@ pub(crate) enum MaskOwner {
     Graphic(usize),
 }
 
-pub(crate) struct MaskOpening<'a> {
-    pub(crate) label: Cow<'a, str>,
-    pub(crate) net: &'a str,
+pub(crate) struct MaskOpening {
+    pub(crate) label: String,
+    pub(crate) net: String,
     pub(crate) center: Pt,
     pub(crate) shape: ResolvedShape,
     pub(crate) bbox: BBoxNm,
@@ -48,20 +46,17 @@ struct CopperTarget<'a> {
     kind: TargetKind,
 }
 
-pub(crate) fn collect_mask_openings<'a>(
-    board: &'a BoardIr,
+pub(crate) fn collect_pad_mask_openings(
+    board: &BoardIr,
     cu_layers: &[String],
-    pads: &'a [PadItem],
-    vias: &'a [ViaItem],
+    pads: &[PadItem],
     side: Side,
-    include_graphics: bool,
-) -> Vec<MaskOpening<'a>> {
+) -> Vec<MaskOpening> {
     let mask_name = match side {
         Side::Top => "F.Mask",
         Side::Bottom => "B.Mask",
     };
-    let cu_name = side.cu_layer();
-    let mut openings = Vec::new();
+    let mut out = Vec::new();
     let mut pad_cursor = 0usize;
     for (pl_idx, pl) in board.placements.iter().enumerate() {
         let Some(fp) = board.footprints.get(&pl.footprint) else {
@@ -79,13 +74,13 @@ pub(crate) fn collect_mask_openings<'a>(
             let margin = pad.mask_margin_nm.unwrap_or(board.rules.mask_expansion_nm);
             if let Some(shape) = pad_world_shape_with_margin(pad, pl, margin) {
                 let item = &pads[pad_idx];
-                let net = if pad.kind == PadKind::Npth {
-                    ""
+                let net = if item.kind == PadKind::Npth {
+                    String::new()
                 } else {
-                    item.net.as_str()
+                    item.net.clone()
                 };
-                openings.push(MaskOpening {
-                    label: Cow::Borrowed(&item.label),
+                out.push(MaskOpening {
+                    label: item.label.clone(),
                     net,
                     center: item.center,
                     bbox: shape.bbox(),
@@ -99,6 +94,16 @@ pub(crate) fn collect_mask_openings<'a>(
             }
         }
     }
+    out
+}
+
+pub(crate) fn append_via_mask_openings(
+    board: &BoardIr,
+    vias: &[ViaItem],
+    side: Side,
+    out: &mut Vec<MaskOpening>,
+) {
+    let cu_name = side.cu_layer();
     for (vi, (via, item)) in board.vias.iter().zip(vias).enumerate() {
         if !via.tented && via.touches_layer(cu_name, &board.layers) {
             let dia = via.diameter + 2 * board.rules.mask_expansion_nm;
@@ -107,9 +112,9 @@ pub(crate) fn collect_mask_openings<'a>(
                     center: via.pos,
                     radius: dia / 2,
                 };
-                openings.push(MaskOpening {
-                    label: Cow::Borrowed(&item.label),
-                    net: &item.net,
+                out.push(MaskOpening {
+                    label: item.label.clone(),
+                    net: item.net.clone(),
                     center: via.pos,
                     bbox: shape.bbox(),
                     shape,
@@ -118,6 +123,22 @@ pub(crate) fn collect_mask_openings<'a>(
             }
         }
     }
+}
+
+pub(crate) fn collect_mask_openings(
+    board: &BoardIr,
+    cu_layers: &[String],
+    pads: &[PadItem],
+    vias: &[ViaItem],
+    side: Side,
+    include_graphics: bool,
+) -> Vec<MaskOpening> {
+    let mask_name = match side {
+        Side::Top => "F.Mask",
+        Side::Bottom => "B.Mask",
+    };
+    let mut openings = collect_pad_mask_openings(board, cu_layers, pads, side);
+    append_via_mask_openings(board, vias, side, &mut openings);
     if include_graphics {
         let mut graphic_id = 0usize;
         let mut shapes = Vec::new();
@@ -131,8 +152,8 @@ pub(crate) fn collect_mask_openings<'a>(
             graphic_id += 1;
             for sh in shapes.drain(..) {
                 openings.push(MaskOpening {
-                    label: Cow::Owned(label.clone()),
-                    net: "",
+                    label: label.clone(),
+                    net: String::new(),
                     center: sh.center(),
                     bbox: sh.bbox(),
                     shape: sh,
@@ -184,10 +205,15 @@ fn pour_violates_mask(pour: &PourItem<'_>, shape: &ResolvedShape, req: Nm) -> Op
     pour.indexed.overlaps_shape(pour.poly, shape).then_some(0.0)
 }
 
+pub(crate) struct MaskOpeningSides<'a> {
+    pub(crate) top: &'a [&'a [MaskOpening]],
+    pub(crate) bot: &'a [&'a [MaskOpening]],
+}
+
 pub(crate) fn check_mask_to_copper(
     board: &BoardIr,
     inputs: &DrcInputs<'_>,
-    shared_openings: Option<(&[MaskOpening<'_>], &[MaskOpening<'_>])>,
+    shared_openings: Option<MaskOpeningSides<'_>>,
     out: &mut Vec<Violation>,
 ) {
     let (cu_layers, tracks, pads, vias, pours) = (
@@ -197,7 +223,7 @@ pub(crate) fn check_mask_to_copper(
         inputs.vias,
         inputs.pours,
     );
-    let (Some(req), Some((top, bot))) = (
+    let (Some(req), Some(openings_sides)) = (
         board.rules.mask_to_copper_nm.filter(|&v| v >= 0),
         shared_openings,
     ) else {
@@ -211,11 +237,11 @@ pub(crate) fn check_mask_to_copper(
         if !cu_layers.iter().any(|l| l == cu_layer) {
             continue;
         }
-        let openings = match side {
-            Side::Top => top,
-            Side::Bottom => bot,
+        let slices = match side {
+            Side::Top => openings_sides.top,
+            Side::Bottom => openings_sides.bot,
         };
-        if openings.is_empty() {
+        if slices.iter().all(|s| s.is_empty()) {
             continue;
         }
 
@@ -260,87 +286,89 @@ pub(crate) fn check_mask_to_copper(
         let target_grid = SpatialGrid::new(targets.iter().map(|t| t.bbox), 2_000_000);
         let side_pours: Vec<&PourItem<'_>> = pours.iter().filter(|p| p.layer == cu_layer).collect();
 
-        for op in openings {
-            if matches!(op.owner, MaskOwner::Graphic(_)) {
-                continue;
-            }
-            let q = op.bbox.expand(req);
-            target_grid.query_with(q, &mut scratch, &mut candidates);
-            for &ti in &candidates {
-                let target = &targets[ti];
-                if !target.bbox.intersects(q) || same_named_net(op.net, target.net) {
+        for &openings in slices {
+            for op in openings {
+                if matches!(op.owner, MaskOwner::Graphic(_)) {
                     continue;
                 }
-                match (&op.owner, &target.kind) {
-                    (MaskOwner::Via(ovi), TargetKind::Via(tvi)) if ovi == tvi => continue,
-                    (
-                        MaskOwner::Pad {
-                            pad_idx: opi,
-                            pl_idx: opl,
-                            mask_only,
-                        },
-                        TargetKind::Pad {
-                            pad_idx: tpi,
-                            pl_idx: tpl,
-                        },
-                    ) if opi == tpi
-                        || (opl == tpl
-                            && op.net.is_empty()
-                            && (*mask_only
-                                || (pads[*opi].kind != PadKind::Npth
-                                    && target.net.is_empty()))) =>
-                    {
+                let q = op.bbox.expand(req);
+                target_grid.query_with(q, &mut scratch, &mut candidates);
+                for &ti in &candidates {
+                    let target = &targets[ti];
+                    if !target.bbox.intersects(q) || same_named_net(&op.net, target.net) {
                         continue;
                     }
-                    _ => {}
-                }
-                if let Some(dist) = shape_violates_mask(&op.shape, target.shape, req) {
-                    let pos_nm = match target.kind {
-                        TargetKind::Track { a, b } => {
-                            closest_pt_on_segment(op.center, a, b).midpoint(op.center)
+                    match (&op.owner, &target.kind) {
+                        (MaskOwner::Via(ovi), TargetKind::Via(tvi)) if ovi == tvi => continue,
+                        (
+                            MaskOwner::Pad {
+                                pad_idx: opi,
+                                pl_idx: opl,
+                                mask_only,
+                            },
+                            TargetKind::Pad {
+                                pad_idx: tpi,
+                                pl_idx: tpl,
+                            },
+                        ) if opi == tpi
+                            || (opl == tpl
+                                && op.net.is_empty()
+                                && (*mask_only
+                                    || (pads[*opi].kind != PadKind::Npth
+                                        && target.net.is_empty()))) =>
+                        {
+                            continue;
                         }
-                        TargetKind::Via(_) | TargetKind::Pad { .. } => {
-                            op.center.midpoint(target.center)
-                        }
-                    };
-                    push_clearance_violation(
-                        out,
-                        ClearanceHit {
-                            kind: ViolationKind::SolderMaskToCopper,
-                            layer: cu_layer,
-                            pos_nm,
-                            dist,
-                            required_nm: req,
-                            item_a: &op.label,
-                            item_b: target.label,
-                            net_a: op.net,
-                            net_b: target.net,
-                            prefix: "mask ",
-                        },
-                    );
+                        _ => {}
+                    }
+                    if let Some(dist) = shape_violates_mask(&op.shape, target.shape, req) {
+                        let pos_nm = match target.kind {
+                            TargetKind::Track { a, b } => {
+                                closest_pt_on_segment(op.center, a, b).midpoint(op.center)
+                            }
+                            TargetKind::Via(_) | TargetKind::Pad { .. } => {
+                                op.center.midpoint(target.center)
+                            }
+                        };
+                        push_clearance_violation(
+                            out,
+                            ClearanceHit {
+                                kind: ViolationKind::SolderMaskToCopper,
+                                layer: cu_layer,
+                                pos_nm,
+                                dist,
+                                required_nm: req,
+                                item_a: &op.label,
+                                item_b: target.label,
+                                net_a: &op.net,
+                                net_b: target.net,
+                                prefix: "mask ",
+                            },
+                        );
+                    }
                 }
-            }
 
-            for pour in &side_pours {
-                if same_named_net(op.net, pour.net) || !pour.bbox.intersects(q) {
-                    continue;
-                }
-                if let Some(dist) = pour_violates_mask(pour, &op.shape, req) {
-                    push_clearance_violation(
-                        out,
-                        ClearanceHit {
-                            kind: ViolationKind::SolderMaskToCopper,
-                            layer: cu_layer,
-                            pos_nm: op.center,
-                            dist,
-                            required_nm: req,
-                            item_a: &op.label,
-                            item_b: &pour.label,
-                            net_a: op.net,
-                            net_b: pour.net,
-                            prefix: "mask ",
-                        },
-                    );
+                for pour in &side_pours {
+                    if same_named_net(&op.net, pour.net) || !pour.bbox.intersects(q) {
+                        continue;
+                    }
+                    if let Some(dist) = pour_violates_mask(pour, &op.shape, req) {
+                        push_clearance_violation(
+                            out,
+                            ClearanceHit {
+                                kind: ViolationKind::SolderMaskToCopper,
+                                layer: cu_layer,
+                                pos_nm: op.center,
+                                dist,
+                                required_nm: req,
+                                item_a: &op.label,
+                                item_b: &pour.label,
+                                net_a: &op.net,
+                                net_b: pour.net,
+                                prefix: "mask ",
+                            },
+                        );
+                    }
                 }
             }
         }

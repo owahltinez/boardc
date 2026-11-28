@@ -814,11 +814,7 @@ impl Via {
     }
 
     pub fn is_through_hole(&self, cu_layers: &[String], layers: &[LayerDef]) -> bool {
-        if cu_layers.len() <= 2 {
-            return true;
-        }
-        let spanned = self.spanned_layers(cu_layers, layers);
-        spanned.len() >= cu_layers.len()
+        cu_layers.len() <= 2 || cu_layers.iter().all(|l| self.touches_layer(l, layers))
     }
 }
 
@@ -1176,7 +1172,7 @@ impl BoardIr {
     }
 
     pub fn all_net_names(&self) -> Vec<String> {
-        let mut names = BTreeSet::new();
+        let mut names: BTreeSet<&str> = BTreeSet::new();
         let iter = self
             .nets
             .keys()
@@ -1192,9 +1188,105 @@ impl BoardIr {
             .chain(self.filled_pours.iter().map(|fp| fp.net.as_str()));
         for name in iter {
             if !name.is_empty() {
-                names.insert(name.to_string());
+                names.insert(name);
             }
         }
-        names.into_iter().collect()
+        names.into_iter().map(str::to_string).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn via_is_through_hole_and_all_net_names_edge_cases() {
+        let one_layer = vec![LayerDef {
+            name: "F.Cu".into(),
+            kind: LayerKind::Signal,
+            side: Some(Side::Top),
+            thickness_nm: None,
+        }];
+        let one_cu = vec!["F.Cu".to_string()];
+        let blind = Via {
+            net: "GND".into(),
+            pos: Pt::new(0, 0),
+            diameter: 400_000,
+            drill: 200_000,
+            layers: ("F.Cu".into(), "In1.Cu".into()),
+            locked: false,
+            tented: true,
+        };
+        assert!(blind.is_through_hole(&one_cu, &one_layer));
+
+        let four_layers: Vec<LayerDef> = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+            .into_iter()
+            .map(|n| LayerDef {
+                name: n.into(),
+                kind: LayerKind::Signal,
+                side: None,
+                thickness_nm: None,
+            })
+            .collect();
+        let four_cu: Vec<String> = four_layers.iter().map(|l| l.name.clone()).collect();
+        assert!(!blind.is_through_hole(&four_cu, &four_layers));
+
+        let reversed_tht = Via {
+            layers: ("B.Cu".into(), "F.Cu".into()),
+            ..blind.clone()
+        };
+        assert!(reversed_tht.is_through_hole(&four_cu, &four_layers));
+
+        let wildcard = Via {
+            layers: ("*.Cu".into(), "In1.Cu".into()),
+            ..blind.clone()
+        };
+        assert!(wildcard.is_through_hole(&four_cu, &four_layers));
+
+        let reversed_blind = Via {
+            layers: ("In2.Cu".into(), "F.Cu".into()),
+            ..blind
+        };
+        assert!(!reversed_blind.is_through_hole(&four_cu, &four_layers));
+
+        let mut board: BoardIr = serde_json::from_str(
+            r#"{"name":"t","outline":[],"layers":[],"footprints":{},"placements":[]}"#,
+        )
+        .unwrap();
+        board.nets.insert(
+            "VCC".into(),
+            NetDef {
+                name: "VCC".into(),
+                ..Default::default()
+            },
+        );
+        board.placements.push(Placement {
+            refdes: "U1".into(),
+            pin_nets: [("1".into(), "GND".into()), ("2".into(), String::new())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        board.tracks.push(Track {
+            net: "SIG_B".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(0, 0),
+            b: Pt::new(100, 0),
+            width: 100,
+            locked: false,
+        });
+        board.vias.push(reversed_tht);
+        board.pours.push(PourSpec {
+            net: "SIG_A".into(),
+            layer: "F.Cu".into(),
+            ..Default::default()
+        });
+        board.filled_pours.push(FilledPour {
+            net: "SIG_A".into(),
+            layer: "F.Cu".into(),
+            priority: 0,
+            polys: Vec::new(),
+        });
+        assert_eq!(board.all_net_names(), vec!["GND", "SIG_A", "SIG_B", "VCC"]);
     }
 }

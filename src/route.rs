@@ -15,7 +15,7 @@ use crate::drc_scene::{
     NetClearance, PourItem, collect_drc_grids, collect_pads, collect_pours, collect_tracks,
     collect_vias, layer_mask_for_name,
 };
-use crate::geom::EPS_NM;
+use crate::geom::{EPS_NM, SpatialGrid};
 use crate::ir::{BoardIr, Nm, PourPoly, Pt, Track, Via, nm_to_um, um};
 use crate::poly_index::IndexedPour;
 pub use crate::route_bridge::to_viahop_board;
@@ -331,7 +331,8 @@ fn prune_dead_end_stubs(
             collect_pours(board)
         };
         let tracks = collect_tracks(board, &cu_layers);
-        let grids = collect_drc_grids(&cu_layers, &pads, &vias, &tracks);
+        let pad_grid = SpatialGrid::new(pads.iter().map(|p| p.bbox), 2_000_000);
+        let grids = collect_drc_grids(&cu_layers, &pad_grid, &vias, &tracks);
         let mut ctx = CopperContext::new(board, &cu_layers, &pads, &vias, &pours, &tracks, &grids);
         let mut pruned_at: HashMap<(&str, &str, Pt), f64> = HashMap::new();
 
@@ -434,7 +435,8 @@ pub(crate) fn apply_match_group_tuning(
     summary: &mut RouteSummary,
     only_nets: Option<HashSet<String>>,
     ignored_nets: &HashSet<String>,
-) {
+) -> bool {
+    let mut modified_tracks = false;
     if !board.constraints.match_groups.is_empty() {
         let len_before: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
         let tune = tune_match_groups(
@@ -445,6 +447,7 @@ pub(crate) fn apply_match_group_tuning(
             },
         );
         let len_after: f64 = board.tracks.iter().map(|t| t.a.dist(t.b)).sum();
+        modified_tracks = tune.added_meanders > 0 || tune.added_segments > 0;
         summary.total_segments += tune.added_segments;
         summary.total_wirelength_um =
             (summary.total_wirelength_um + (len_after - len_before) / 1000.0).max(0.0);
@@ -453,6 +456,7 @@ pub(crate) fn apply_match_group_tuning(
     if !board.constraints.match_groups.is_empty() || !board.constraints.max_lengths.is_empty() {
         summary.length_violations = count_length_violations(board);
     }
+    modified_tracks
 }
 
 /// Routes all non-ignored (or `--reroute-nets` targeted) nets in memory using `viahop`.

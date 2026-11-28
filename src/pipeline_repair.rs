@@ -5,7 +5,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::drc::{
-    DEFAULT_CLUSTER_RADIUS_NM, Hotspot, Severity, Violation, ViolationKind, check_board_drc,
+    DEFAULT_CLUSTER_RADIUS_NM, Hotspot, RepairDrcStatic, Severity, Violation, ViolationKind,
+    check_repair_drc,
 };
 use crate::drc_cluster::{cluster_hotspots, routable_board_nets};
 use crate::drc_constraints::count_length_violations;
@@ -17,7 +18,7 @@ use crate::pipeline_repair_pour::{
 use crate::route::{
     RouteOptions, RouteSummary, apply_match_group_tuning, route_board_ir, route_board_ir_inner,
 };
-use crate::zones::{ZoneChoke, fill_zones};
+use crate::zones::{ZoneReport, fill_zones};
 
 const BASE_REROUTE_PAD_MM: f64 = 2.0;
 const REROUTE_PAD_STEP_MM: f64 = 2.0;
@@ -224,15 +225,20 @@ struct RepairEval {
     score: RepairScore,
 }
 
-fn eval_repair_state(
+fn eval_repair_violations(
     board: &BoardIr,
+    violations: Vec<Violation>,
     ignored: &HashSet<String>,
     unconnected_pairs: usize,
-    zone_state: Option<(usize, usize)>,
+    zone_report: Option<&ZoneReport>,
 ) -> RepairEval {
-    let drc = check_board_drc(board);
-    let zones_active = zone_state.is_some();
-    let (unconnected_pour_terminals, zone_chokes) = zone_state.unwrap_or((0, 0));
+    let zones_active = zone_report.is_some();
+    let (unconnected_pour_terminals, zone_chokes) = zone_report.map_or((0, 0), |rep| {
+        (
+            rep.pours.iter().map(|p| p.unconnected_terminals).sum(),
+            rep.chokes.len(),
+        )
+    });
     let mut repairable = Vec::new();
     let mut pour_opens = Vec::new();
     let mut constraint_excess: HashMap<String, (Nm, Nm)> = HashMap::new();
@@ -240,7 +246,7 @@ fn eval_repair_state(
     let mut max_vias_viols = 0usize;
     let mut total_excess_nm: Nm = 0;
     let mut total_excess_vias: Nm = 0;
-    for v in drc.violations {
+    for v in violations {
         if v.severity != Severity::Error || !is_repairable_kind(v.kind) {
             continue;
         }
@@ -313,6 +319,28 @@ fn eval_repair_state(
         constraint_excess,
         score,
     }
+}
+
+fn eval_repair_state_with_static(
+    board: &BoardIr,
+    ignored: &HashSet<String>,
+    unconnected_pairs: usize,
+    zone_report: Option<&ZoneReport>,
+    static_ctx: &RepairDrcStatic,
+) -> RepairEval {
+    let violations = check_repair_drc(board, static_ctx);
+    eval_repair_violations(board, violations, ignored, unconnected_pairs, zone_report)
+}
+
+#[cfg(test)]
+fn eval_repair_state(
+    board: &BoardIr,
+    ignored: &HashSet<String>,
+    unconnected_pairs: usize,
+    zone_report: Option<&ZoneReport>,
+) -> RepairEval {
+    let static_ctx = RepairDrcStatic::new(board);
+    eval_repair_state_with_static(board, ignored, unconnected_pairs, zone_report, &static_ctx)
 }
 
 fn net_can_reroute(board: &BoardIr, net: &str) -> bool {
@@ -405,7 +433,8 @@ struct RepairState<'a> {
     repaired_nets: HashSet<String>,
     cur_eval: RepairEval,
     pour_keepouts: Vec<Keepout>,
-    zone_state: Option<(usize, Vec<ZoneChoke>)>,
+    zone_state: Option<ZoneReport>,
+    drc_static: RepairDrcStatic,
 }
 
 impl<'a> RepairState<'a> {
@@ -442,11 +471,11 @@ impl<'a> RepairState<'a> {
                 return true;
             }
         }
-        if let Some((_, chokes)) = &self.zone_state
-            && (!chokes.is_empty() || !self.cur_eval.pour_opens.is_empty())
+        if let Some(rep) = &self.zone_state
+            && (!rep.chokes.is_empty() || !self.cur_eval.pour_opens.is_empty())
             && !collect_pour_hotspots(
                 board,
-                chokes,
+                &rep.chokes,
                 &self.cur_eval.pour_opens,
                 eligible_nets,
                 scope_nets,
@@ -543,27 +572,21 @@ impl<'a> RepairState<'a> {
         targets: impl IntoIterator<Item = String>,
         extra_keepouts: Vec<Keepout>,
     ) -> Result<bool, String> {
-        let cand_zone_state = self.zone_state.is_some().then(|| {
-            let rep = fill_zones(board);
-            let unconnected: usize = rep.pours.iter().map(|p| p.unconnected_terminals).sum();
-            (unconnected, rep.chokes)
-        });
-        let zone_counts = cand_zone_state
-            .as_ref()
-            .map(|(unconnected, chokes)| (*unconnected, chokes.len()));
-        let cand_eval = eval_repair_state(
+        let cand_zone_rep = self.zone_state.is_some().then(|| fill_zones(board));
+        let cand_eval = eval_repair_state_with_static(
             board,
             &self.cfg.ignored_nets,
             cand_summary.unconnected_pairs,
-            zone_counts,
+            cand_zone_rep.as_ref(),
+            &self.drc_static,
         );
         if cand_eval.score.is_better_than(&self.cur_eval.score) {
             self.summary = cand_summary;
             self.repaired_nets.extend(targets);
             self.cur_eval = cand_eval;
             self.pour_keepouts.extend(extra_keepouts);
-            if let Some(zs) = cand_zone_state {
-                self.zone_state = Some(zs);
+            if let Some(rep) = cand_zone_rep {
+                self.zone_state = Some(rep);
             }
             Ok(true)
         } else {
@@ -840,7 +863,7 @@ fn repair_pours(
         let chokes = state
             .zone_state
             .as_ref()
-            .map(|(_, c)| c.as_slice())
+            .map(|rep| rep.chokes.as_slice())
             .unwrap_or(&[]);
         if chokes.is_empty() && state.cur_eval.pour_opens.is_empty() {
             break;
@@ -899,14 +922,22 @@ fn repair_pours(
     Ok(())
 }
 
+pub(crate) struct RouteRepairResult {
+    pub(crate) summary: RouteSummary,
+    pub(crate) zones: Option<(Vec<FilledPour>, ZoneReport)>,
+}
+
 /// Runs `route_board_ir`, optionally followed by bounded hotspot auto-repair and final `tune_match_groups`.
-pub(crate) fn route_with_repair(
+pub(crate) fn route_with_repair_and_zones(
     board: &mut BoardIr,
     cfg: &RouteOptions,
     repair_passes: usize,
-) -> Result<RouteSummary, String> {
+) -> Result<RouteRepairResult, String> {
     if repair_passes == 0 {
-        return route_board_ir(board, cfg);
+        return Ok(RouteRepairResult {
+            summary: route_board_ir(board, cfg)?,
+            zones: None,
+        });
     }
 
     let start = Instant::now();
@@ -914,6 +945,7 @@ pub(crate) fn route_with_repair(
     if !board.pours.is_empty() {
         board.filled_pours.clear();
     }
+    let drc_static = RepairDrcStatic::new(board);
     let eligible_nets: HashSet<String> = routable_board_nets(board)
         .into_iter()
         .filter(|n| !board.is_net_ignored(n, &cfg.ignored_nets))
@@ -943,11 +975,12 @@ pub(crate) fn route_with_repair(
     let (initial_summary, _, init_timed_out) =
         route_with_deadline(board, &init_cfg, init_deadline)?;
 
-    let initial_eval = eval_repair_state(
+    let initial_eval = eval_repair_state_with_static(
         board,
         &cfg.ignored_nets,
         initial_summary.unconnected_pairs,
         None,
+        &drc_static,
     );
     let mut history: Vec<PriorCluster> = Vec::new();
     let mut state = RepairState {
@@ -964,6 +997,7 @@ pub(crate) fn route_with_repair(
         cur_eval: initial_eval,
         pour_keepouts: Vec::new(),
         zone_state: None,
+        drc_static,
     };
 
     while state.can_step() && !state.cur_eval.repairable.is_empty() {
@@ -1011,15 +1045,14 @@ pub(crate) fn route_with_repair(
 
     if !board.pours.is_empty() && state.can_step() {
         let zone_rep = fill_zones(board);
-        let unconnected: usize = zone_rep.pours.iter().map(|p| p.unconnected_terminals).sum();
-        let choke_count = zone_rep.chokes.len();
-        state.zone_state = Some((unconnected, zone_rep.chokes));
-        state.cur_eval = eval_repair_state(
+        state.cur_eval = eval_repair_state_with_static(
             board,
             &cfg.ignored_nets,
             state.summary.unconnected_pairs,
-            Some((unconnected, choke_count)),
+            Some(&zone_rep),
+            &state.drc_static,
         );
+        state.zone_state = Some(zone_rep);
         repair_pours(
             board,
             &mut state,
@@ -1047,9 +1080,11 @@ pub(crate) fn route_with_repair(
         state.any_stopped_early = true;
     }
 
-    if !board.pours.is_empty() {
-        board.filled_pours.clear();
-    }
+    let saved_filled_pours = if !board.pours.is_empty() {
+        std::mem::take(&mut board.filled_pours)
+    } else {
+        Vec::new()
+    };
 
     let mut summary = state.summary;
     if !state.pour_keepouts.is_empty() {
@@ -1057,7 +1092,7 @@ pub(crate) fn route_with_repair(
     }
     let repaired_nets = state.repaired_nets;
     let can_tune = cfg.tune_match_groups && hard_deadline.is_none_or(|dl| Instant::now() < dl);
-    if can_tune {
+    let tuned_tracks = if can_tune {
         let only_nets = cfg.reroute_nets.clone().map(|mut s| {
             s.extend(repaired_nets.iter().cloned());
             for rule in &board.constraints.match_groups {
@@ -1067,7 +1102,7 @@ pub(crate) fn route_with_repair(
             }
             s
         });
-        apply_match_group_tuning(board, &mut summary, only_nets, &cfg.ignored_nets);
+        apply_match_group_tuning(board, &mut summary, only_nets, &cfg.ignored_nets)
     } else {
         if cfg.tune_match_groups && !board.constraints.match_groups.is_empty() {
             state.any_stopped_early = true;
@@ -1075,14 +1110,24 @@ pub(crate) fn route_with_repair(
         if !board.constraints.match_groups.is_empty() || !board.constraints.max_lengths.is_empty() {
             summary.length_violations = count_length_violations(board);
         }
-    }
+        false
+    };
+
+    let precomputed_zones = if !tuned_tracks {
+        state.zone_state.map(|rep| (saved_filled_pours, rep))
+    } else {
+        None
+    };
 
     summary.passes_run = state.passes_run;
     summary.starts_run = state.starts_run;
     summary.stopped_early = state.any_stopped_early;
     summary.repair_passes_run = state.repair_passes_run;
     summary.elapsed_ms = start.elapsed().as_millis();
-    Ok(summary)
+    Ok(RouteRepairResult {
+        summary,
+        zones: precomputed_zones,
+    })
 }
 
 #[cfg(test)]
@@ -1092,13 +1137,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        DeadlineWatchdog, REPAIR_PASS_MAX_MULTI_START, REPAIR_PASS_MAX_PASSES, RepairScore,
-        RepairState, budget_margins, eval_repair_state, initial_route_budget, next_pass_budget,
+        DeadlineWatchdog, REPAIR_PASS_MAX_MULTI_START, REPAIR_PASS_MAX_PASSES, RepairDrcStatic,
+        RepairScore, RepairState, budget_margins, eval_repair_state, eval_repair_violations,
+        initial_route_budget, next_pass_budget, route_with_repair_and_zones,
     };
+    use crate::drc::{ViolationKind, check_board_drc};
     use crate::ir::{
-        BoardIr, BoardSpec, FilledPour, MaxLengthRule, MaxViasRule, PourPoly, Pt, Track, Via, mm,
+        BgaShadowRule, BoardIr, BoardSpec, CapProximityRule, FilledPour, FootprintDef, Keepout,
+        KeepoutKind, MatchGroupRule, MaxLengthRule, MaxViasRule, PadDef, PadKind, PadShape,
+        Placement, PourPoly, PourSpec, Pt, Side, Track, Via, mm,
     };
     use crate::route::{RouteOptions, RouteSummary};
+    use crate::zones::fill_zones;
 
     #[test]
     fn eval_repair_state_prioritizes_geom_drc_over_max_length() {
@@ -1565,6 +1615,7 @@ side = "top"
             cur_eval: eval_repair_state(&board, &HashSet::new(), 1, None),
             pour_keepouts: Vec::new(),
             zone_state: None,
+            drc_static: RepairDrcStatic::new(&board),
         };
         assert_eq!(untimed_state.configure_pass_budget(), Some(None));
         assert_eq!(untimed_state.pass_cfg.max_passes, 90);
@@ -1596,6 +1647,7 @@ side = "top"
             cur_eval: eval_repair_state(&board, &HashSet::new(), 1, None),
             pour_keepouts: Vec::new(),
             zone_state: None,
+            drc_static: RepairDrcStatic::new(&board),
         };
         assert!(state_ok.can_step());
         let dl = state_ok.configure_pass_budget().unwrap().unwrap();
@@ -1620,6 +1672,7 @@ side = "top"
             cur_eval: eval_repair_state(&board, &HashSet::new(), 1, None),
             pour_keepouts: Vec::new(),
             zone_state: None,
+            drc_static: RepairDrcStatic::new(&board),
         };
         assert!(state_stage2.prepare_stage2(Some(Instant::now() + Duration::from_secs(4))));
         assert_eq!(state_stage2.pass_cfg.max_passes, REPAIR_PASS_MAX_PASSES);
@@ -1643,6 +1696,7 @@ side = "top"
             cur_eval: eval_repair_state(&board, &HashSet::new(), 1, None),
             pour_keepouts: Vec::new(),
             zone_state: None,
+            drc_static: RepairDrcStatic::new(&board),
         };
         assert!(!state_low.can_step());
         assert!(!state_low.has_start_budget());
@@ -1666,10 +1720,352 @@ side = "top"
             cur_eval: eval_repair_state(&board, &HashSet::new(), 0, None),
             pour_keepouts: Vec::new(),
             zone_state: None,
+            drc_static: RepairDrcStatic::new(&board),
         };
         assert!(state_gen.configure_pass_budget().is_some());
         assert_eq!(state_gen.pass_cfg.max_passes, REPAIR_PASS_MAX_PASSES);
         assert_eq!(state_gen.pass_cfg.multi_start, REPAIR_PASS_MAX_MULTI_START);
         assert!(state_gen.pass_cfg.optimize);
+    }
+
+    #[test]
+    fn check_repair_drc_matches_board_drc_eval_across_violation_kinds() {
+        let spec: BoardSpec = toml::from_str(
+            r#"
+name = "repair_drc_parity"
+size_nm = [40000000, 30000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "B.Cu"
+kind = "signal"
+side = "bottom"
+[footprints.PAD1]
+kind = "custom"
+[[footprints.PAD1.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu", "F.Mask"]
+[[placements]]
+refdes = "U1"
+footprint = "PAD1"
+pos = { x = 4000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "OPEN_NET" }
+[[placements]]
+refdes = "U2"
+footprint = "PAD1"
+pos = { x = 34000000, y = 10000000 }
+locked = true
+pin_nets = { "1" = "OPEN_NET" }
+[[placements]]
+refdes = "C1"
+footprint = "PAD1"
+pos = { x = 4000000, y = 10000000 }
+side = "bottom"
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "C2"
+footprint = "PAD1"
+pos = { x = 4000000, y = 10000000 }
+side = "bottom"
+locked = true
+pin_nets = { "1" = "SIG_B" }
+[rules]
+clearance_nm = 150000
+hole_to_hole_nm = 250000
+edge_clearance_nm = 300000
+mask_to_copper_nm = 200000
+"#,
+        )
+        .unwrap();
+        let mut board = BoardIr::from_spec(&spec).unwrap();
+        board.constraints.max_lengths.push(MaxLengthRule {
+            nets: vec!["SIG_A".into()],
+            max_nm: mm(5.0),
+        });
+        board.constraints.match_groups.push(MatchGroupRule {
+            name: "MG".into(),
+            nets: vec!["SIG_A".into(), "SIG_B".into()],
+            tolerance_nm: mm(0.1),
+            target_nm: None,
+        });
+        board.constraints.max_vias.push(MaxViasRule {
+            nets: vec!["SIG_A".into()],
+            max_vias: 1,
+        });
+        board.constraints.cap_proximity.push(CapProximityRule {
+            cap_refdes: "C1".into(),
+            ic_refdes: "U2".into(),
+            net: String::new(),
+            max_dist_nm: mm(1.0),
+        });
+        board.constraints.bga_shadows.push(BgaShadowRule {
+            bga_refdes: "U1".into(),
+            min_clearance_nm: mm(0.5),
+            allow_passives: false,
+        });
+        board.tracks = vec![
+            // Long + dangling track on SIG_A, plus close to SIG_B track (Clearance) and U1 mask (SolderMaskToCopper).
+            Track {
+                net: "SIG_A".into(),
+                layer: "F.Cu".into(),
+                a: Pt::new(mm(4.35), mm(10.0)),
+                b: Pt::new(mm(16.0), mm(10.0)),
+                width: mm(0.2),
+                locked: false,
+            },
+            Track {
+                net: "SIG_B".into(),
+                layer: "F.Cu".into(),
+                a: Pt::new(mm(8.0), mm(10.22)),
+                b: Pt::new(mm(14.0), mm(10.22)),
+                width: mm(0.2),
+                locked: false,
+            },
+            // Track passing too close to via drill on SIG_B (DrillToCopper + Clearance).
+            Track {
+                net: "SIG_A".into(),
+                layer: "F.Cu".into(),
+                a: Pt::new(mm(20.0), mm(20.0)),
+                b: Pt::new(mm(25.0), mm(20.0)),
+                width: mm(0.2),
+                locked: false,
+            },
+        ];
+        board.vias = vec![
+            Via {
+                net: "SIG_A".into(),
+                pos: Pt::new(mm(16.0), mm(10.0)),
+                diameter: mm(0.45),
+                drill: mm(0.25),
+                layers: ("F.Cu".into(), "B.Cu".into()),
+                locked: false,
+                tented: true,
+            },
+            // Close second via causing HoleToHole + MaxVias + DrillToCopper.
+            Via {
+                net: "SIG_A".into(),
+                pos: Pt::new(mm(16.3), mm(10.0)),
+                diameter: mm(0.45),
+                drill: mm(0.25),
+                layers: ("F.Cu".into(), "B.Cu".into()),
+                locked: false,
+                tented: true,
+            },
+            Via {
+                net: "SIG_B".into(),
+                pos: Pt::new(mm(22.0), mm(20.15)),
+                diameter: mm(0.45),
+                drill: mm(0.25),
+                layers: ("F.Cu".into(), "B.Cu".into()),
+                locked: false,
+                tented: true,
+            },
+        ];
+
+        board.footprints.insert(
+            "PAD_B".into(),
+            FootprintDef {
+                name: "PAD_B".into(),
+                pads: vec![PadDef {
+                    name: "1".into(),
+                    kind: PadKind::Smd,
+                    shape: PadShape::Circle { diameter: 600_000 },
+                    pos: Pt::new(0, 0),
+                    rot_deg: 0.0,
+                    drill_nm: None,
+                    layers: vec!["B.Cu".into(), "B.Mask".into()],
+                    mask_margin_nm: None,
+                    paste_margin_nm: None,
+                }],
+                courtyard: Vec::new(),
+                graphics: Vec::new(),
+                keepouts: Vec::new(),
+                models: Vec::new(),
+                pin_types: Default::default(),
+                kicad_raw: None,
+            },
+        );
+        board.placements.push(Placement {
+            refdes: "J1".into(),
+            footprint: "PAD_B".into(),
+            pos: Pt::new(mm(6.0), mm(25.0)),
+            side: Side::Top,
+            locked: true,
+            pin_nets: [("1".into(), "GND".into())].into_iter().collect(),
+            ..Default::default()
+        });
+        board.placements.push(Placement {
+            refdes: "J2".into(),
+            footprint: "PAD_B".into(),
+            pos: Pt::new(mm(34.0), mm(25.0)),
+            side: Side::Top,
+            locked: true,
+            pin_nets: [("1".into(), "GND".into())].into_iter().collect(),
+            ..Default::default()
+        });
+        board.keepouts.push(Keepout {
+            kind: KeepoutKind::Copper,
+            layers: vec!["B.Cu".into()],
+            poly: vec![
+                Pt::new(mm(19.0), 0),
+                Pt::new(mm(21.0), 0),
+                Pt::new(mm(21.0), mm(30.0)),
+                Pt::new(mm(19.0), mm(30.0)),
+            ],
+        });
+        board.pours.push(PourSpec {
+            name: "GND_B".into(),
+            net: "GND".into(),
+            layer: "B.Cu".into(),
+            outline: board.outline.clone(),
+            min_width_nm: 200_000,
+            ..Default::default()
+        });
+        let zone_rep = fill_zones(&mut board);
+
+        let ignored = HashSet::new();
+        let fast = eval_repair_state(&board, &ignored, 1, Some(&zone_rep));
+        let full_drc = check_board_drc(&board);
+        let ref_eval =
+            eval_repair_violations(&board, full_drc.violations, &ignored, 1, Some(&zone_rep));
+
+        assert_eq!(fast.score, ref_eval.score);
+        assert_eq!(fast.constraint_excess, ref_eval.constraint_excess);
+        assert_eq!(fast.repairable, ref_eval.repairable);
+        assert_eq!(fast.pour_opens, ref_eval.pour_opens);
+        assert!(!fast.pour_opens.is_empty());
+        assert!(
+            fast.repairable
+                .iter()
+                .any(|v| v.kind == ViolationKind::SolderMaskToCopper)
+        );
+        assert!(
+            fast.repairable
+                .iter()
+                .any(|v| v.kind == ViolationKind::HoleToHole)
+        );
+        assert!(
+            fast.repairable
+                .iter()
+                .any(|v| v.kind == ViolationKind::DrillToCopper)
+        );
+        assert!(
+            fast.repairable
+                .iter()
+                .any(|v| v.kind == ViolationKind::TrackDangling)
+        );
+        assert!(
+            fast.repairable
+                .iter()
+                .any(|v| v.kind == ViolationKind::OpenNet)
+        );
+        assert_eq!(fast.score.max_length_viols, 1);
+        assert_eq!(fast.score.max_vias_viols, 1);
+    }
+
+    #[test]
+    fn route_with_repair_and_zones_handoff_reused_or_invalidated_by_tuning() {
+        let mut spec: BoardSpec = toml::from_str(
+            r#"
+name = "zone_handoff"
+size_nm = [30000000, 20000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[[layers]]
+name = "B.Cu"
+kind = "plane"
+side = "bottom"
+[footprints.PAD]
+kind = "custom"
+[[footprints.PAD.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "rect", width = 600000, height = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[[placements]]
+refdes = "U1"
+footprint = "PAD"
+pos = { x = 4000000, y = 6000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "U2"
+footprint = "PAD"
+pos = { x = 10000000, y = 6000000 }
+locked = true
+pin_nets = { "1" = "SIG_A" }
+[[placements]]
+refdes = "U3"
+footprint = "PAD"
+pos = { x = 4000000, y = 14000000 }
+locked = true
+pin_nets = { "1" = "SIG_B" }
+[[placements]]
+refdes = "U4"
+footprint = "PAD"
+pos = { x = 26000000, y = 14000000 }
+locked = true
+pin_nets = { "1" = "SIG_B" }
+[rules]
+clearance_nm = 150000
+edge_clearance_nm = 300000
+track_width_nm = 200000
+"#,
+        )
+        .unwrap();
+        spec.pours.push(PourSpec {
+            name: "GND_B".into(),
+            net: "GND".into(),
+            layer: "B.Cu".into(),
+            outline: vec![
+                Pt::new(0, 0),
+                Pt::new(mm(30.0), 0),
+                Pt::new(mm(30.0), mm(20.0)),
+                Pt::new(0, mm(20.0)),
+            ],
+            min_width_nm: 200_000,
+            remove_islands: false,
+            ..Default::default()
+        });
+        let base_board = BoardIr::from_spec(&spec).unwrap();
+
+        let mut no_tune_board = base_board.clone();
+        let no_tune_cfg = RouteOptions {
+            tune_match_groups: false,
+            ..Default::default()
+        };
+        let no_tune = route_with_repair_and_zones(&mut no_tune_board, &no_tune_cfg, 1).unwrap();
+        let (filled, rep) = no_tune
+            .zones
+            .expect("zones should be handed off when tuning makes no edits");
+        assert!(!filled.is_empty());
+        assert_eq!(rep.pours.len(), 1);
+
+        let mut tuned_board = base_board;
+        tuned_board.constraints.match_groups.push(MatchGroupRule {
+            name: "MG".into(),
+            nets: vec!["SIG_A".into(), "SIG_B".into()],
+            tolerance_nm: mm(0.1),
+            target_nm: None,
+        });
+        let tune_cfg = RouteOptions {
+            tune_match_groups: true,
+            ..Default::default()
+        };
+        let after_tune = route_with_repair_and_zones(&mut tuned_board, &tune_cfg, 1).unwrap();
+        assert!(
+            after_tune.zones.is_none(),
+            "precomputed zones must be invalidated when match-group tuning edits tracks"
+        );
     }
 }

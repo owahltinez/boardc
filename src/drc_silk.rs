@@ -67,7 +67,7 @@ fn collect_silk_items(board: &BoardIr, side: Side) -> Vec<SilkItem> {
 
 fn check_silk_to_mask(
     silk_items: &[SilkItem],
-    openings: &[MaskOpening<'_>],
+    openings: &[MaskOpening],
     silk_layer: &str,
     req: Nm,
     out: &mut Vec<Violation>,
@@ -127,7 +127,7 @@ fn check_silk_to_mask(
                     item_a: &item.label,
                     item_b: &op.label,
                     net_a: "",
-                    net_b: op.net,
+                    net_b: &op.net,
                     prefix: "silk ",
                 },
             );
@@ -183,7 +183,7 @@ fn check_silk_to_edge(
 pub(crate) fn check_silkscreen(
     board: &BoardIr,
     edge_idx: Option<&BoardEdgeIndex>,
-    shared_openings: Option<(&[MaskOpening<'_>], &[MaskOpening<'_>])>,
+    shared_openings: Option<(&[MaskOpening], &[MaskOpening])>,
     out: &mut Vec<Violation>,
 ) {
     let mask_req = board.rules.silk_to_mask_nm.filter(|&v| v >= 0);

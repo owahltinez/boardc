@@ -299,6 +299,16 @@ pub fn polygon_to_polygon_dist(a: &[Pt], b: &[Pt]) -> f64 {
     min_d
 }
 
+pub(crate) fn pad_query_bbox(shape_bbox: BBoxNm, center: Pt, drill_nm: Option<Nm>) -> BBoxNm {
+    if let Some(d) = drill_nm
+        && d > 0
+    {
+        shape_bbox.union(BBoxNm::from_pt(center, d / 2))
+    } else {
+        shape_bbox
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct GridQueryScratch {
     seen: Vec<u32>,
@@ -324,6 +334,17 @@ pub(crate) struct SpatialGrid {
     storage: GridStorage,
 }
 
+#[inline]
+fn cell_span(bbox: BBoxNm, cell_nm: Nm) -> Option<(i64, i64, i64, i64)> {
+    let x0 = bbox.min_x.div_euclid(cell_nm);
+    let x1 = bbox.max_x.div_euclid(cell_nm);
+    let y0 = bbox.min_y.div_euclid(cell_nm);
+    let y1 = bbox.max_y.div_euclid(cell_nm);
+    let dx = x1.saturating_sub(x0).saturating_add(1);
+    let dy = y1.saturating_sub(y0).saturating_add(1);
+    (dx > 0 && dy > 0 && dx.saturating_mul(dy) <= 256).then_some((x0, x1, y0, y1))
+}
+
 impl SpatialGrid {
     pub(crate) fn new(bboxes: impl IntoIterator<Item = BBoxNm>, cell_nm: Nm) -> Self {
         let cell_nm = cell_nm.max(250_000);
@@ -338,20 +359,14 @@ impl SpatialGrid {
         for b in bboxes {
             let idx = len as u32;
             len += 1;
-            let x0 = b.min_x.div_euclid(cell_nm);
-            let x1 = b.max_x.div_euclid(cell_nm);
-            let y0 = b.min_y.div_euclid(cell_nm);
-            let y1 = b.max_y.div_euclid(cell_nm);
-            let dx = x1.saturating_sub(x0).saturating_add(1);
-            let dy = y1.saturating_sub(y0).saturating_add(1);
-            if dx <= 0 || dy <= 0 || dx.saturating_mul(dy) > 256 {
-                globals.push(idx);
-            } else {
+            if let Some((x0, x1, y0, y1)) = cell_span(b, cell_nm) {
                 min_gx = min_gx.min(x0);
                 max_gx = max_gx.max(x1);
                 min_gy = min_gy.min(y0);
                 max_gy = max_gy.max(y1);
                 entries.push((idx, x0, x1, y0, y1));
+            } else {
+                globals.push(idx);
             }
         }
 
@@ -482,6 +497,32 @@ impl SpatialGrid {
         false
     }
 
+    pub(crate) fn new_dynamic(cell_nm: Nm) -> Self {
+        Self {
+            cell_nm: cell_nm.max(250_000),
+            len: 0,
+            globals: Vec::new(),
+            storage: GridStorage::Sparse(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, idx: usize, bbox: BBoxNm) {
+        self.len = self.len.max(idx + 1);
+        let id = idx as u32;
+        let Some((x0, x1, y0, y1)) = cell_span(bbox, self.cell_nm) else {
+            self.globals.push(id);
+            return;
+        };
+        let GridStorage::Sparse(map) = &mut self.storage else {
+            unreachable!("insert requires dynamic SpatialGrid");
+        };
+        for gx in x0..=x1 {
+            for gy in y0..=y1 {
+                map.entry((gx, gy)).or_default().push(id);
+            }
+        }
+    }
+
     pub(crate) fn query_with(
         &self,
         bbox: BBoxNm,
@@ -492,16 +533,10 @@ impl SpatialGrid {
         if self.len == 0 {
             return;
         }
-        let x0 = bbox.min_x.div_euclid(self.cell_nm);
-        let x1 = bbox.max_x.div_euclid(self.cell_nm);
-        let y0 = bbox.min_y.div_euclid(self.cell_nm);
-        let y1 = bbox.max_y.div_euclid(self.cell_nm);
-        let dx = x1.saturating_sub(x0).saturating_add(1);
-        let dy = y1.saturating_sub(y0).saturating_add(1);
-        if dx <= 0 || dy <= 0 || dx.saturating_mul(dy) > 256 {
+        let Some((x0, x1, y0, y1)) = cell_span(bbox, self.cell_nm) else {
             out.extend(0..self.len);
             return;
-        }
+        };
         if x0 == x1 && y0 == y1 && self.globals.is_empty() {
             out.extend(self.cell_slice(x0, y0).iter().map(|&idx| idx as usize));
             return;
@@ -675,6 +710,7 @@ pub(crate) fn poly_extends_outside_board(
     cutouts.iter().any(|c| polys_overlap_area(verts, c) > 0.0)
 }
 
+#[cfg(test)]
 pub(crate) fn shape_edge_clearance(
     shape: &ResolvedShape,
     outline: &[Pt],

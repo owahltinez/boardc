@@ -622,6 +622,7 @@ pub(crate) fn check_pour_clearances(
 mod tests {
     use super::*;
     use crate::drc_scene::{collect_drc_grids, collect_pours, compute_max_clearance};
+    use crate::geom::SpatialGrid;
     use crate::ir::{FilledPour, NetClass, NetDef, PourPoly, PourSpec, Pt};
 
     #[test]
@@ -702,7 +703,8 @@ mod tests {
 
         let cu_layers = board.copper_layer_names();
         let pours = collect_pours(&board);
-        let grids = collect_drc_grids(&cu_layers, &[], &[], &[]);
+        let pad_grid = SpatialGrid::new(std::iter::empty(), 2_000_000);
+        let grids = collect_drc_grids(&cu_layers, &pad_grid, &[], &[]);
         let inputs = DrcInputs {
             cu_layers: &cu_layers,
             tracks: &[],

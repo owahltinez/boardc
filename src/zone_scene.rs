@@ -8,8 +8,7 @@ use clipper2_rust::{
 use crate::fab_gerber::pad_world_shape_with_margin;
 use crate::geom::{
     ensure_ccw, local_to_board, pad_copper_layers, pad_to_world_shape, pad_world_layers,
-    path64_to_pts, point_in_polygon, polygon_area, polygon_signed_area_2, pts_to_path64,
-    remap_layer_for_side,
+    path64_to_pts, polygon_area, polygon_signed_area_2, pts_to_path64, remap_layer_for_side,
 };
 use crate::ir::{
     BBoxNm, BoardIr, FilledPour, KeepoutKind, Nm, PadKind, PourPoly, PourSpec, Pt, Side,
@@ -616,10 +615,6 @@ pub(crate) fn pour_poly_area(poly: &PourPoly) -> f64 {
     let outer_area = polygon_area(&poly.outer);
     let hole_area: f64 = poly.holes.iter().map(|h| polygon_area(h)).sum();
     (outer_area - hole_area).max(0.0)
-}
-
-pub(crate) fn point_in_pour_poly(p: Pt, poly: &PourPoly) -> bool {
-    point_in_polygon(p, &poly.outer) && !poly.holes.iter().any(|h| point_in_polygon(p, h))
 }
 
 pub(crate) fn indexed_pour_intersects_terminal(pour: &IndexedPour, term: &Terminal) -> bool {

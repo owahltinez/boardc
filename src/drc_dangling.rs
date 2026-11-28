@@ -19,7 +19,7 @@ pub(crate) struct CopperContext<'a> {
     via_spanned_idx: Vec<Vec<usize>>,
     pours: &'a [PourItem<'a>],
     tracks: &'a [TrackItem<'a>],
-    grids: &'a DrcGrids,
+    grids: &'a DrcGrids<'a>,
     scratch: GridQueryScratch,
     candidates: Vec<usize>,
     pub(crate) alive_tracks: Vec<bool>,
@@ -34,7 +34,7 @@ impl<'a> CopperContext<'a> {
         vias: &'a [ViaItem],
         pours: &'a [PourItem<'a>],
         tracks: &'a [TrackItem<'a>],
-        grids: &'a DrcGrids,
+        grids: &'a DrcGrids<'a>,
     ) -> Self {
         let mut tht_barrels = Vec::with_capacity(pads.len());
         let mut barrel_exceeds_pad = false;
@@ -96,7 +96,7 @@ impl<'a> CopperContext<'a> {
     fn pad_grid(&self) -> &SpatialGrid {
         self.pad_grid_override
             .as_ref()
-            .unwrap_or(&self.grids.pad_grid)
+            .unwrap_or(self.grids.pad_grid)
     }
 
     fn pad_shape_on_layer(&self, pad_idx: usize, layer: &str) -> Option<&ResolvedShape> {
@@ -521,7 +521,7 @@ pub(crate) fn check_dangling(
     pads: &[PadItem],
     vias: &[ViaItem],
     pours: &[PourItem<'_>],
-    grids: &DrcGrids,
+    grids: &DrcGrids<'_>,
 ) -> Vec<Violation> {
     let mut ctx = CopperContext::new(board, cu_layers, pads, vias, pours, tracks, grids);
     let mut out = Vec::new();

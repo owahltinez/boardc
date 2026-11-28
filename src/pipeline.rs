@@ -17,7 +17,7 @@ use crate::ir::{
     MaxViasRule, MinViasRule, NetClass, NetDef, Nm, PadKind, Placement, PourSpec, Pt, Track, Via,
     fnv1a_128, safe_slug, save_board_json,
 };
-use crate::pipeline_repair::route_with_repair;
+use crate::pipeline_repair::route_with_repair_and_zones;
 use crate::place::{
     PlaceOptions, PlaceReport, PowerViaOptions, PowerViaReport, legalize_placement,
     solve_power_vias,
@@ -576,6 +576,7 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
     };
     let seed_hash = loaded_seed.as_ref().map(content_hash_hex).transpose()?;
     let route_key = route_key_for(&eff_route_cfg, cfg.repair_passes, seed_hash.as_deref())?;
+    let mut precomputed_zones: Option<(Vec<FilledPour>, ZoneReport)> = None;
     let route_cache = run_cached_stage(
         cfg,
         StageKind::Route,
@@ -589,7 +590,10 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
             if !board.pours.is_empty() && cfg.repair_passes > 0 {
                 board.filled_pours.clear();
             }
-            let summary = route_with_repair(&mut board, &eff_route_cfg, cfg.repair_passes)?;
+            let repaired =
+                route_with_repair_and_zones(&mut board, &eff_route_cfg, cfg.repair_passes)?;
+            precomputed_zones = repaired.zones;
+            let summary = repaired.summary;
             if cfg.use_cache && eff_route_cfg.reroute_nets.is_none() {
                 save_cached(
                     &cfg.cache_dir,
@@ -625,6 +629,12 @@ pub fn compile_board(mut board: BoardIr, cfg: &BuildOptions) -> Result<BuildRepo
         zones_key.clone(),
         &mut stages,
         || {
+            if let Some((filled_pours, report)) = precomputed_zones.take() {
+                return Ok(ZonesCache {
+                    filled_pours,
+                    report,
+                });
+            }
             let report = fill_zones(&mut board);
             Ok(ZonesCache {
                 filled_pours: board.filled_pours.clone(),

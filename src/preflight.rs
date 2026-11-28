@@ -13,6 +13,7 @@ use crate::drc_scene::{
     collect_tracks, collect_vias,
 };
 use crate::erc::{ErcViolation, check_board_erc};
+use crate::geom::SpatialGrid;
 use crate::ir::{BoardIr, LayerKind, Pt};
 use crate::route::{point_from_viahop as pt_from_viahop, to_viahop_board};
 use crate::zones::{ZoneChoke, analyze_zone_chokes, fill_zones};
@@ -107,7 +108,8 @@ pub fn run_preflight(
         &mut layout_violations,
     );
     if !keepouts.is_empty() {
-        let grids = collect_drc_grids(&cu_layers, &pads, &vias, &tracks);
+        let pad_grid = SpatialGrid::new(pads.iter().map(|p| p.bbox), 2_000_000);
+        let grids = collect_drc_grids(&cu_layers, &pad_grid, &vias, &tracks);
         let drc_inputs = DrcInputs {
             cu_layers: &cu_layers,
             tracks: &tracks,
