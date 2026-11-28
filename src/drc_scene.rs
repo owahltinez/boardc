@@ -156,8 +156,8 @@ pub(crate) struct KeepoutItem {
     pub bbox: BBoxNm,
 }
 
-pub(crate) struct DrcGrids {
-    pub pad_grid: SpatialGrid,
+pub(crate) struct DrcGrids<'a> {
+    pub pad_grid: &'a SpatialGrid,
     pub via_grid: SpatialGrid,
     pub track_grid: SpatialGrid,
     pub tracks_by_layer: Vec<(Vec<usize>, SpatialGrid)>,
@@ -169,7 +169,7 @@ pub(crate) struct DrcInputs<'a> {
     pub pads: &'a [PadItem],
     pub vias: &'a [ViaItem],
     pub pours: &'a [PourItem<'a>],
-    pub grids: &'a DrcGrids,
+    pub grids: &'a DrcGrids<'a>,
     pub max_clr: Nm,
 }
 
@@ -451,13 +451,12 @@ pub(crate) fn collect_pours(board: &BoardIr) -> Vec<PourItem<'_>> {
     })
 }
 
-pub(crate) fn collect_drc_grids(
+pub(crate) fn collect_drc_grids<'a>(
     cu_layers: &[String],
-    pads: &[PadItem],
+    pad_grid: &'a SpatialGrid,
     vias: &[ViaItem],
     tracks: &[TrackItem<'_>],
-) -> DrcGrids {
-    let pad_grid = SpatialGrid::new(pads.iter().map(|p| p.bbox), 2_000_000);
+) -> DrcGrids<'a> {
     let via_grid = SpatialGrid::new(vias.iter().map(|v| v.bbox), 2_000_000);
     let track_grid = SpatialGrid::new(tracks.iter().map(|t| t.bbox), 2_000_000);
     let mut layer_indices: Vec<Vec<usize>> = vec![Vec::new(); cu_layers.len()];

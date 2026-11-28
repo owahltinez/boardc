@@ -161,7 +161,7 @@ pub(crate) fn collect_mask_guards(
     layer_names: &[String],
     signal_layers: &[usize],
     net_name_to_id: &HashMap<String, usize>,
-    pin_to_net: &HashMap<(String, String), usize>,
+    pin_to_net: &HashMap<(&str, &str), usize>,
     nets: &[NetInfo],
 ) -> (Vec<FixedPlane>, Vec<ResolvedKeepout>) {
     let mut planes = Vec::new();
@@ -202,7 +202,7 @@ pub(crate) fn collect_mask_guards(
                 None
             } else {
                 pin_to_net
-                    .get(&(pl.refdes.clone(), pad.name.clone()))
+                    .get(&(pl.refdes.as_str(), pad.name.as_str()))
                     .copied()
             };
             let clr = net_id.map_or(default_clr, |nid| clearances_from_net(&nets[nid]));

@@ -218,12 +218,13 @@ fn tune_single_net(
             break;
         }
         let mut candidates: Vec<(usize, f64)> = scene
-            .tracks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| {
-                let t = slot.as_ref()?;
-                (!t.locked && t.net == net && t.a != t.b && t.width > 0).then(|| (i, t.a.dist(t.b)))
+            .tracks_by_net
+            .get(net)
+            .into_iter()
+            .flat_map(|idxs| idxs.iter().copied())
+            .filter_map(|i| {
+                let t = scene.tracks[i].as_ref()?;
+                (!t.locked && t.a != t.b && t.width > 0).then(|| (i, t.a.dist(t.b)))
             })
             .collect();
         candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

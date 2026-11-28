@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::drc_layout::keepout_matches_layer;
 use crate::drc_mask::{collect_mask_openings, shape_violates_mask};
 use crate::drc_scene::{
@@ -67,6 +69,7 @@ pub(crate) struct TuneScene<'a> {
     keepout_grid: SpatialGrid,
     pours: Vec<PourItem<'a>>,
     pub(crate) tracks: Vec<Option<Track>>,
+    pub(crate) tracks_by_net: HashMap<String, Vec<usize>>,
     track_grid: SpatialGrid,
     extra_tracks: Vec<usize>,
     mask_to_copper: Option<Nm>,
@@ -107,6 +110,11 @@ impl<'a> TuneScene<'a> {
             (None, None)
         };
 
+        let mut tracks_by_net: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, t) in board.tracks.iter().enumerate() {
+            tracks_by_net.entry(t.net.clone()).or_default().push(i);
+        }
+
         Self {
             board,
             outline_idx,
@@ -122,6 +130,7 @@ impl<'a> TuneScene<'a> {
             pours,
             track_grid: SpatialGrid::new(board.tracks.iter().map(track_bbox), 2_000_000),
             extra_tracks: Vec::new(),
+            tracks_by_net,
             tracks: board.tracks.iter().cloned().map(Some).collect(),
             mask_to_copper,
             top_masks,
@@ -142,7 +151,7 @@ impl<'a> TuneScene<'a> {
 
     /// Computes required lead-in/lead-out distance at `ep` to step past same-net pads/vias there.
     pub(crate) fn endpoint_pad_clear_lead(
-        &self,
+        &mut self,
         net: &str,
         layer: &str,
         ep: Pt,
@@ -152,8 +161,13 @@ impl<'a> TuneScene<'a> {
     ) -> f64 {
         let mut lead = base_lead;
         let pad_margin = width as f64 * 0.5 + same_net_clr as f64;
-        for pad in &self.pads {
+        let q = BBoxNm::from_pt(ep, 2);
+        self.pad_grid
+            .query_with(q, &mut self.scratch, &mut self.candidates);
+        for &pi in &self.candidates {
+            let pad = &self.pads[pi];
             if pad.kind != PadKind::Npth
+                && pad.bbox.intersects(q)
                 && same_named_net(net, &pad.net)
                 && pad.layers.iter().any(|l| l == layer)
                 && pad.shape.dist_to_point(ep) <= TOUCH_TOL_NM
@@ -162,8 +176,12 @@ impl<'a> TuneScene<'a> {
                 lead = lead.max(ep.dist(pad.center) + half_diag + pad_margin);
             }
         }
-        for (vi, via) in self.vias.iter().enumerate() {
-            if same_named_net(net, &via.net)
+        self.via_grid
+            .query_with(q, &mut self.scratch, &mut self.candidates);
+        for &vi in &self.candidates {
+            let via = &self.vias[vi];
+            if via.bbox.intersects(q)
+                && same_named_net(net, &via.net)
                 && self.board.vias[vi].touches_layer(layer, &self.board.layers)
                 && via.pos.dist(ep) <= (via.dia / 2) as f64 + TOUCH_TOL_NM
             {
@@ -288,7 +306,12 @@ impl<'a> TuneScene<'a> {
     pub(crate) fn commit_replacement(&mut self, orig_idx: usize, new_tracks: Vec<Track>) {
         self.tracks[orig_idx] = None;
         for t in new_tracks {
-            self.extra_tracks.push(self.tracks.len());
+            let idx = self.tracks.len();
+            self.extra_tracks.push(idx);
+            self.tracks_by_net
+                .entry(t.net.clone())
+                .or_default()
+                .push(idx);
             self.tracks.push(Some(t));
         }
     }
@@ -357,18 +380,6 @@ impl<'a> TuneScene<'a> {
             }
         }
 
-        let item_ok = |same: bool, at_end: bool, dist: f64, req_other: Nm| -> bool {
-            let req = if same {
-                if !is_excursion || at_end {
-                    return true;
-                }
-                same_net_clr
-            } else {
-                req_other
-            };
-            dist >= req as f64 - EPS_NM
-        };
-
         self.track_grid
             .query_with(q_bbox, &mut self.scratch, &mut self.candidates);
         self.candidates.extend(self.extra_tracks.iter().copied());
@@ -376,14 +387,22 @@ impl<'a> TuneScene<'a> {
             let Some(o) = (ti != orig_idx).then(|| self.tracks[ti].as_ref()).flatten() else {
                 continue;
             };
-            if o.layer == layer
-                && !item_ok(
-                    same_named_net(net, &o.net),
-                    false,
-                    shape.dist_to_capsule(o.a, o.b, o.width / 2),
-                    self.board.pair_clearance(net, &o.net, None),
-                )
-            {
+            if o.layer != layer {
+                continue;
+            }
+            let same = same_named_net(net, &o.net);
+            if same && !is_excursion {
+                continue;
+            }
+            let req = if same {
+                same_net_clr
+            } else {
+                self.board.pair_clearance(net, &o.net, None)
+            };
+            if !seg_bbox.expand(req).intersects(track_bbox(o)) {
+                continue;
+            }
+            if shape.dist_to_capsule(o.a, o.b, o.width / 2) < req as f64 - EPS_NM {
                 return false;
             }
         }
@@ -396,15 +415,22 @@ impl<'a> TuneScene<'a> {
                 continue;
             }
             let same = same_named_net(net, &pad.net);
-            let at_end = same
-                && (pad.shape.dist_to_point(span_a) <= TOUCH_TOL_NM
-                    || pad.shape.dist_to_point(span_b) <= TOUCH_TOL_NM);
-            if !item_ok(
-                same,
-                at_end,
-                pad.shape.dist_to_shape(&shape),
-                self.board.pair_clearance(net, &pad.net, None),
-            ) {
+            if same
+                && (!is_excursion
+                    || pad.shape.dist_to_point(span_a) <= TOUCH_TOL_NM
+                    || pad.shape.dist_to_point(span_b) <= TOUCH_TOL_NM)
+            {
+                continue;
+            }
+            let req = if same {
+                same_net_clr
+            } else {
+                self.board.pair_clearance(net, &pad.net, None)
+            };
+            if !seg_bbox.expand(req).intersects(pad.bbox) {
+                continue;
+            }
+            if pad.shape.dist_to_shape(&shape) < req as f64 - EPS_NM {
                 return false;
             }
         }
@@ -417,17 +443,25 @@ impl<'a> TuneScene<'a> {
                 continue;
             }
             let same = same_named_net(net, &via.net);
-            let r_via = (via.dia / 2) as f64 + TOUCH_TOL_NM;
-            let at_end = same && (via.pos.dist(span_a) <= r_via || via.pos.dist(span_b) <= r_via);
-            let req = self
-                .board
-                .pair_clearance(net, &via.net, self.board.rules.via_to_track_nm);
-            if !item_ok(
-                same,
-                at_end,
-                shape.dist_to_circle(via.pos, via.dia / 2),
-                req,
-            ) {
+            if same {
+                if !is_excursion {
+                    continue;
+                }
+                let r_via = (via.dia / 2) as f64 + TOUCH_TOL_NM;
+                if via.pos.dist(span_a) <= r_via || via.pos.dist(span_b) <= r_via {
+                    continue;
+                }
+            }
+            let req = if same {
+                same_net_clr
+            } else {
+                self.board
+                    .pair_clearance(net, &via.net, self.board.rules.via_to_track_nm)
+            };
+            if !seg_bbox.expand(req).intersects(via.bbox) {
+                continue;
+            }
+            if shape.dist_to_circle(via.pos, via.dia / 2) < req as f64 - EPS_NM {
                 return false;
             }
         }
@@ -442,6 +476,9 @@ impl<'a> TuneScene<'a> {
             }
             let d_net = if d.is_npth { "" } else { d.net.as_str() };
             let req = self.board.pair_clearance(d_net, net, None).max(hole_clr);
+            if !seg_bbox.expand(req).intersects(d.bbox) {
+                continue;
+            }
             if shape.dist_to_circle(d.pos, d.radius) < req as f64 - EPS_NM {
                 return false;
             }

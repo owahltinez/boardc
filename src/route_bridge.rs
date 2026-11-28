@@ -204,18 +204,18 @@ pub fn to_viahop_board(
 
     let is_net_ignored = |name: &str| board.is_net_ignored(name, ignored_nets);
 
-    let mut pin_to_net: HashMap<(String, String), usize> = HashMap::new();
+    let mut pin_to_net: HashMap<(&str, &str), usize> = HashMap::new();
     for (net_name, net_def) in &board.nets {
         if let Some(&nid) = net_name_to_id.get(net_name) {
             for (refdes, pin) in &net_def.pins {
-                pin_to_net.insert((refdes.clone(), pin.clone()), nid);
+                pin_to_net.insert((refdes.as_str(), pin.as_str()), nid);
             }
         }
     }
     for pl in &board.placements {
         for (pin, net_name) in &pl.pin_nets {
             if let Some(&nid) = net_name_to_id.get(net_name) {
-                pin_to_net.insert((pl.refdes.clone(), pin.clone()), nid);
+                pin_to_net.insert((pl.refdes.as_str(), pin.as_str()), nid);
             }
         }
     }
@@ -306,17 +306,16 @@ pub fn to_viahop_board(
             if layer_shapes.is_empty() {
                 continue;
             }
-            let unique_layers: HashSet<usize> = layer_shapes.iter().map(|(l, _)| *l).collect();
-            let is_smd = pad.kind == PadKind::Smd && unique_layers.len() == 1;
+            let is_smd = pad.kind == PadKind::Smd && layer_shapes.len() == 1;
             let is_through_hole =
-                pad.kind != PadKind::Smd || unique_layers.len() >= num_layers.min(2);
+                pad.kind != PadKind::Smd || layer_shapes.len() >= num_layers.min(2);
             let bbox = bbox.unwrap();
             let max_radius = ((bbox.max_x - bbox.min_x).hypot(bbox.max_y - bbox.min_y)) * 0.5;
             let net_id = if pad.kind == PadKind::Npth {
                 None
             } else {
                 pin_to_net
-                    .get(&(pl.refdes.clone(), pad.name.clone()))
+                    .get(&(pl.refdes.as_str(), pad.name.as_str()))
                     .copied()
             };
             let id = pads.len();

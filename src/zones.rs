@@ -117,7 +117,7 @@ fn build_spoke_rects(term: &Terminal, spec: &PourSpec) -> Vec<Path64> {
 fn build_raw_pour(
     spec: &PourSpec,
     board_region: &Paths64,
-    higher_priority_on_layer: &[(Paths64, String, Nm)],
+    higher_priority_on_layer: &[(&Paths64, &str, Nm)],
     scene: &LayerScene,
     pour_clr: Nm,
 ) -> Paths64 {
@@ -137,14 +137,14 @@ fn build_raw_pour(
     }
 
     let mut clips = Paths64::new();
-    for (hp_paths, hp_net, hp_clr) in higher_priority_on_layer {
+    for &(hp_paths, hp_net, hp_clr) in higher_priority_on_layer {
         if hp_paths.is_empty() {
             continue;
         }
-        if !spec.net.is_empty() && hp_net == &spec.net {
+        if !spec.net.is_empty() && hp_net == spec.net {
             clips.extend(hp_paths.iter().cloned());
         } else {
-            clips.extend(inflate_round_outer(hp_paths, pour_clr.max(*hp_clr)));
+            clips.extend(inflate_round_outer(hp_paths, pour_clr.max(hp_clr)));
         }
     }
     for obs in &scene.obstacles {
@@ -367,7 +367,10 @@ pub fn fill_zones(board: &mut BoardIr) -> ZoneReport {
                             spec.clearance_nm,
                             scene_bbox,
                         );
-                        let p_raw = build_raw_pour(spec, region_ref, &higher, &scene, pour_clr);
+                        let higher_refs: Vec<(&Paths64, &str, Nm)> =
+                            higher.iter().map(|(p, n, c)| (p, n.as_str(), *c)).collect();
+                        let p_raw =
+                            build_raw_pour(spec, region_ref, &higher_refs, &scene, pour_clr);
                         let all_polys =
                             apply_thermal_or_solid_polys(&p_raw, spec, &scene, outline_bbox);
 
