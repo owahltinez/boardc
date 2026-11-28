@@ -6,13 +6,16 @@ use crate::drc::{
 };
 use crate::drc_cluster::{cluster_hotspots, routable_board_nets};
 use crate::drc_constraints::count_length_violations;
-use crate::geom::{local_to_board, point_to_segment_dist};
-use crate::ir::{BoardIr, Nm, Pt};
-use crate::pipeline_repair_length::{collect_corridor_neighbors, collect_pour_nets};
+use crate::ir::{BoardIr, FilledPour, Keepout, Nm, Pt, Track, Via};
+use crate::pipeline_repair_length::collect_corridor_neighbors;
+use crate::pipeline_repair_pour::{
+    collect_hotspot_targets, collect_pour_hotspots, resolve_pad_centers,
+};
 use crate::route::{
     RouteOptions, RouteSummary, apply_match_group_tuning, route_board_ir,
     route_board_ir_with_unconnected,
 };
+use crate::zones::{ZoneChoke, fill_zones};
 
 const BASE_REROUTE_PAD_MM: f64 = 2.0;
 const REROUTE_PAD_STEP_MM: f64 = 2.0;
@@ -57,6 +60,9 @@ fn is_unlocked_routed_item(board: &BoardIr, item: &str) -> bool {
 struct RepairScore {
     unconnected_pairs: usize,
     geom_viols: usize,
+    pour_opens: usize,
+    unconnected_pour_terminals: usize,
+    zone_chokes: usize,
     max_length_viols: usize,
     max_vias_viols: usize,
     total_excess_nm: Nm,
@@ -65,8 +71,20 @@ struct RepairScore {
 
 impl RepairScore {
     fn is_better_than(&self, cur: &Self) -> bool {
-        let geom_self = (self.unconnected_pairs, self.geom_viols);
-        let geom_cur = (cur.unconnected_pairs, cur.geom_viols);
+        let geom_self = (
+            self.unconnected_pairs,
+            self.geom_viols,
+            self.pour_opens,
+            self.unconnected_pour_terminals,
+            self.zone_chokes,
+        );
+        let geom_cur = (
+            cur.unconnected_pairs,
+            cur.geom_viols,
+            cur.pour_opens,
+            cur.unconnected_pour_terminals,
+            cur.zone_chokes,
+        );
         if geom_self != geom_cur {
             return geom_self < geom_cur;
         }
@@ -85,6 +103,7 @@ impl RepairScore {
 
 struct RepairEval {
     repairable: Vec<Violation>,
+    pour_opens: Vec<Violation>,
     constraint_excess: HashMap<String, (Nm, Nm)>,
     score: RepairScore,
 }
@@ -93,14 +112,13 @@ fn eval_repair_state(
     board: &BoardIr,
     ignored: &HashSet<String>,
     unconnected_pairs: usize,
+    zone_state: Option<(usize, usize)>,
 ) -> RepairEval {
     let drc = check_board_drc(board);
-    let pour_nets = if board.filled_pours.is_empty() {
-        collect_pour_nets(board)
-    } else {
-        HashSet::new()
-    };
+    let zones_active = zone_state.is_some();
+    let (unconnected_pour_terminals, zone_chokes) = zone_state.unwrap_or((0, 0));
     let mut repairable = Vec::new();
+    let mut pour_opens = Vec::new();
     let mut constraint_excess: HashMap<String, (Nm, Nm)> = HashMap::new();
     let mut max_length_viols = 0usize;
     let mut max_vias_viols = 0usize;
@@ -138,9 +156,11 @@ fn eval_repair_state(
             }
             continue;
         }
-        let skip_conn = net_ignored || pour_nets.contains(v.net_a.as_str());
+        let is_pour_net = !v.net_a.is_empty() && board.pours.iter().any(|p| p.net == v.net_a);
         if v.kind == ViolationKind::OpenNet {
-            if !skip_conn {
+            if zones_active && is_pour_net {
+                pour_opens.push(v);
+            } else if !net_ignored && !is_pour_net {
                 repairable.push(v);
             }
             continue;
@@ -148,7 +168,7 @@ fn eval_repair_state(
         if matches!(
             v.kind,
             ViolationKind::TrackDangling | ViolationKind::ViaDangling
-        ) && skip_conn
+        ) && (net_ignored || (!zones_active && is_pour_net))
         {
             continue;
         }
@@ -163,6 +183,9 @@ fn eval_repair_state(
     let score = RepairScore {
         unconnected_pairs,
         geom_viols: repairable.len(),
+        pour_opens: pour_opens.len(),
+        unconnected_pour_terminals,
+        zone_chokes,
         max_length_viols,
         max_vias_viols,
         total_excess_nm,
@@ -170,6 +193,7 @@ fn eval_repair_state(
     };
     RepairEval {
         repairable,
+        pour_opens,
         constraint_excess,
         score,
     }
@@ -195,12 +219,15 @@ struct PriorCluster {
 }
 
 impl PriorCluster {
-    fn matches(&self, h: &Hotspot, base_nets: &HashSet<String>) -> bool {
-        let match_dist = DEFAULT_CLUSTER_RADIUS_NM
-            .max(h.radius_nm)
-            .max(self.radius_nm) as f64;
-        h.centroid_nm.dist(self.centroid_nm) <= match_dist
-            || (!base_nets.is_empty() && &self.base_nets == base_nets)
+    fn matches_region(
+        &self,
+        centroid_nm: Pt,
+        radius_nm: Nm,
+        base_nets: Option<&HashSet<String>>,
+    ) -> bool {
+        let match_dist = DEFAULT_CLUSTER_RADIUS_NM.max(radius_nm).max(self.radius_nm) as f64;
+        centroid_nm.dist(self.centroid_nm) <= match_dist
+            || base_nets.is_some_and(|nets| !nets.is_empty() && &self.base_nets == nets)
     }
 }
 
@@ -217,62 +244,36 @@ fn collect_hotspot_anchors(board: &BoardIr, hotspot: &Hotspot) -> Vec<Pt> {
                 .filter(|s| !s.is_empty())
         })
         .collect();
-    if open_pads.is_empty() {
-        return anchors;
-    }
-    for pl in &board.placements {
-        let Some(fp) = board.footprints.get(&pl.footprint) else {
-            continue;
-        };
-        for pad in &fp.pads {
-            let matched = open_pads.iter().any(|lbl| {
-                lbl.strip_prefix(&pl.refdes)
-                    .and_then(|rest| rest.strip_prefix('.'))
-                    == Some(pad.name.as_str())
-            });
-            if matched {
-                anchors.push(local_to_board(
-                    pad.pos, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side,
-                ));
-            }
-        }
-    }
+    anchors.extend(
+        resolve_pad_centers(board, &open_pads, &[])
+            .into_iter()
+            .map(|p| p.pos),
+    );
     anchors
 }
 
-fn collect_hotspot_targets(
-    board: &BoardIr,
-    eligible_nets: &HashSet<String>,
-    base_nets: &HashSet<String>,
-    hotspot: &Hotspot,
-    neighbor_radius_nm: Nm,
-) -> HashSet<String> {
-    let mut targets = base_nets.clone();
-    if neighbor_radius_nm <= 0 {
-        return targets;
-    }
-    let search_r = (hotspot.radius_nm.max(0) + neighbor_radius_nm) as f64;
-    let anchors = collect_hotspot_anchors(board, hotspot);
-    for t in &board.tracks {
-        if t.locked || t.net.is_empty() || !eligible_nets.contains(&t.net) {
-            continue;
-        }
-        if anchors
-            .iter()
-            .any(|&a| point_to_segment_dist(a, t.a, t.b) <= search_r)
-        {
-            targets.insert(t.net.clone());
+struct BoardSnapshot {
+    tracks: Vec<Track>,
+    vias: Vec<Via>,
+    filled_pours: Option<Vec<FilledPour>>,
+}
+
+impl BoardSnapshot {
+    fn take(board: &mut BoardIr, save_filled_pours: bool) -> Self {
+        Self {
+            tracks: board.tracks.clone(),
+            vias: board.vias.clone(),
+            filled_pours: save_filled_pours.then(|| std::mem::take(&mut board.filled_pours)),
         }
     }
-    for v in &board.vias {
-        if v.locked || v.net.is_empty() || !eligible_nets.contains(&v.net) {
-            continue;
-        }
-        if anchors.iter().any(|&a| a.dist(v.pos) <= search_r) {
-            targets.insert(v.net.clone());
+
+    fn restore(self, board: &mut BoardIr) {
+        board.tracks = self.tracks;
+        board.vias = self.vias;
+        if let Some(fp) = self.filled_pours {
+            board.filled_pours = fp;
         }
     }
-    targets
 }
 
 struct RepairState<'a> {
@@ -287,6 +288,8 @@ struct RepairState<'a> {
     summary: RouteSummary,
     repaired_nets: HashSet<String>,
     cur_eval: RepairEval,
+    pour_keepouts: Vec<Keepout>,
+    zone_state: Option<(usize, Vec<ZoneChoke>)>,
 }
 
 impl<'a> RepairState<'a> {
@@ -305,41 +308,86 @@ impl<'a> RepairState<'a> {
             .map(|limit| limit.saturating_sub(self.start.elapsed().as_secs()).max(1))
     }
 
+    fn route_with_keepouts(
+        &self,
+        board: &mut BoardIr,
+        extra_keepouts: &[Keepout],
+    ) -> Result<(RouteSummary, HashSet<String>), String> {
+        let orig_len = board.keepouts.len();
+        board.keepouts.extend(self.pour_keepouts.iter().cloned());
+        board.keepouts.extend(extra_keepouts.iter().cloned());
+        let res = route_board_ir_with_unconnected(board, &self.pass_cfg);
+        board.keepouts.truncate(orig_len);
+        res
+    }
+
+    fn finish_candidate(
+        &mut self,
+        board: &mut BoardIr,
+        snap: BoardSnapshot,
+        cand_summary: RouteSummary,
+        targets: impl IntoIterator<Item = String>,
+        extra_keepouts: Vec<Keepout>,
+    ) -> Result<bool, String> {
+        let cand_zone_state = self.zone_state.is_some().then(|| {
+            let rep = fill_zones(board);
+            let unconnected: usize = rep.pours.iter().map(|p| p.unconnected_terminals).sum();
+            (unconnected, rep.chokes)
+        });
+        let zone_counts = cand_zone_state
+            .as_ref()
+            .map(|(unconnected, chokes)| (*unconnected, chokes.len()));
+        let cand_eval = eval_repair_state(
+            board,
+            &self.cfg.ignored_nets,
+            cand_summary.unconnected_pairs,
+            zone_counts,
+        );
+        if cand_eval.score.is_better_than(&self.cur_eval.score) {
+            self.summary = cand_summary;
+            self.repaired_nets.extend(targets);
+            self.cur_eval = cand_eval;
+            self.pour_keepouts.extend(extra_keepouts);
+            if let Some(zs) = cand_zone_state {
+                self.zone_state = Some(zs);
+            }
+            Ok(true)
+        } else {
+            snap.restore(board);
+            Ok(false)
+        }
+    }
+
     fn try_candidate(
         &mut self,
         board: &mut BoardIr,
         targets: HashSet<String>,
         pad_mm: f64,
     ) -> Result<bool, String> {
+        self.try_candidate_with_keepouts(board, targets, pad_mm, Vec::new())
+    }
+
+    fn try_candidate_with_keepouts(
+        &mut self,
+        board: &mut BoardIr,
+        targets: HashSet<String>,
+        pad_mm: f64,
+        extra_keepouts: Vec<Keepout>,
+    ) -> Result<bool, String> {
         if !self.can_step() || targets.is_empty() {
             return Ok(false);
         }
         self.repair_passes_run += 1;
-        let saved_tracks = board.tracks.clone();
-        let saved_vias = board.vias.clone();
+        let snap = BoardSnapshot::take(board, self.zone_state.is_some());
         self.pass_cfg.reroute_nets = Some(targets.clone());
         self.pass_cfg.reroute_pad_mm = Some(pad_mm);
         self.pass_cfg.timeout_secs = self.remaining_timeout_secs();
 
-        let cand_summary = route_board_ir(board, &self.pass_cfg)?;
+        let (cand_summary, _) = self.route_with_keepouts(board, &extra_keepouts)?;
         self.passes_run += cand_summary.passes_run;
         self.starts_run += cand_summary.starts_run;
         self.stopped_early |= cand_summary.stopped_early;
-        let cand_eval = eval_repair_state(
-            board,
-            &self.cfg.ignored_nets,
-            cand_summary.unconnected_pairs,
-        );
-        if cand_eval.score.is_better_than(&self.cur_eval.score) {
-            self.summary = cand_summary;
-            self.repaired_nets.extend(targets);
-            self.cur_eval = cand_eval;
-            Ok(true)
-        } else {
-            board.tracks = saved_tracks;
-            board.vias = saved_vias;
-            Ok(false)
-        }
+        self.finish_candidate(board, snap, cand_summary, targets, extra_keepouts)
     }
 
     // Route a MaxVias net while neighbors are stripped, then route neighbors around it.
@@ -355,8 +403,7 @@ impl<'a> RepairState<'a> {
         }
         let vias_before = board.vias.iter().filter(|v| v.net == primary_net).count();
         self.repair_passes_run += 1;
-        let saved_tracks = board.tracks.clone();
-        let saved_vias = board.vias.clone();
+        let snap = BoardSnapshot::take(board, self.zone_state.is_some());
 
         board
             .tracks
@@ -368,8 +415,7 @@ impl<'a> RepairState<'a> {
         self.pass_cfg.reroute_nets = Some(HashSet::from([primary_net.to_string()]));
         self.pass_cfg.reroute_pad_mm = Some(pad_mm);
         self.pass_cfg.timeout_secs = self.remaining_timeout_secs();
-        let (net_summary, net_unconnected) =
-            route_board_ir_with_unconnected(board, &self.pass_cfg)?;
+        let (net_summary, net_unconnected) = self.route_with_keepouts(board, &[])?;
         self.passes_run += net_summary.passes_run;
         self.starts_run += net_summary.starts_run;
         self.stopped_early |= net_summary.stopped_early;
@@ -383,32 +429,20 @@ impl<'a> RepairState<'a> {
             || (self.cur_eval.score.unconnected_pairs == 0
                 && net_unconnected.iter().any(|n| !neighbors.contains(n)));
         if bad_unconnected || net_summary.stopped_early || timed_out || vias_after >= vias_before {
-            board.tracks = saved_tracks;
-            board.vias = saved_vias;
+            snap.restore(board);
             return Ok(false);
         }
 
         self.pass_cfg.reroute_nets = Some(neighbors.clone());
         self.pass_cfg.reroute_pad_mm = Some(pad_mm);
         self.pass_cfg.timeout_secs = self.remaining_timeout_secs();
-        let nbr_summary = route_board_ir(board, &self.pass_cfg)?;
+        let (nbr_summary, _) = self.route_with_keepouts(board, &[])?;
         self.passes_run += nbr_summary.passes_run;
         self.starts_run += nbr_summary.starts_run;
         self.stopped_early |= nbr_summary.stopped_early;
 
-        let cand_eval =
-            eval_repair_state(board, &self.cfg.ignored_nets, nbr_summary.unconnected_pairs);
-        if cand_eval.score.is_better_than(&self.cur_eval.score) {
-            self.summary = nbr_summary;
-            self.repaired_nets.insert(primary_net.to_string());
-            self.repaired_nets.extend(neighbors.iter().cloned());
-            self.cur_eval = cand_eval;
-            Ok(true)
-        } else {
-            board.tracks = saved_tracks;
-            board.vias = saved_vias;
-            Ok(false)
-        }
+        let targets = std::iter::once(primary_net.to_string()).chain(neighbors.iter().cloned());
+        self.finish_candidate(board, snap, nbr_summary, targets, Vec::new())
     }
 }
 
@@ -478,6 +512,106 @@ fn repair_constraints(
     Ok(())
 }
 
+fn record_cluster_attempt(
+    history: &mut Vec<PriorCluster>,
+    centroid_nm: Pt,
+    radius_nm: Nm,
+    base_nets: Option<&HashSet<String>>,
+    attempt: usize,
+) {
+    let mut matched = false;
+    for prior in history.iter_mut() {
+        if prior.matches_region(centroid_nm, radius_nm, base_nets) {
+            prior.attempts = prior.attempts.max(attempt);
+            prior.centroid_nm = centroid_nm;
+            prior.radius_nm = prior.radius_nm.max(radius_nm);
+            if let Some(nets) = base_nets {
+                prior.base_nets.extend(nets.iter().cloned());
+            }
+            matched = true;
+        }
+    }
+    if !matched {
+        history.push(PriorCluster {
+            centroid_nm,
+            radius_nm,
+            base_nets: base_nets.cloned().unwrap_or_default(),
+            attempts: attempt,
+        });
+    }
+}
+
+fn repair_pours(
+    board: &mut BoardIr,
+    state: &mut RepairState<'_>,
+    eligible_nets: &HashSet<String>,
+    scope_nets: Option<&HashSet<String>>,
+    base_pad_mm: f64,
+) -> Result<(), String> {
+    let mut history: Vec<PriorCluster> = Vec::new();
+    while state.can_step() {
+        let chokes = state
+            .zone_state
+            .as_ref()
+            .map(|(_, c)| c.as_slice())
+            .unwrap_or(&[]);
+        if chokes.is_empty() && state.cur_eval.pour_opens.is_empty() {
+            break;
+        }
+        let hotspots = collect_pour_hotspots(
+            board,
+            chokes,
+            &state.cur_eval.pour_opens,
+            eligible_nets,
+            scope_nets,
+        );
+        if hotspots.is_empty() {
+            break;
+        }
+        let Some((h_idx, prev_attempts)) = hotspots
+            .iter()
+            .enumerate()
+            .map(|(idx, h)| {
+                let prev = history
+                    .iter()
+                    .filter(|p| p.matches_region(h.centroid_nm, h.radius_nm, None))
+                    .map(|p| p.attempts)
+                    .max()
+                    .unwrap_or(0);
+                (idx, prev)
+            })
+            .filter(|(_, prev)| *prev < 3)
+            .min_by_key(|(idx, prev)| (*prev, *idx))
+        else {
+            break;
+        };
+
+        let hotspot = &hotspots[h_idx];
+        let attempt = prev_attempts + 1;
+        let neighbor_radius_nm = ((attempt - 1) as Nm) * NEIGHBOR_RADIUS_STEP_NM;
+        let pad_mm = base_pad_mm + ((attempt - 1) as f64) * REROUTE_PAD_STEP_MM;
+        let targets = collect_hotspot_targets(
+            board,
+            eligible_nets,
+            &hotspot.base_nets,
+            &hotspot.anchors,
+            hotspot.radius_nm,
+            neighbor_radius_nm,
+            Some(hotspot.pour_net.as_str()),
+        );
+        let keepouts = hotspot.build_keepouts(board, attempt);
+        record_cluster_attempt(
+            &mut history,
+            hotspot.centroid_nm,
+            hotspot.radius_nm,
+            None,
+            attempt,
+        );
+        state.try_candidate_with_keepouts(board, targets, pad_mm, keepouts)?;
+    }
+    Ok(())
+}
+
 /// Runs `route_board_ir`, optionally followed by bounded hotspot auto-repair and final `tune_match_groups`.
 pub(crate) fn route_with_repair(
     board: &mut BoardIr,
@@ -515,8 +649,12 @@ pub(crate) fn route_with_repair(
     let mut pass_cfg = cfg.clone();
     pass_cfg.tune_match_groups = false;
     let initial_summary = route_board_ir(board, &pass_cfg)?;
-    let initial_eval =
-        eval_repair_state(board, &cfg.ignored_nets, initial_summary.unconnected_pairs);
+    let initial_eval = eval_repair_state(
+        board,
+        &cfg.ignored_nets,
+        initial_summary.unconnected_pairs,
+        None,
+    );
     let mut history: Vec<PriorCluster> = Vec::new();
     let mut state = RepairState {
         cfg,
@@ -530,6 +668,8 @@ pub(crate) fn route_with_repair(
         summary: initial_summary,
         repaired_nets: HashSet::new(),
         cur_eval: initial_eval,
+        pour_keepouts: Vec::new(),
+        zone_state: None,
     };
 
     while state.can_step() && !state.cur_eval.repairable.is_empty() {
@@ -568,7 +708,7 @@ pub(crate) fn route_with_repair(
                 }
                 let prev_attempts = history
                     .iter()
-                    .filter(|p| p.matches(h, &base_nets))
+                    .filter(|p| p.matches_region(h.centroid_nm, h.radius_nm, Some(&base_nets)))
                     .map(|p| p.attempts)
                     .max()
                     .unwrap_or(0);
@@ -588,34 +728,46 @@ pub(crate) fn route_with_repair(
         let attempt = prev_attempts + 1;
         let neighbor_radius_nm = ((attempt - 1) as Nm) * NEIGHBOR_RADIUS_STEP_NM;
         let pad_mm = base_pad_mm + ((attempt - 1) as f64) * REROUTE_PAD_STEP_MM;
+        let anchors = collect_hotspot_anchors(board, hotspot);
         let targets = collect_hotspot_targets(
             board,
             &eligible_nets,
             base_nets,
-            hotspot,
+            &anchors,
+            hotspot.radius_nm,
             neighbor_radius_nm,
+            None,
         );
 
-        let mut matched = false;
-        for prior in &mut history {
-            if prior.matches(hotspot, base_nets) {
-                prior.attempts = prior.attempts.max(attempt);
-                prior.centroid_nm = hotspot.centroid_nm;
-                prior.radius_nm = prior.radius_nm.max(hotspot.radius_nm);
-                prior.base_nets.extend(base_nets.iter().cloned());
-                matched = true;
-            }
-        }
-        if !matched {
-            history.push(PriorCluster {
-                centroid_nm: hotspot.centroid_nm,
-                radius_nm: hotspot.radius_nm,
-                base_nets: base_nets.clone(),
-                attempts: attempt,
-            });
-        }
+        record_cluster_attempt(
+            &mut history,
+            hotspot.centroid_nm,
+            hotspot.radius_nm,
+            Some(base_nets),
+            attempt,
+        );
 
         state.try_candidate(board, targets, pad_mm)?;
+    }
+
+    if !board.pours.is_empty() && state.can_step() {
+        let zone_rep = fill_zones(board);
+        let unconnected: usize = zone_rep.pours.iter().map(|p| p.unconnected_terminals).sum();
+        let choke_count = zone_rep.chokes.len();
+        state.zone_state = Some((unconnected, zone_rep.chokes));
+        state.cur_eval = eval_repair_state(
+            board,
+            &cfg.ignored_nets,
+            state.summary.unconnected_pairs,
+            Some((unconnected, choke_count)),
+        );
+        repair_pours(
+            board,
+            &mut state,
+            &eligible_nets,
+            scope_nets.as_ref(),
+            base_pad_mm,
+        )?;
     }
 
     if state.can_step() && !state.cur_eval.constraint_excess.is_empty() {
@@ -628,7 +780,14 @@ pub(crate) fn route_with_repair(
         )?;
     }
 
+    if !board.pours.is_empty() {
+        board.filled_pours.clear();
+    }
+
     let mut summary = state.summary;
+    if !state.pour_keepouts.is_empty() {
+        summary.drc_violations = state.cur_eval.score.geom_viols;
+    }
     let repaired_nets = state.repaired_nets;
     if cfg.tune_match_groups {
         let only_nets = cfg.reroute_nets.clone().map(|mut s| {
@@ -660,7 +819,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{RepairScore, eval_repair_state};
-    use crate::ir::{BoardIr, BoardSpec, MaxLengthRule, MaxViasRule, Pt, Track, Via, mm};
+    use crate::ir::{
+        BoardIr, BoardSpec, FilledPour, MaxLengthRule, MaxViasRule, PourPoly, Pt, Track, Via, mm,
+    };
 
     #[test]
     fn eval_repair_state_prioritizes_geom_drc_over_max_length() {
@@ -721,7 +882,7 @@ edge_clearance_nm = 300000
             },
         ];
         let ignored = HashSet::new();
-        let s_long = eval_repair_state(&board, &ignored, 0);
+        let s_long = eval_repair_state(&board, &ignored, 0, None);
         assert_eq!(s_long.score.unconnected_pairs, 0);
         assert_eq!(s_long.score.geom_viols, 0);
         assert_eq!(s_long.score.max_length_viols, 1);
@@ -730,7 +891,7 @@ edge_clearance_nm = 300000
         // Shorter excess length improves score when geom_viols and max_length_count are equal.
         board.tracks[0].b = Pt::new(mm(9.0), mm(13.0));
         board.tracks[1].a = Pt::new(mm(9.0), mm(13.0));
-        let s_shorter = eval_repair_state(&board, &ignored, 0);
+        let s_shorter = eval_repair_state(&board, &ignored, 0, None);
         assert_eq!(
             (
                 s_shorter.score.unconnected_pairs,
@@ -761,7 +922,7 @@ edge_clearance_nm = 300000
                 locked: false,
             },
         ];
-        let s_geom_bad = eval_repair_state(&board, &ignored, 0);
+        let s_geom_bad = eval_repair_state(&board, &ignored, 0, None);
         assert!(s_geom_bad.score.geom_viols > 0);
         assert_eq!(s_geom_bad.score.max_length_viols, 0);
         assert!(s_long.score.is_better_than(&s_geom_bad.score));
@@ -800,12 +961,12 @@ edge_clearance_nm = 300000
                 tented: true,
             },
         ];
-        let s_two_vias = eval_repair_state(&board, &ignored, 0);
+        let s_two_vias = eval_repair_state(&board, &ignored, 0, None);
         assert_eq!(s_two_vias.score.max_vias_viols, 1);
         assert_eq!(s_two_vias.score.total_excess_vias, 2);
 
         board.vias.pop();
-        let s_one_via = eval_repair_state(&board, &ignored, 0);
+        let s_one_via = eval_repair_state(&board, &ignored, 0, None);
         assert_eq!(s_one_via.score.max_vias_viols, 1);
         assert_eq!(s_one_via.score.total_excess_vias, 1);
         assert!(s_one_via.score.is_better_than(&s_two_vias.score));
@@ -814,6 +975,9 @@ edge_clearance_nm = 300000
         let trade_len = RepairScore {
             unconnected_pairs: 0,
             geom_viols: 0,
+            pour_opens: 0,
+            unconnected_pour_terminals: 0,
+            zone_chokes: 0,
             max_length_viols: 1,
             max_vias_viols: 0,
             total_excess_nm: mm(2.0),
@@ -822,6 +986,9 @@ edge_clearance_nm = 300000
         let trade_vias = RepairScore {
             unconnected_pairs: 0,
             geom_viols: 0,
+            pour_opens: 0,
+            unconnected_pour_terminals: 0,
+            zone_chokes: 0,
             max_length_viols: 0,
             max_vias_viols: 1,
             total_excess_nm: 0,
@@ -840,7 +1007,7 @@ edge_clearance_nm = 300000
             locked: true,
             tented: true,
         }];
-        let s_locked_only = eval_repair_state(&board, &ignored, 0);
+        let s_locked_only = eval_repair_state(&board, &ignored, 0, None);
         assert_eq!(s_locked_only.score.max_vias_viols, 1);
         assert_eq!(s_locked_only.score.total_excess_vias, 1);
         assert!(!s_locked_only.constraint_excess.contains_key("SIG_A"));
@@ -854,11 +1021,113 @@ edge_clearance_nm = 300000
             locked: false,
             tented: true,
         });
-        let s_locked_plus_unlocked = eval_repair_state(&board, &ignored, 0);
+        let s_locked_plus_unlocked = eval_repair_state(&board, &ignored, 0, None);
         assert!(
             s_locked_only
                 .score
                 .is_better_than(&s_locked_plus_unlocked.score)
         );
+    }
+
+    #[test]
+    fn repair_score_rejects_pour_open_and_island_destruction_trades() {
+        let narrow_neck = RepairScore {
+            unconnected_pairs: 0,
+            geom_viols: 0,
+            pour_opens: 0,
+            unconnected_pour_terminals: 0,
+            zone_chokes: 1,
+            max_length_viols: 0,
+            max_vias_viols: 0,
+            total_excess_nm: 0,
+            total_excess_vias: 0,
+        };
+        let severed_pour = RepairScore {
+            pour_opens: 1,
+            zone_chokes: 0,
+            ..narrow_neck
+        };
+        assert!(!severed_pour.is_better_than(&narrow_neck));
+        assert!(narrow_neck.is_better_than(&severed_pour));
+
+        let split_pour = RepairScore {
+            unconnected_pairs: 0,
+            geom_viols: 0,
+            pour_opens: 1,
+            unconnected_pour_terminals: 0,
+            zone_chokes: 1,
+            max_length_viols: 0,
+            max_vias_viols: 0,
+            total_excess_nm: 0,
+            total_excess_vias: 0,
+        };
+        let destroyed_island = RepairScore {
+            unconnected_pour_terminals: 1,
+            zone_chokes: 0,
+            ..split_pour
+        };
+        assert!(!destroyed_island.is_better_than(&split_pour));
+        assert!(split_pour.is_better_than(&destroyed_island));
+
+        let healed = RepairScore {
+            pour_opens: 0,
+            unconnected_pour_terminals: 0,
+            zone_chokes: 0,
+            ..split_pour
+        };
+        assert!(healed.is_better_than(&split_pour));
+    }
+
+    #[test]
+    fn eval_repair_state_keeps_prebaked_filled_pour_opens_repairable() {
+        let spec: BoardSpec = toml::from_str(
+            r#"
+name = "prebaked_pour_open"
+size_nm = [20000000, 12000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[footprints.PAD1]
+kind = "custom"
+[[footprints.PAD1.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 600000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[[placements]]
+refdes = "A1"
+footprint = "PAD1"
+pos = { x = 4000000, y = 6000000 }
+locked = true
+pin_nets = { "1" = "GND" }
+[[placements]]
+refdes = "A2"
+footprint = "PAD1"
+pos = { x = 16000000, y = 6000000 }
+locked = true
+pin_nets = { "1" = "GND" }
+"#,
+        )
+        .unwrap();
+        let mut board = BoardIr::from_spec(&spec).unwrap();
+        board.filled_pours.push(FilledPour {
+            net: "GND".into(),
+            layer: "F.Cu".into(),
+            priority: 0,
+            polys: vec![PourPoly {
+                outer: vec![
+                    Pt::new(mm(3.0), mm(5.0)),
+                    Pt::new(mm(8.0), mm(5.0)),
+                    Pt::new(mm(8.0), mm(7.0)),
+                    Pt::new(mm(3.0), mm(7.0)),
+                ],
+                holes: Vec::new(),
+            }],
+        });
+        let eval = eval_repair_state(&board, &HashSet::new(), 1, None);
+        assert_eq!(eval.pour_opens.len(), 0);
+        assert_eq!(eval.repairable.len(), 1);
     }
 }

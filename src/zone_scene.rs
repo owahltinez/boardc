@@ -318,7 +318,7 @@ pub(crate) fn collect_layer_scene(
             obstacles.push(Obstacle {
                 kind: BlockerKind::Track,
                 net: track.net.clone(),
-                label: format!("track:{}", track.net),
+                label: format!("track#{idx}:{}", track.net),
                 pos: track.a.midpoint(track.b),
                 cleared_poly: pts_to_path64(&pts),
                 cleared_bbox,
