@@ -893,12 +893,8 @@ impl LegalizeCtx<'_> {
                 .then_some(board.rules.smd_to_smd_nm)
                 .flatten();
             let req = board.pair_clearance(&lp.net, &op.net, rule_ov);
-            if wb.expand(req).intersects(op.bbox)
-                && ws.dist_to_shape(&op.shape) < req as f64 - EPS_NM
-            {
-                return false;
-            }
-            true
+            !(wb.expand(req).intersects(op.bbox)
+                && ws.dist_to_shape(&op.shape) < req as f64 - EPS_NM)
         };
 
         if let Some(lpb) = tmpl.local_pads_bbox {

@@ -47,7 +47,7 @@ Do not apply KiCad Y-down or millimeter assumptions when editing `BoardSpec` or 
    ```
    Outputs go to `out/` (`<name>.board.json`, `out/fab/`, `out/svg/`). Unchanged stages reuse `.boardc-cache/`.
    - Mark movable components `locked = false` to let the legalizer resolve courtyard overlaps, BGA shadows, keepouts, and `cap_proximity` rules.
-   - Pass `--via-at-smd` for POFV via-in-pad fanout on dense BGAs and `--repair-passes <N>` to run bounded hotspot rip-up/reroute passes automatically after routing.
+   - Pass `--via-at-smd` for POFV via-in-pad fanout on dense BGAs and `--repair-passes <N>` to run bounded post-route hotspot auto-repair (geometric, pour-split `open_net`/`zone_choke`, `max_length`, and `max_vias` violations) with strict `--timeout` budget reservation and per-pass capping.
 
 4. **Triage DRC hotspots and iterate narrowly**:
    - Read `drc.hotspots` from the `--json` report (grouped by shared root-cause item and spatial proximity) and inspect `out/svg/*_top.svg` / `*_bottom.svg` (hotspot overlays are enabled by default).
@@ -104,7 +104,7 @@ kicad-cli pcb render out/board.kicad_pcb -o out/render_bot.png --side bottom --q
 - Board metadata & graphics: optional top-level `title` and `revision` populate KiCad `(title_block ...)` and `<name>-job.gbrjob` `"Revision"`; `[[graphics]]` supports `line`, `rect`, `circle`, `poly`, and `text` (multi-line, rotated `rot_deg`, auto-mirrored on `B.*` layers across Gerber, SVG, and KiCad).
 - Stackup (`[stackup]`): `thickness_nm`, `finish`, `pofv` (via plugging + filling + capping), and `dielectric_nm` (emitted to `<name>-job.gbrjob` and KiCad `(general)`/`(setup (stackup ...))`).
 - Fabrication silkscreen (`[fab]`): `auto_refdes` (`true`/`"rotate"` default, `"upright"` to avoid upside-down labels on both sides, or `false`/`"off"` to suppress auto-generated refdes and pin-1 dots in Gerber/SVG and raw `.kicad_mod` `export-kicad` while keeping explicit silkscreen graphics) and `refdes_stroke_nm` (default `120000`, must be `>= 10000`); override via `boardc fab --no-auto-refdes`, `--auto-refdes <mode>`, or `--refdes-stroke-nm <nm>`.
-- Constraints (`[constraints]`): `max_lengths`, `match_groups`, `cap_proximity`, `min_vias`, and `bga_shadows`.
+- Constraints (`[constraints]`): `max_lengths`, `match_groups`, `cap_proximity`, `min_vias`, `max_vias`, and `bga_shadows`.
 - Mask-to-copper, silkscreen & dangling-copper DRC (`[rules]`): optional `mask_to_copper_nm` is enforced during both outer-layer routing and DRC (`solder_mask_to_copper`, imported/exported via `.kicad_pro` `solder_mask_to_copper_clearance`); optional `silk_to_mask_nm` (`silk_over_copper`) and `silk_to_edge_nm` (`silk_edge_clearance`) check silkscreen clearance natively; dead-end grid-snap stubs are pruned after routing and remaining dangling tracks/vias are reported as `track_dangling`/`via_dangling`.
 - Keepout kinds: `all`, `track`, `via`, `copper` (pours only, allows tracks), `placement`, or `custom` (`tracks`/`vias`/`copper`/`placement` booleans).
 - `boardc` embeds `viahop` statically; you do not need `viahop` installed separately unless you specifically need Specctra `.dsn`/`.ses` Freerouting compatibility.
