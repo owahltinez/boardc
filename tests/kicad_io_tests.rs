@@ -963,3 +963,176 @@ fn kicad_text_size_order_subnm_placeholders_keep_upright_and_non_sided_mirror() 
         "non-sided layer on Side::Bottom must emit (justify mirror): {dwg_line}"
     );
 }
+
+#[test]
+fn kicad_roundtrip_preserves_disambiguated_fp_ids_locked_fp_text_keepouts_and_nonrect_courtyard() {
+    use std::collections::BTreeMap;
+
+    use boardc::geom::pad_to_world_shape;
+    use boardc::ir::{
+        BoardIr, BoardSpec, Keepout, KeepoutKind, PadDef, PadKind, PadShape, Placement,
+    };
+    use boardc::kicad_export::render_kicad_pcb;
+    use boardc::kicad_io::parse_kicad_mod;
+
+    // 1. Disambiguated footprints keep original KiCad ID on export and legacy `fp_text ... locked` parses cleanly.
+    let pcb_src = r#"(kicad_pcb (version 20240108) (generator "test")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (5 "F.SilkS" user) (25 "Edge.Cuts" user))
+  (net 0 "") (net 1 "SIG")
+  (gr_rect (start 0 0) (end 40 -30) (stroke (width 0.1)) (layer "Edge.Cuts"))
+  (footprint "Lib:R_0402" (layer "F.Cu") (at 10 -10 0)
+    (fp_text reference locked "R1" (at 0 -1) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+    (fp_text value locked "10k" (at 0 1) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+    (fp_text user locked "PIN1" (at 0.5 -0.5) (layer "F.SilkS") (effects (font (size 0.8 0.8) (thickness 0.12))))
+    (pad "1" smd rect (at 0 0 0) (size 0.6 0.6) (layers "F.Cu" "F.Mask") (net 1 "SIG"))
+  )
+  (footprint "Lib:R_0402" (layer "F.Cu") (at 20 -10 0)
+    (property "Reference" "R2" (at 0 0 0) (layer "F.Fab"))
+    (property "Value" "22k" (at 0 0 0) (layer "F.Fab"))
+    (pad "1" smd rect (at 0 0 0) (size 0.8 0.6) (layers "F.Cu" "F.Mask") (net 1 "SIG"))
+  )
+)"#;
+    let ir = parse_kicad_pcb(pcb_src, None).expect("parse disambiguated + locked fp_text");
+    let r1 = ir.placements.iter().find(|p| p.refdes == "R1").unwrap();
+    let r2 = ir.placements.iter().find(|p| p.refdes == "R2").unwrap();
+    assert_eq!(r1.value, "10k");
+    assert_eq!(r1.footprint, "Lib:R_0402");
+    assert_eq!(r2.footprint, "Lib:R_0402#R2");
+    assert_eq!(ir.footprints["Lib:R_0402#R2"].name, "Lib:R_0402");
+    assert!(
+        ir.footprints["Lib:R_0402"]
+            .graphics
+            .iter()
+            .any(|g| matches!(g, Graphic::Text { text, .. } if text == "PIN1"))
+    );
+    let exported = render_kicad_pcb(&ir);
+    assert!(
+        !exported.contains("Lib:R_0402#R2"),
+        "exported .kicad_pcb leaked internal map key:\n{exported}"
+    );
+    assert_eq!(exported.matches("(footprint \"Lib:R_0402\"").count(), 2);
+
+    // 2. Structured .kicad_mod round-trip across Top/Bottom + rotations: roundrect/custom/NPTH pads,
+    //    non-rectangular 4-vertex courtyard (`axis_aligned_rect` fallback to fp_line), and footprint keepout.
+    let mod_src = r#"(footprint "Rich:Part"
+  (version 20241229) (layer "F.Cu")
+  (pad "1" smd roundrect (at -1.0 0.5) (size 0.8 0.5) (roundrect_rratio 0.25) (layers "F.Cu" "F.Mask" "F.Paste"))
+  (pad "2" np_thru_hole circle (at 1.5 -0.4) (size 0.9 0.9) (drill 0.9) (layers "*.Cu" "*.Mask"))
+  (zone (net 0) (net_name "") (layers "F.Cu")
+    (keepout (tracks not_allowed) (vias not_allowed) (pads allowed) (copperpour not_allowed) (footprints allowed))
+    (polygon (pts (xy -0.5 -0.5) (xy 0.5 -0.5) (xy 0.5 0.5) (xy -0.5 0.5)))
+  )
+)"#;
+    let mut rich_fp = parse_kicad_mod(mod_src).expect("parse rich kicad_mod");
+    // Diamond 4-vertex courtyard must reject axis-aligned rect fast path and export fp_line segments.
+    rich_fp.courtyard = vec![
+        Pt::new(0, mm(-1.5)),
+        Pt::new(mm(2.0), 0),
+        Pt::new(0, mm(1.5)),
+        Pt::new(mm(-2.0), 0),
+    ];
+    rich_fp.pads.push(PadDef {
+        name: "3".into(),
+        kind: PadKind::Smd,
+        shape: PadShape::Poly {
+            verts: vec![
+                Pt::new(mm(-0.3), mm(-0.2)),
+                Pt::new(mm(0.4), mm(-0.2)),
+                Pt::new(mm(0.2), mm(0.3)),
+            ],
+        },
+        pos: Pt::new(mm(0.2), mm(1.0)),
+        rot_deg: 0.0,
+        drill_nm: None,
+        layers: vec!["F.Cu".into(), "F.Mask".into()],
+        mask_margin_nm: None,
+        paste_margin_nm: None,
+    });
+    assert_eq!(rich_fp.keepouts.len(), 1);
+    assert_eq!(
+        rich_fp.keepouts[0].kind,
+        KeepoutKind::Custom {
+            tracks: true,
+            vias: true,
+            copper: true,
+            placement: false,
+        }
+    );
+
+    let mut board = BoardIr::from_spec(&BoardSpec {
+        name: "rich_rt".into(),
+        size_nm: Some([mm(60.0), mm(40.0)]),
+        ..Default::default()
+    })
+    .unwrap();
+    board.footprints.insert("Rich:Part".into(), rich_fp);
+    for (idx, (side, rot)) in [
+        (Side::Top, 0.0),
+        (Side::Top, 90.0),
+        (Side::Bottom, 180.0),
+        (Side::Bottom, 270.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        board.placements.push(Placement {
+            refdes: format!("U{}", idx + 1),
+            footprint: "Rich:Part".into(),
+            pos: Pt::new(mm(10.0 + idx as f64 * 12.0), mm(20.0)),
+            rot_deg: rot,
+            side,
+            pin_nets: BTreeMap::from([("1".into(), "N1".into()), ("3".into(), "N2".into())]),
+            ..Default::default()
+        });
+    }
+
+    let rendered = render_kicad_pcb(&board);
+    assert!(
+        rendered.contains("(fp_line ") && !rendered.contains("(fp_rect "),
+        "non-rectangular 4-vertex courtyard must fall back to fp_line"
+    );
+    let rt = parse_kicad_pcb(&rendered, None).expect("reimport rich round-trip");
+    // All four Top/Bottom rotated instances must deduplicate to one FootprintDef.
+    assert_eq!(
+        rt.footprints.len(),
+        1,
+        "expected deduplicated footprint across sides/rotations, got {:?}",
+        rt.footprints.keys().collect::<Vec<_>>()
+    );
+    let rt_fp = &rt.footprints["Rich:Part"];
+    assert_eq!(rt_fp.courtyard.len(), 4);
+    assert_eq!(rt_fp.keepouts.len(), 1);
+    let orig_ko: &Keepout = &board.footprints["Rich:Part"].keepouts[0];
+    assert_eq!(rt_fp.keepouts[0].kind, orig_ko.kind);
+    assert_eq!(rt_fp.keepouts[0].layers, orig_ko.layers);
+    assert_eq!(rt_fp.keepouts[0].poly.len(), orig_ko.poly.len());
+    for (orig_pl, rt_pl) in board.placements.iter().zip(rt.placements.iter()) {
+        let orig_fp = &board.footprints[&orig_pl.footprint];
+        let rfp = &rt.footprints[&rt_pl.footprint];
+        assert_eq!(orig_fp.pads.len(), rfp.pads.len());
+        for (op, rp) in orig_fp.pads.iter().zip(rfp.pads.iter()) {
+            let ob = pad_to_world_shape(op, orig_pl, 16).bbox();
+            let rb = pad_to_world_shape(rp, rt_pl, 16).bbox();
+            assert!(
+                (ob.min_x - rb.min_x).abs() <= 5_000,
+                "{}: {ob:?} vs {rb:?}",
+                orig_pl.refdes
+            );
+            assert!(
+                (ob.max_x - rb.max_x).abs() <= 5_000,
+                "{}: {ob:?} vs {rb:?}",
+                orig_pl.refdes
+            );
+            assert!(
+                (ob.min_y - rb.min_y).abs() <= 5_000,
+                "{}: {ob:?} vs {rb:?}",
+                orig_pl.refdes
+            );
+            assert!(
+                (ob.max_y - rb.max_y).abs() <= 5_000,
+                "{}: {ob:?} vs {rb:?}",
+                orig_pl.refdes
+            );
+        }
+    }
+}

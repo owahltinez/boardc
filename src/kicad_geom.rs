@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, TAU};
 
 use viahop::sexp::SExp;
@@ -122,40 +122,14 @@ pub(crate) fn parse_kicad_sexp(src: &str) -> Result<SExp, String> {
     root.ok_or_else(|| "empty KiCad S-expression".into())
 }
 
-pub(crate) fn is_ignored_kicad_field(name: &str) -> bool {
-    name.trim().is_empty()
-        || matches!(
-            name,
-            "Reference" | "Value" | "Footprint" | "Sheetname" | "Sheetfile"
-        )
-        || name.starts_with("ki_")
-}
-
-pub(crate) fn is_exportable_kicad_field(k: &str, v: &str) -> bool {
-    !(is_ignored_kicad_field(k) || v.is_empty() || (k == "Datasheet" && v == "~"))
-}
-
-pub(crate) fn insert_kicad_field(fields: &mut BTreeMap<String, String>, k: &str, v: &str) {
-    if !is_exportable_kicad_field(k, v) {
-        return;
-    }
-    fields.insert(k.to_string(), v.to_string());
-}
-
-pub(crate) fn find_field_ci(fields: &BTreeMap<String, String>, key: &str) -> Option<String> {
-    fields
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v.clone())
-}
-
-pub(crate) fn normalize_sheetname(raw: &str) -> String {
-    let trimmed = raw.trim().trim_matches('/');
-    if trimmed.is_empty() {
-        "/".into()
+pub(crate) fn fp_text_value(node: &SExp) -> Option<&str> {
+    let items = node.as_list()?;
+    let idx = if items.get(2).and_then(SExp::as_atom) == Some("locked") && items.len() > 3 {
+        3
     } else {
-        format!("/{trimmed}/")
-    }
+        2
+    };
+    items.get(idx)?.as_atom()
 }
 
 pub(crate) fn atom_at(node: &SExp, idx: usize) -> Option<&str> {
@@ -413,10 +387,7 @@ pub(crate) fn parse_graphic_node(
                 if atom_at(node, 1) != Some("user") {
                     return Vec::new();
                 }
-                let val_idx = node
-                    .as_list()
-                    .map_or(2, crate::kicad_raw_fp::fp_text_val_idx);
-                atom_at(node, val_idx).filter(|t| !t.contains("${"))
+                fp_text_value(node).filter(|t| !t.contains("${"))
             } else {
                 atom_at(node, 1)
             };

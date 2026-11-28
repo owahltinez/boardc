@@ -3,8 +3,7 @@ use std::fmt::Write as _;
 
 use crate::geom::{local_to_board, remap_layer_for_side};
 use crate::ir::{
-    BBoxNm, FootprintDef, Graphic, Keepout, Nm, PadDef, PadKind, PadShape, Placement, Pt, Side,
-    nm_to_mm,
+    BBoxNm, BoardIr, Graphic, Keepout, Nm, PadDef, PadKind, PadShape, Placement, Pt, Side, nm_to_mm,
 };
 
 pub(crate) struct UuidGen(pub(crate) u64);
@@ -39,7 +38,7 @@ fn kicad_layer_name(layer: &str) -> &str {
     }
 }
 
-pub(crate) fn remap_kicad_layer(layer: &str, side: Side) -> String {
+fn remap_kicad_layer(layer: &str, side: Side) -> String {
     let mapped = remap_layer_for_side(layer, side);
     kicad_layer_name(&mapped).to_string()
 }
@@ -249,14 +248,16 @@ pub(crate) fn write_graphic(
 pub(crate) fn write_keepout(
     out: &mut String,
     ko: &Keepout,
-    y_sign: i64,
-    side: Side,
-    indent: &str,
+    pl: Option<&Placement>,
     uuids: &mut UuidGen,
 ) {
     if ko.poly.len() < 3 {
         return;
     }
+    let (side, indent) = match pl {
+        Some(p) => (p.side, "\t\t"),
+        None => (Side::Top, "\t"),
+    };
     let tracks = if ko.kind.blocks_tracks() {
         "not_allowed"
     } else {
@@ -277,20 +278,16 @@ pub(crate) fn write_keepout(
     } else {
         "allowed"
     };
-    let layers: Vec<String> = if ko.layers.is_empty() {
-        vec!["*.Cu".into()]
-    } else {
-        ko.layers
-            .iter()
-            .map(|l| remap_kicad_layer(l, side))
-            .collect()
-    };
     let _ = writeln!(out, "{indent}(zone");
     let _ = writeln!(out, "{indent}\t(net 0)");
     let _ = writeln!(out, "{indent}\t(net_name \"\")");
     let _ = write!(out, "{indent}\t(layers");
-    for l in &layers {
-        let _ = write!(out, " \"{}\"", esc(l));
+    if ko.layers.is_empty() {
+        out.push_str(" \"*.Cu\"");
+    } else {
+        for l in &ko.layers {
+            let _ = write!(out, " \"{}\"", esc(&remap_kicad_layer(l, side)));
+        }
     }
     out.push_str(")\n");
     let _ = writeln!(out, "{indent}\t(uuid \"{}\")", uuids.next());
@@ -300,7 +297,17 @@ pub(crate) fn write_keepout(
         "{indent}\t(keepout (tracks {tracks}) (vias {vias}) (pads allowed) (copperpour {copperpour}) (footprints {footprints}))"
     );
     let _ = writeln!(out, "{indent}\t(polygon");
-    write_pts(out, &ko.poly, y_sign, &format!("{indent}\t\t"));
+    let pts_indent = format!("{indent}\t\t");
+    if let Some(p) = pl {
+        let world: Vec<Pt> = ko
+            .poly
+            .iter()
+            .map(|&pt| local_to_board(pt, p.pos.x, p.pos.y, p.rot_deg, p.side))
+            .collect();
+        write_pts(out, &world, -1, &pts_indent);
+    } else {
+        write_pts(out, &ko.poly, -1, &pts_indent);
+    }
     let _ = writeln!(out, "{indent}\t)");
     let _ = writeln!(out, "{indent})");
 }
@@ -415,81 +422,128 @@ fn write_pad(
     out.push_str("\t\t)\n");
 }
 
-pub(crate) fn write_footprint_body(
+fn write_fp_property(out: &mut String, key: &str, val: &str, bottom: bool, uuids: &mut UuidGen) {
+    let fab_layer = if bottom { "B.Fab" } else { "F.Fab" };
+    let just = if bottom { " (justify mirror)" } else { "" };
+    let _ = writeln!(
+        out,
+        "\t\t(property \"{}\" \"{}\" (at 0 0 0) (layer \"{fab_layer}\") (hide yes) (uuid \"{}\") (effects (font (size 1 1) (thickness 0.15)){just}))",
+        esc(key),
+        esc(val),
+        uuids.next()
+    );
+}
+
+pub(crate) fn write_footprints(
     out: &mut String,
-    pl: &Placement,
-    fp: &FootprintDef,
+    board: &BoardIr,
     net_ids: &BTreeMap<String, usize>,
     uuids: &mut UuidGen,
 ) {
-    // B.Cu footprints in .kicad_pcb store Y-flipped local coords (y_sign = +1).
-    let bottom = pl.side == Side::Bottom;
-    let y_sign: i64 = if bottom { 1 } else { -1 };
-    let crtyd_layer = if bottom { "B.CrtYd" } else { "F.CrtYd" };
-
-    for g in &fp.graphics {
-        let layer = g.layer();
-        if layer == "F.CrtYd" || layer == "B.CrtYd" || layer == "Edge.Cuts" {
+    for pl in &board.placements {
+        let Some(fp) = board.footprints.get(&pl.footprint) else {
             continue;
-        }
-        write_graphic(out, g, Some(pl), uuids);
-    }
-
-    if fp.courtyard.len() >= 3 {
-        if let Some((min, max)) = axis_aligned_rect(&fp.courtyard) {
-            let rect = Graphic::Rect {
-                layer: "F.CrtYd".to_string(),
-                min,
-                max,
-                width: 50_000,
-                fill: false,
-            };
-            write_graphic(out, &rect, Some(pl), uuids);
-        } else {
-            write_closed_poly_lines(
-                out,
-                "fp_line",
-                crtyd_layer,
-                &fp.courtyard,
-                50_000,
-                y_sign,
-                uuids,
-            );
-        }
-    }
-
-    for ko in &fp.keepouts {
-        let world_ko = Keepout {
-            kind: ko.kind,
-            layers: ko.layers.clone(),
-            poly: ko
-                .poly
-                .iter()
-                .map(|&p| local_to_board(p, pl.pos.x, pl.pos.y, pl.rot_deg, pl.side))
-                .collect(),
         };
-        write_keepout(out, &world_ko, -1, pl.side, "\t\t", uuids);
-    }
-    for pad in &fp.pads {
-        write_pad(out, pad, pl, y_sign, net_ids, uuids);
-    }
-    for m in &fp.models {
-        let _ = writeln!(out, "\t\t(model \"{}\"", esc(&m.path));
+        // B.Cu footprints in .kicad_pcb store Y-flipped local coords (y_sign = +1).
+        let bottom = pl.side == Side::Bottom;
+        let y_sign: i64 = if bottom { 1 } else { -1 };
+        let crtyd_layer = if bottom { "B.CrtYd" } else { "F.CrtYd" };
+
+        let _ = writeln!(out, "\t(footprint \"{}\"", esc(&fp.name));
+        let _ = writeln!(out, "\t\t(layer \"{}\")", pl.side.cu_layer());
+        let _ = writeln!(out, "\t\t(uuid \"{}\")", uuids.next());
         let _ = writeln!(
             out,
-            "\t\t\t(offset (xyz {:.6} {:.6} {:.6}))",
-            m.offset_mm[0], m.offset_mm[1], m.offset_mm[2]
+            "\t\t(at {:.6} {:.6} {:.4})",
+            nm_to_mm(pl.pos.x),
+            nm_to_mm(-pl.pos.y),
+            pl.rot_deg.rem_euclid(360.0)
         );
-        let _ = writeln!(
-            out,
-            "\t\t\t(scale (xyz {:.6} {:.6} {:.6}))",
-            m.scale[0], m.scale[1], m.scale[2]
-        );
-        let _ = writeln!(
-            out,
-            "\t\t\t(rotate (xyz {:.6} {:.6} {:.6}))",
-            m.rotate_deg[0], m.rotate_deg[1], m.rotate_deg[2]
-        );
-        out.push_str("\t\t)\n");
+        if pl.locked {
+            out.push_str("\t\t(locked yes)\n");
+        }
+        write_fp_property(out, "Reference", &pl.refdes, bottom, uuids);
+        write_fp_property(out, "Value", &pl.value, bottom, uuids);
+        if let Some(mpn) = pl.mpn.as_deref().filter(|s| !s.trim().is_empty()) {
+            write_fp_property(out, "MPN", mpn, bottom, uuids);
+        }
+        if let Some(lcsc) = pl.lcsc.as_deref().filter(|s| !s.trim().is_empty()) {
+            write_fp_property(out, "LCSC", lcsc, bottom, uuids);
+        }
+        let mut attrs: Vec<&str> = if fp.pads.iter().any(|p| p.kind == PadKind::Tht) {
+            vec!["through_hole"]
+        } else if fp.pads.iter().any(|p| p.kind == PadKind::Smd) {
+            vec!["smd"]
+        } else {
+            vec!["board_only"]
+        };
+        if pl.exclude_from_pos {
+            attrs.push("exclude_from_pos_files");
+        }
+        if pl.exclude_from_bom {
+            attrs.push("exclude_from_bom");
+        }
+        if pl.dnp {
+            attrs.push("dnp");
+        }
+        let _ = writeln!(out, "\t\t(attr {})", attrs.join(" "));
+
+        for g in &fp.graphics {
+            let layer = g.layer();
+            if layer == "F.CrtYd" || layer == "B.CrtYd" || layer == "Edge.Cuts" {
+                continue;
+            }
+            write_graphic(out, g, Some(pl), uuids);
+        }
+
+        if fp.courtyard.len() >= 3 {
+            if let Some((min, max)) = axis_aligned_rect(&fp.courtyard) {
+                let rect = Graphic::Rect {
+                    layer: "F.CrtYd".to_string(),
+                    min,
+                    max,
+                    width: 50_000,
+                    fill: false,
+                };
+                write_graphic(out, &rect, Some(pl), uuids);
+            } else {
+                write_closed_poly_lines(
+                    out,
+                    "fp_line",
+                    crtyd_layer,
+                    &fp.courtyard,
+                    50_000,
+                    y_sign,
+                    uuids,
+                );
+            }
+        }
+
+        for ko in &fp.keepouts {
+            write_keepout(out, ko, Some(pl), uuids);
+        }
+        for pad in &fp.pads {
+            write_pad(out, pad, pl, y_sign, net_ids, uuids);
+        }
+        for m in &fp.models {
+            let _ = writeln!(out, "\t\t(model \"{}\"", esc(&m.path));
+            let _ = writeln!(
+                out,
+                "\t\t\t(offset (xyz {:.6} {:.6} {:.6}))",
+                m.offset_mm[0], m.offset_mm[1], m.offset_mm[2]
+            );
+            let _ = writeln!(
+                out,
+                "\t\t\t(scale (xyz {:.6} {:.6} {:.6}))",
+                m.scale[0], m.scale[1], m.scale[2]
+            );
+            let _ = writeln!(
+                out,
+                "\t\t\t(rotate (xyz {:.6} {:.6} {:.6}))",
+                m.rotate_deg[0], m.rotate_deg[1], m.rotate_deg[2]
+            );
+            out.push_str("\t\t)\n");
+        }
+        out.push_str("\t)\n");
     }
 }

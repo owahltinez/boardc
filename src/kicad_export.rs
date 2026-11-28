@@ -6,11 +6,11 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::geom::{ensure_ccw, polygon_signed_area_2};
-use crate::ir::{BoardIr, LayerKind, Nm, PourPoly, Pt, SOLDER_MASK_THICKNESS_NM, Side, nm_to_mm};
+use crate::ir::{BoardIr, LayerKind, Nm, PourPoly, Pt, SOLDER_MASK_THICKNESS_NM, nm_to_mm};
 use crate::kicad_export_items::{
-    UuidGen, esc, write_closed_poly_lines, write_graphic, write_keepout, write_pts,
+    UuidGen, esc, write_closed_poly_lines, write_footprints, write_graphic, write_keepout,
+    write_pts,
 };
-use crate::kicad_raw_fp::write_footprints;
 use crate::zone_scene::match_pour_specs;
 
 fn collect_net_ids(board: &BoardIr) -> BTreeMap<String, usize> {
@@ -22,12 +22,8 @@ fn collect_net_ids(board: &BoardIr) -> BTreeMap<String, usize> {
         .collect()
 }
 
-fn kicad_copper_layer_id(
-    name: &str,
-    used_ids: &mut HashSet<usize>,
-    next_inner: &mut usize,
-) -> usize {
-    let fixed = if name == "F.Cu" {
+fn fixed_copper_layer_id(name: &str) -> Option<usize> {
+    if name == "F.Cu" {
         Some(0)
     } else if name == "B.Cu" {
         Some(2)
@@ -38,8 +34,15 @@ fn kicad_copper_layer_id(
         Some(2 + 2 * n)
     } else {
         None
-    };
-    if let Some(id) = fixed {
+    }
+}
+
+fn kicad_copper_layer_id(
+    name: &str,
+    used_ids: &mut HashSet<usize>,
+    next_inner: &mut usize,
+) -> usize {
+    if let Some(id) = fixed_copper_layer_id(name) {
         used_ids.insert(id);
         return id;
     }
@@ -56,22 +59,10 @@ fn write_layers(out: &mut String, board: &BoardIr) {
     out.push_str("\t(layers\n");
     let layers = board.effective_layers();
     // Pre-reserve standard InN.Cu IDs so non-standard custom inner layer names never collide with ID 4.
-    let mut used_ids: HashSet<usize> = HashSet::new();
-    for l in &layers {
-        if l.name == "F.Cu" {
-            used_ids.insert(0);
-        } else if l.name == "B.Cu" {
-            used_ids.insert(2);
-        } else if let Some(rest) = l
-            .name
-            .strip_prefix("In")
-            .and_then(|s| s.strip_suffix(".Cu"))
-            && let Ok(n) = rest.parse::<usize>()
-            && n >= 1
-        {
-            used_ids.insert(2 + 2 * n);
-        }
-    }
+    let mut used_ids: HashSet<usize> = layers
+        .iter()
+        .filter_map(|l| fixed_copper_layer_id(&l.name))
+        .collect();
     let mut next_inner = 0usize;
     for l in &layers {
         let id = kicad_copper_layer_id(&l.name, &mut used_ids, &mut next_inner);
@@ -157,12 +148,7 @@ fn write_setup(out: &mut String, board: &BoardIr) {
     let has_tented = board.vias.iter().any(|v| v.tented);
     let has_untented = board.vias.iter().any(|v| !v.tented);
     if board.pofv_enabled() || (has_tented && has_untented) {
-        let yn = if board.pofv_enabled() || has_tented {
-            "yes"
-        } else {
-            "no"
-        };
-        let _ = writeln!(out, "\t\t(tenting (front {yn}) (back {yn}))");
+        out.push_str("\t\t(tenting (front yes) (back yes))\n");
     } else if has_tented {
         out.push_str("\t\t(tenting front back)\n");
     } else if has_untented {
@@ -484,7 +470,7 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
     }
 
     for ko in &board.keepouts {
-        write_keepout(&mut out, ko, -1, Side::Top, "\t", &mut uuids);
+        write_keepout(&mut out, ko, None, &mut uuids);
     }
 
     let matched = match_pour_specs(board, &board.filled_pours);

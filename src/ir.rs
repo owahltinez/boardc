@@ -524,43 +524,6 @@ pub struct FootprintDef {
     pub models: Vec<Model3d>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pin_types: BTreeMap<String, PinType>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kicad_raw: Option<String>,
-}
-
-/// KiCad schematic parity metadata preserved across `.kicad_net`/`.kicad_pcb` and `export-kicad`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SchematicMeta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sheetname: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sheetfile: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub footprint: Option<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub fields: BTreeMap<String, String>,
-}
-
-impl SchematicMeta {
-    pub fn is_empty(&self) -> bool {
-        self.path.as_deref().is_none_or(|s| s.trim().is_empty())
-            && self
-                .sheetname
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-            && self
-                .sheetfile
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-            && self
-                .footprint
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-            && self.fields.is_empty()
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -595,8 +558,6 @@ pub struct Placement {
     pub exclude_from_pos: bool,
     #[serde(default)]
     pub cpl_rotation_offset_deg: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schematic: Option<SchematicMeta>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]

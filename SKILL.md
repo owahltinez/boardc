@@ -55,10 +55,6 @@ Do not apply KiCad Y-down or millimeter assumptions when editing `BoardSpec` or 
      ```sh
      boardc build board.toml --out-dir out --reroute-nets CLK,CS --reroute-pad-mm 4.0 --json
      ```
-   - To triage an external `kicad-cli` DRC report with the same clusterer:
-     ```sh
-     boardc drc board.json --kicad-drc kicad_drc.json --json
-     ```
 
 5. **Verify manufacturing files independently**:
    ```sh
@@ -84,26 +80,16 @@ boardc svg filled.json -o drill_map.svg --view drill-map
 boardc svg filled.json -o preview_in1.svg --layer In1.Cu
 ```
 
-## 3D Rendering via KiCad CLI
-
-`boardc` stays pure Rust with no external subprocesses, and preserves footprint 3D `(model ...)` metadata across `import-kicad` and `export-kicad`. When `kicad-cli` is installed, export to `.kicad_pcb` and render 3D PNGs directly:
-
-```sh
-boardc export-kicad out/board.board.json -o out/board.kicad_pcb
-kicad-cli pcb render out/board.kicad_pcb -o out/render_top.png --side top --quality high --perspective --rotate "-35,0,30"
-kicad-cli pcb render out/board.kicad_pcb -o out/render_bot.png --side bottom --quality high --perspective --rotate "-35,0,-30"
-```
-
 ## Spec Quick Reference
 
 - Parametric footprints supported natively: `chip2_pin` (`0201`/`0402`/`0603`/`0805`), `bga`, `qfn`, `sot23`, `pin_header`, plus `custom` pads/courtyards/graphics/keepouts/3D `models`.
 - Named pin aliases, shorthand nets & subcircuits: define `pin_names = { ALIAS = "1", VDD = ["A1", "B2"] }` on any footprint (or `kind = "lib"` overlay, with `kind = "lib"` auto-inferred when omitted), write `[nets]` as shorthand arrays (`SWO = ["U1.PB5", "P1.SWO"]`), and author reusable `[subcircuits.<Name>]` blocks instantiated via `[[instances]]` (`subcircuit`, `prefix`, `ports`, `pos`, `rot_deg`, `side`) with recursive nesting, private net scoping, and constraint rewriting.
-- External KiCad libraries & netlists: set `footprint_libs = ["path/to/lib.pretty"]` to load `.kicad_mod` footprints directly (preserving raw `.kicad_mod` fidelity across `export-kicad` to avoid `lib_footprint_mismatch` warnings, with optional `kind = "lib"` overlays for `pin_types`, `pin_names`, and/or `courtyard`) and `netlist = "path/to/design.net"` to import `.kicad_net`/`.net` pin nets, `(libparts)`/`(node ... (pintype ...))` electrical pin types, values, MPN/LCSC, DNP/BOM flags, and schematic `path`/`sheetname`/`sheetfile` metadata (preserved through `export-kicad` for `kicad-cli pcb drc --schematic-parity`).
+- External KiCad libraries & netlists: set `footprint_libs = ["path/to/lib.pretty"]` to load `.kicad_mod` footprints directly (with optional `kind = "lib"` overlays for `pin_types`, `pin_names`, and/or `courtyard`) and `netlist = "path/to/design.net"` to import `.kicad_net`/`.net` pin nets, `(libparts)`/`(node ... (pintype ...))` electrical pin types, values, MPN/LCSC, and DNP/BOM flags.
 - Edge-mating connectors: set `allow_edge_overhang = true` on `[[placements]]` to allow overhanging the outer `board.outline` perimeter (requiring nonzero courtyard overlap with `board.outline`, while still enforcing `ComponentToEdge` against interior `board.cutouts`, plus courtyard-to-courtyard overlap, keepouts, and copper pad and NPTH/THT drill `edge_clearance_nm`).
 - Electrical pin types (`pin_types` on `[footprints.<NAME>]` or `[[placements]]`) & net flags: optional `in`, `out`, `bidir`, `tri`, `open_collector` (`open_drain` alias), `open_emitter`, `power_in`, `power_out`, `passive`, `free`, `nc` annotations checked by `boardc erc` and `boardc preflight` (single-pin nets, output/`power_out`/`open_collector`/`open_emitter` conflicts, undriven `in`/`power_in`, unconnected non-`nc` pins, connected `nc` pins). Set `[nets.<NAME>] power_driven = true` on rails fed through passives/connectors; KiCad `unconnected-(...)` nets are treated as intentional `nc`.
 - Board metadata & graphics: optional top-level `title` and `revision` populate KiCad `(title_block ...)` and `<name>-job.gbrjob` `"Revision"`; `[[graphics]]` supports `line`, `rect`, `circle`, `poly`, and `text` (multi-line, rotated `rot_deg`, auto-mirrored on `B.*` layers across Gerber, SVG, and KiCad).
 - Stackup (`[stackup]`): `thickness_nm`, `finish`, `pofv` (via plugging + filling + capping), and `dielectric_nm` (emitted to `<name>-job.gbrjob` and KiCad `(general)`/`(setup (stackup ...))`).
-- Fabrication silkscreen (`[fab]`): `auto_refdes` (`true`/`"rotate"` default, `"upright"` to avoid upside-down labels on both sides, or `false`/`"off"` to suppress auto-generated refdes and pin-1 dots in Gerber/SVG and raw `.kicad_mod` `export-kicad` while keeping explicit silkscreen graphics) and `refdes_stroke_nm` (default `120000`, must be `>= 10000`); override via `boardc fab --no-auto-refdes`, `--auto-refdes <mode>`, or `--refdes-stroke-nm <nm>`.
+- Fabrication silkscreen (`[fab]`): `auto_refdes` (`true`/`"rotate"` default, `"upright"` to avoid upside-down labels on both sides, or `false`/`"off"` to suppress auto-generated refdes and pin-1 dots in Gerber/SVG while keeping explicit silkscreen graphics) and `refdes_stroke_nm` (default `120000`, must be `>= 10000`); override via `boardc fab --no-auto-refdes`, `--auto-refdes <mode>`, or `--refdes-stroke-nm <nm>`.
 - Constraints (`[constraints]`): `max_lengths`, `match_groups`, `cap_proximity`, `min_vias`, `max_vias`, and `bga_shadows`.
 - Mask-to-copper, silkscreen & dangling-copper DRC (`[rules]`): optional `mask_to_copper_nm` is enforced during both outer-layer routing and DRC (`solder_mask_to_copper`, imported/exported via `.kicad_pro` `solder_mask_to_copper_clearance`); optional `silk_to_mask_nm` (`silk_over_copper`) and `silk_to_edge_nm` (`silk_edge_clearance`) check silkscreen clearance natively; dead-end grid-snap stubs are pruned after routing and remaining dangling tracks/vias are reported as `track_dangling`/`via_dangling`.
 - Keepout kinds: `all`, `track`, `via`, `copper` (pours only, allows tracks), `placement`, or `custom` (`tracks`/`vias`/`copper`/`placement` booleans).

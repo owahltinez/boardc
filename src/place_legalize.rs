@@ -1445,7 +1445,6 @@ courtyard_clearance_nm = 150000
                 keepouts: Vec::new(),
                 models: Vec::new(),
                 pin_types: Default::default(),
-                kicad_raw: None,
             },
         );
         board.footprints.insert(
@@ -1476,7 +1475,6 @@ courtyard_clearance_nm = 150000
                 keepouts: Vec::new(),
                 models: Vec::new(),
                 pin_types: Default::default(),
-                kicad_raw: None,
             },
         );
         board.footprints.insert(
@@ -1504,7 +1502,6 @@ courtyard_clearance_nm = 150000
                 keepouts: Vec::new(),
                 models: Vec::new(),
                 pin_types: Default::default(),
-                kicad_raw: None,
             },
         );
         board.placements = vec![

@@ -475,7 +475,7 @@ fn erc_lib_overlays_placement_overrides_and_validation() {
     )
     .unwrap();
 
-    // Qualified [footprints."custom:U_LIB".pin_types] matched via netlist schematic.footprint.
+    // Qualified [footprints."custom:U_LIB".pin_types] matched via netlist component footprint.
     let qual_toml = r#"
 name = "qual_overlay"
 size_nm = [30000000, 20000000]

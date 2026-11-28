@@ -327,7 +327,6 @@ mod tests {
                 keepouts: Vec::new(),
                 models: Vec::new(),
                 pin_types: Default::default(),
-                kicad_raw: None,
             },
         );
         let placements = [

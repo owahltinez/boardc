@@ -6,10 +6,9 @@ use std::path::Path;
 use clipper2_rust::{FillRule, union_subjects_64};
 use viahop::sexp::SExp;
 
-use crate::geom::{board_to_local, ensure_ccw, polygon_area, remap_layer_for_side};
+use crate::geom::{board_to_local, ensure_ccw, polygon_area};
 use crate::ir::{
-    BoardIr, FootprintDef, Keepout, KeepoutKind, Model3d, Nm, PadDef, PadKind, PadShape, Pt, Side,
-    mm,
+    FootprintDef, Keepout, KeepoutKind, Model3d, Nm, PadDef, PadKind, PadShape, Pt, Side, mm,
 };
 use crate::kicad_geom::{
     atom_at, chain_segments, child_atom, collect_poly_or_segment, f64_at, parse_at, parse_fill,
@@ -19,7 +18,7 @@ use crate::kicad_geom::{
 pub use crate::kicad_net::{
     KicadNetlist, NetlistComponent, NetlistNet, load_kicad_net, parse_kicad_net,
 };
-use crate::kicad_pcb;
+pub use crate::kicad_pcb::{import_kicad_pcb, parse_kicad_pcb};
 use crate::shapes::{capsule_poly, circle_poly, paths64_to_polys, polys_to_paths64, rect_poly};
 
 /// Loads and parses a `.kicad_mod` footprint file into canonical Y-up local coordinates.
@@ -39,22 +38,8 @@ pub fn parse_kicad_mod(src: &str) -> Result<FootprintDef, String> {
         return Err(format!("expected '(footprint ...)', got '({tag} ...)'"));
     }
     let empty_nets = HashMap::new();
-    let (mut fp, _) = parse_footprint_node(&root, false, &empty_nets)?;
-    // Legacy KiCad 5 `(module ...)` syntax can fail KiCad 9/10 board parsing; passthrough KiCad 6+ only.
-    if tag == "footprint" {
-        fp.kicad_raw = Some(src.to_string());
-    }
+    let (fp, _) = parse_footprint_node(&root, false, &empty_nets)?;
     Ok(fp)
-}
-
-/// Imports a read-only `.kicad_pcb` (and optional `.kicad_pro`) into canonical `BoardIr`.
-pub fn import_kicad_pcb(pcb_path: &Path, pro_path_opt: Option<&Path>) -> Result<BoardIr, String> {
-    kicad_pcb::import_kicad_pcb(pcb_path, pro_path_opt)
-}
-
-/// Parses `.kicad_pcb` S-expression text (and optional `.kicad_pro` JSON) into `BoardIr`.
-pub fn parse_kicad_pcb(src: &str, pro_json_opt: Option<&str>) -> Result<BoardIr, String> {
-    kicad_pcb::parse_kicad_pcb(src, pro_json_opt)
 }
 
 pub(crate) fn parse_footprint_node(
@@ -109,13 +94,9 @@ pub(crate) fn parse_footprint_node(
             Some("fp_line") | Some("fp_arc") | Some("fp_rect") | Some("fp_circle")
             | Some("fp_poly") | Some("fp_text") => {
                 let raw_layer = child_atom(child, "layer").unwrap_or("");
-                let norm_layer = match layer_norm {
-                    Some(s) => remap_layer_for_side(raw_layer, s),
-                    None => raw_layer.to_string(),
-                };
-                if norm_layer == "F.CrtYd" || norm_layer == "B.CrtYd" {
+                if raw_layer == "F.CrtYd" || raw_layer == "B.CrtYd" {
                     collect_poly_or_segment(child, y_sign, &mut crtyd_open, &mut crtyd_closed);
-                } else if norm_layer != "Edge.Cuts" {
+                } else if raw_layer != "Edge.Cuts" {
                     graphics.extend(parse_graphic_node(
                         child,
                         y_sign,
@@ -125,8 +106,7 @@ pub(crate) fn parse_footprint_node(
                 }
             }
             Some("zone") => {
-                let z_sign = if is_placed_pcb { -1 } else { y_sign };
-                if let Some(mut ko) = parse_keepout_zone(child, z_sign, layer_norm) {
+                if let Some(mut ko) = parse_keepout_zone(child, layer_norm) {
                     if is_placed_pcb {
                         for p in &mut ko.poly {
                             *p = board_to_local(*p, fp_pos.x, fp_pos.y, fp_rot, side);
@@ -160,7 +140,6 @@ pub(crate) fn parse_footprint_node(
             keepouts,
             models,
             pin_types: BTreeMap::new(),
-            kicad_raw: None,
         },
         pad_nets,
     ))
@@ -399,11 +378,7 @@ fn annulus_slit_poly(center: Pt, r_in: Nm, r_out: Nm, segs: usize) -> Vec<Pt> {
     verts
 }
 
-pub(crate) fn parse_keepout_zone(
-    node: &SExp,
-    y_sign: i64,
-    layer_norm: Option<Side>,
-) -> Option<Keepout> {
+pub(crate) fn parse_keepout_zone(node: &SExp, layer_norm: Option<Side>) -> Option<Keepout> {
     let ko = node.find_child("keepout")?;
     let tracks_no = child_atom(ko, "tracks") == Some("not_allowed");
     let vias_no = child_atom(ko, "vias") == Some("not_allowed");
@@ -424,7 +399,7 @@ pub(crate) fn parse_keepout_zone(
     };
     let mut poly = node
         .find_child("polygon")
-        .map(|p| parse_pts(p, y_sign))
+        .map(|p| parse_pts(p, -1))
         .unwrap_or_default();
     if poly.len() < 3 {
         return None;

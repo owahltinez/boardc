@@ -1744,7 +1744,6 @@ via_drill_nm = 200000
                 keepouts: Vec::new(),
                 models: Vec::new(),
                 pin_types: Default::default(),
-                kicad_raw: None,
             },
         );
         for &(rd, x_mm, y_mm, net) in pads {
@@ -1842,7 +1841,6 @@ via_drill_nm = 200000
                 keepouts: Vec::new(),
                 models: Vec::new(),
                 pin_types: Default::default(),
-                kicad_raw: None,
             },
         );
         board.placements.push(Placement {

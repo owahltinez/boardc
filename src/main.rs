@@ -6,7 +6,7 @@ use std::process;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use boardc::drc::{Severity, check_board_drc, cluster_kicad_drc_json};
+use boardc::drc::{Severity, check_board_drc};
 use boardc::erc::check_board_erc;
 use boardc::fab::{FabOptions, export_fab};
 use boardc::ir::{
@@ -195,8 +195,6 @@ enum Command {
     /// Run continuous DRC engine and spatial hotspot clusterer.
     Drc {
         input: PathBuf,
-        #[arg(long = "kicad-drc", visible_alias = "kicad-json")]
-        kicad_drc: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -724,58 +722,30 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Drc {
-            input,
-            kicad_drc,
-            json,
-        } => {
+        Command::Drc { input, json } => {
             let ir = load_board_input(&input)?;
-            if let Some(kdrc_path) = kicad_drc {
-                let kdrc_str = fs::read_to_string(&kdrc_path)
-                    .map_err(|e| format!("failed to read '{}': {e}", kdrc_path.display()))?;
-                let hotspots = cluster_kicad_drc_json(&ir, &kdrc_str)?;
-                if json {
-                    print_json(&hotspots, "hotspots")?;
-                } else {
-                    println!("KiCad DRC hotspots: {}", hotspots.len());
-                    for (i, hs) in hotspots.iter().enumerate() {
-                        println!(
-                            "  [{}] ({:.3}, {:.3}) mm r={:.3} mm count={} root={} net={} | {}",
-                            i + 1,
-                            nm_to_mm(hs.centroid_nm.x),
-                            nm_to_mm(hs.centroid_nm.y),
-                            nm_to_mm(hs.radius_nm),
-                            hs.violation_count,
-                            hs.root_cause_item,
-                            hs.root_cause_net,
-                            hs.action_hint
-                        );
-                    }
-                }
+            let report = check_board_drc(&ir);
+            if json {
+                print_json(&report, "DrcReport")?;
             } else {
-                let report = check_board_drc(&ir);
-                if json {
-                    print_json(&report, "DrcReport")?;
-                } else {
+                println!(
+                    "DRC {}: {} errors, {} warnings, {} hotspots",
+                    if report.passed { "PASSED" } else { "FAILED" },
+                    report.error_count,
+                    report.warning_count,
+                    report.hotspots.len()
+                );
+                for (i, hs) in report.hotspots.iter().enumerate() {
                     println!(
-                        "DRC {}: {} errors, {} warnings, {} hotspots",
-                        if report.passed { "PASSED" } else { "FAILED" },
-                        report.error_count,
-                        report.warning_count,
-                        report.hotspots.len()
+                        "  hotspot {}: ({:.3}, {:.3}) mm r={:.3} mm count={} root={} | {}",
+                        i + 1,
+                        nm_to_mm(hs.centroid_nm.x),
+                        nm_to_mm(hs.centroid_nm.y),
+                        nm_to_mm(hs.radius_nm),
+                        hs.violation_count,
+                        hs.root_cause_item,
+                        hs.action_hint
                     );
-                    for (i, hs) in report.hotspots.iter().enumerate() {
-                        println!(
-                            "  hotspot {}: ({:.3}, {:.3}) mm r={:.3} mm count={} root={} | {}",
-                            i + 1,
-                            nm_to_mm(hs.centroid_nm.x),
-                            nm_to_mm(hs.centroid_nm.y),
-                            nm_to_mm(hs.radius_nm),
-                            hs.violation_count,
-                            hs.root_cause_item,
-                            hs.action_hint
-                        );
-                    }
                 }
             }
             Ok(())

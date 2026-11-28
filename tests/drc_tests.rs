@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::process::Command;
 
 use boardc::drc::{
-    DrcReport, Hotspot, Severity, Violation, ViolationKind, check_board_drc, cluster_hotspots,
-    cluster_kicad_drc_json,
+    DrcReport, Severity, Violation, ViolationKind, check_board_drc, cluster_hotspots,
 };
 use boardc::ir::{
     BgaShadowRule, BoardIr, BoardSpec, CapProximityRule, Constraints, DesignRules, FilledPour,
@@ -789,14 +788,14 @@ fn hotspot_clustering_collapses_six_violations_around_one_via() {
 }
 
 #[test]
-fn cluster_kicad_drc_json_maps_coordinates_and_clusters_hotspots() {
+fn cli_drc_json_reports_native_violations_and_hotspots() {
     let mut footprints = BTreeMap::new();
     footprints.insert(
         "PAD".into(),
         single_pad_fp(1.0, PadKind::Smd, vec!["F.Cu"], None),
     );
     let mut spec = BoardSpec {
-        name: "kdrc".into(),
+        name: "drc_cli".into(),
         outline: Vec::new(),
         size_nm: Some([mm(20.0), mm(20.0)]),
         cutouts: Vec::new(),
@@ -807,38 +806,21 @@ fn cluster_kicad_drc_json_maps_coordinates_and_clusters_hotspots() {
             thickness_nm: None,
         }],
         footprints,
-        // Note: BoardIr Y-up y = +16.0 corresponds to KiCad Y-down y = -16.0!
-        placements: vec![place_pin1("R1", "PAD", 18.0, -16.0, Side::Top, "VCC")],
-        keepouts: Vec::new(),
-        pours: Vec::new(),
-        tracks: vec![Track {
-            net: "GND".into(),
-            layer: "F.Cu".into(),
-            a: Pt::new(mm(15.0), mm(-16.0)),
-            b: Pt::new(mm(19.0), mm(-16.0)),
-            width: um(250.0),
-            locked: false,
-        }],
+        placements: vec![place_pin1("R1", "PAD", 18.0, 16.0, Side::Top, "VCC")],
         vias: vec![Via {
             net: "VCC".into(),
-            pos: Pt::new(mm(5.0), mm(-5.0)),
+            pos: Pt::new(mm(5.0), mm(5.0)),
             diameter: um(400.0),
             drill: um(350.0),
             layers: ("F.Cu".into(), "B.Cu".into()),
             locked: false,
             tented: true,
         }],
-        net_classes: Default::default(),
-        nets: Default::default(),
-        rules: DesignRules::default(),
-        constraints: Default::default(),
-        graphics: Vec::new(),
-        stackup: Default::default(),
         ..Default::default()
     };
     spec.vias.push(Via {
         net: "GND".into(),
-        pos: Pt::new(mm(5.5), mm(-5.0)),
+        pos: Pt::new(mm(5.5), mm(5.0)),
         diameter: um(500.0),
         drill: um(350.0),
         layers: ("F.Cu".into(), "B.Cu".into()),
@@ -847,61 +829,10 @@ fn cluster_kicad_drc_json_maps_coordinates_and_clusters_hotspots() {
     });
     let board = BoardIr::from_spec(&spec).unwrap();
 
-    let kdrc_json = r#"{
-        "coordinate_units": "mm",
-        "violations": [
-            {
-                "type": "annular_width",
-                "severity": "error",
-                "description": "Annular width (board setup constraints min annular width 0.1000 mm; actual 0.0250 mm)",
-                "items": [{ "description": "Via [VCC] on F.Cu - B.Cu", "pos": { "x": 5.0, "y": 5.0 } }]
-            },
-            {
-                "type": "hole_to_hole",
-                "severity": "warning",
-                "description": "Drilled hole too close to other hole (board setup constraints min 0.2495 mm; actual 0.1500 mm)",
-                "items": [
-                    { "description": "Via [GND] on F.Cu - B.Cu", "pos": { "x": 5.5, "y": 5.0 } },
-                    { "description": "Via [VCC] on F.Cu - B.Cu", "pos": { "x": 5.0, "y": 5.0 } }
-                ]
-            },
-            {
-                "type": "clearance",
-                "severity": "error",
-                "description": "Clearance violation ( clearance 0.2000 mm; actual 0.0500 mm)",
-                "items": [
-                    { "description": "Via [GND] on F.Cu - B.Cu", "pos": { "x": 5.5, "y": 5.0 } },
-                    { "description": "Via [VCC] on F.Cu - B.Cu", "pos": { "x": 5.0, "y": 5.0 } }
-                ]
-            }
-        ],
-        "unconnected_items": [
-            {
-                "type": "unconnected_items",
-                "severity": "error",
-                "description": "Missing connection between items",
-                "items": [
-                    { "description": "Pad 1 [VCC] of R1 on F.Cu", "pos": { "x": 18.0, "y": 16.0 } },
-                    { "description": "Track [GND] on F.Cu, length 4.0000 mm", "pos": { "x": 15.0, "y": 16.0 } }
-                ]
-            }
-        ]
-    }"#;
-
-    let hotspots = cluster_kicad_drc_json(&board, kdrc_json).unwrap();
-    assert_eq!(hotspots.len(), 2);
-    assert_eq!(hotspots[0].violation_count, 3);
-    assert_eq!(hotspots[0].root_cause_item, "via#0");
-    assert_eq!(hotspots[0].root_cause_net, "VCC");
-    assert_eq!(hotspots[0].centroid_nm.y, -mm(5.0));
-
-    // Also test CLI `boardc drc --kicad-drc ... --json` and `boardc drc --json`
     let tmp_dir = std::env::temp_dir().join("boardc_test_drc_cli");
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let board_path = tmp_dir.join("board.json");
-    let kdrc_path = tmp_dir.join("kdrc.json");
     std::fs::write(&board_path, serde_json::to_string_pretty(&board).unwrap()).unwrap();
-    std::fs::write(&kdrc_path, kdrc_json).unwrap();
 
     let out_native = Command::new(env!("CARGO_BIN_EXE_boardc"))
         .args(["drc", board_path.to_str().unwrap(), "--json"])
@@ -911,21 +842,7 @@ fn cluster_kicad_drc_json_maps_coordinates_and_clusters_hotspots() {
     let rep: DrcReport = serde_json::from_slice(&out_native.stdout).unwrap();
     assert!(!rep.passed);
     assert!(rep.error_count > 0);
-
-    let out_kdrc = Command::new(env!("CARGO_BIN_EXE_boardc"))
-        .args([
-            "drc",
-            board_path.to_str().unwrap(),
-            "--kicad-drc",
-            kdrc_path.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert!(out_kdrc.status.success());
-    let cli_hs: Vec<Hotspot> = serde_json::from_slice(&out_kdrc.stdout).unwrap();
-    assert_eq!(cli_hs.len(), 2);
-    assert_eq!(cli_hs[0].root_cause_item, "via#0");
+    assert!(!rep.hotspots.is_empty());
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
@@ -1142,21 +1059,6 @@ fn regression_inner_via_paste_pad_cutout_edge_flush_pour_clr_and_drc_units() {
         "edge-flush copper and tighter pour clearance should pass DRC, got {:?}",
         flush_drc.violations
     );
-
-    // 3. `cluster_kicad_drc_json` must not mistake "minimum" for unit "um".
-    let kdrc = r#"{
-        "coordinate_units": "mm",
-        "violations": [{
-            "type": "clearance",
-            "severity": "error",
-            "description": "Clearance violation (minimum 0.1500 mm; actual 0.0500 mm)",
-            "items": [{ "description": "Track [SIG_E] on F.Cu", "pos": { "x": 3.0, "y": -10.0 } }]
-        }]
-    }"#;
-    let hs = cluster_kicad_drc_json(&flush_board, kdrc).unwrap();
-    assert_eq!(hs.len(), 1);
-    assert_eq!(hs[0].violations[0].required_nm, mm(0.15));
-    assert_eq!(hs[0].violations[0].measured_nm, mm(0.05));
 }
 
 fn mask_viols(rep: &DrcReport) -> Vec<&Violation> {
@@ -2024,21 +1926,6 @@ fn fill_zones_honors_mask_to_copper_and_kicad_roundtrip() {
             .mask_expansion_nm,
         -um(20.0)
     );
-
-    // 4. Real KiCad DRC JSON "type": "solder_mask_bridge" clustering.
-    let kdrc = r#"{
-        "coordinate_units": "mm",
-        "violations": [{
-            "type": "solder_mask_bridge",
-            "severity": "error",
-            "description": "Solder mask bridge (clearance 0.0800 mm; actual 0.0650 mm)",
-            "items": [{ "description": "Pad 1 [SIG_TOP] of U1 on F.Mask", "pos": { "x": 10.0, "y": -10.0 } }]
-        }]
-    }"#;
-    let hs = cluster_kicad_drc_json(&board, kdrc).unwrap();
-    assert_eq!(hs.len(), 1);
-    assert_eq!(hs[0].kinds, vec![ViolationKind::SolderMaskToCopper]);
-    assert_eq!(hs[0].violations[0].item_a, "U1.1");
 }
 
 #[test]
@@ -2572,7 +2459,7 @@ fn hotspot_filters_unconnected_and_single_pin_nets_and_reroutes_cleanly() {
 }
 
 #[test]
-fn cluster_hotspots_and_kicad_drc_json_filter_unconnected_nets() {
+fn cluster_hotspots_filters_unconnected_nets() {
     // 1. Board-less cluster_hotspots filters case-insensitive unconnected-(...) and picks routable root_cause_net.
     let violations = vec![
         Violation {
@@ -2625,103 +2512,50 @@ fn cluster_hotspots_and_kicad_drc_json_filter_unconnected_nets() {
     assert_eq!(hs[1].affected_nets, Vec::<String>::new());
     assert_eq!(hs[1].root_cause_net, "unconnected-(U9-Pad1)");
 
-    // 2. cluster_kicad_drc_json filters unconnected-(...), single-pin nets, and [no net],
-    //    while preserving 2-pad routable nets for --reroute-nets.
-    let mut board = base_board();
-    board.footprints.insert(
-        "U_PAD".into(),
-        smd_row_fp(&[("J1", 0.0), ("J2", 4.0), ("J3", 8.0)], &["F.Cu"])
-            .resolve("U_PAD")
-            .unwrap(),
-    );
-    board.footprints.insert(
-        "SMD".into(),
-        single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu"], None)
-            .resolve("SMD")
-            .unwrap(),
-    );
-    board.placements = vec![
-        Placement {
-            refdes: "U1".into(),
-            footprint: "U_PAD".into(),
-            pos: Pt::new(mm(10.0), mm(10.0)),
-            side: Side::Top,
-            locked: true,
-            pin_nets: BTreeMap::from([
-                ("J1".into(), "VDDSMPS_1V8".into()),
-                ("J2".into(), "unconnected-(U1-PadJ2)".into()),
-                ("J3".into(), "NC_SINGLE".into()),
-            ]),
-            ..Default::default()
+    // Error beats Warning on dominant_kind tiebreak and warning_count is tracked accurately.
+    let mixed = vec![
+        Violation {
+            kind: ViolationKind::ViaDangling,
+            severity: Severity::Warning,
+            layer: "F.Cu".into(),
+            pos_nm: Pt::new(mm(20.0), mm(20.0)),
+            measured_nm: 1,
+            required_nm: 2,
+            item_a: "via#0".into(),
+            item_b: None,
+            net_a: String::new(),
+            net_b: String::new(),
+            message: "dangling via".into(),
         },
-        place_pin1("U2", "SMD", 24.0, 10.0, Side::Top, "VDDSMPS_1V8"),
+        Violation {
+            kind: ViolationKind::Clearance,
+            severity: Severity::Error,
+            layer: "F.Cu".into(),
+            pos_nm: Pt::new(mm(20.0), mm(20.0)),
+            measured_nm: um(50.0),
+            required_nm: um(150.0),
+            item_a: "via#0".into(),
+            item_b: Some("track#0".into()),
+            net_a: String::new(),
+            net_b: "SIG".into(),
+            message: "clearance".into(),
+        },
     ];
-    board.tracks = vec![Track {
-        net: "VDDSMPS_1V8".into(),
-        layer: "F.Cu".into(),
-        a: Pt::new(mm(10.0), mm(10.0)),
-        b: Pt::new(mm(24.0), mm(10.0)),
-        width: um(200.0),
-        locked: false,
-    }];
-
-    let kdrc = r#"{
-        "coordinate_units": "mm",
-        "violations": [
-            {
-                "type": "clearance",
-                "severity": "error",
-                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
-                "items": [
-                    { "description": "Pad J2 [unconnected-(U1-PadJ2)] of U1 on F.Cu", "pos": { "x": 14.0, "y": -10.0 } },
-                    { "description": "Track [VDDSMPS_1V8] on F.Cu", "pos": { "x": 14.0, "y": -10.0 } }
-                ]
-            },
-            {
-                "type": "clearance",
-                "severity": "error",
-                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
-                "items": [
-                    { "description": "Pad J3 [NC_SINGLE] of U1 on F.Cu", "pos": { "x": 18.0, "y": -10.0 } },
-                    { "description": "Track [VDDSMPS_1V8] on F.Cu", "pos": { "x": 18.0, "y": -10.0 } }
-                ]
-            },
-            {
-                "type": "clearance",
-                "severity": "error",
-                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
-                "items": [
-                    { "description": "Track [no net] on F.Cu", "pos": { "x": 14.0, "y": -10.0 } },
-                    { "description": "Track [VDDSMPS_1V8] on F.Cu", "pos": { "x": 14.0, "y": -10.0 } }
-                ]
-            }
-        ]
-    }"#;
-    let kdrc_hs = cluster_kicad_drc_json(&board, kdrc).unwrap();
-    assert_eq!(kdrc_hs.len(), 1);
-    assert_eq!(kdrc_hs[0].affected_nets, vec!["VDDSMPS_1V8".to_string()]);
-    assert_eq!(kdrc_hs[0].root_cause_net, "VDDSMPS_1V8");
-    assert_eq!(kdrc_hs[0].violations[0].net_a, "unconnected-(U1-PadJ2)");
-    assert_eq!(kdrc_hs[0].violations[1].net_a, "NC_SINGLE");
-    assert_eq!(kdrc_hs[0].violations[2].net_a, "");
-
-    let summary = route_board_ir(
-        &mut board,
-        &RouteOptions {
-            reroute_nets: Some(kdrc_hs[0].affected_nets.iter().cloned().collect()),
-            max_passes: 20,
-            multi_start: 2,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(summary.unconnected_pairs, 0);
-    assert!(check_board_drc(&board).passed);
+    let mixed_hs = cluster_hotspots(&mixed, mm(1.5));
+    assert_eq!(mixed_hs.len(), 1);
+    assert_eq!(mixed_hs[0].error_count, 1);
+    assert_eq!(mixed_hs[0].warning_count, 1);
+    assert!(
+        mixed_hs[0].action_hint.starts_with("Reposition or resize"),
+        "Severity::Error must beat Severity::Warning on tiebreak, got {}",
+        mixed_hs[0].action_hint
+    );
 }
 
 #[test]
 fn hotspot_omits_ignore_route_and_zero_copper_pad_nets() {
     let mut board = base_board();
+    board.rules.mask_to_copper_nm = Some(um(80.0));
     board.footprints.insert(
         "SMD".into(),
         single_pad_fp(0.8, PadKind::Smd, vec!["F.Cu", "F.Mask"], None)
@@ -2754,48 +2588,32 @@ fn hotspot_omits_ignore_route_and_zero_copper_pad_nets() {
         place_pin1("U4", "SMD", 15.0, 15.0, Side::Top, "PWR_IGNORED"),
         place_pin1("M1", "MASK_ONLY", 15.0, 10.5, Side::Top, "MASK_ONLY_NET"),
         place_pin1("M2", "MASK_ONLY", 25.0, 10.5, Side::Top, "MASK_ONLY_NET"),
-        place_pin1("H1", "NPTH_FP", 15.0, 11.0, Side::Top, "NPTH_NET"),
-        place_pin1("H2", "NPTH_FP", 25.0, 11.0, Side::Top, "NPTH_NET"),
+        place_pin1("H1", "NPTH_FP", 15.0, 10.2, Side::Top, "NPTH_NET"),
+        place_pin1("H2", "NPTH_FP", 25.0, 15.0, Side::Top, "NPTH_NET"),
+    ];
+    board.tracks = vec![
+        Track {
+            net: "SIG_REAL".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(10.0), mm(10.0)),
+            b: Pt::new(mm(20.0), mm(10.0)),
+            width: um(200.0),
+            locked: false,
+        },
+        Track {
+            net: "PWR_IGNORED".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(15.0), mm(10.0)),
+            b: Pt::new(mm(15.0), mm(15.0)),
+            width: um(200.0),
+            locked: false,
+        },
     ];
 
-    let kdrc = r#"{
-        "coordinate_units": "mm",
-        "violations": [
-            {
-                "type": "clearance",
-                "severity": "error",
-                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
-                "items": [
-                    { "description": "Pad 1 [PWR_IGNORED] of U3 on F.Cu", "pos": { "x": 15.0, "y": -10.0 } },
-                    { "description": "Track [SIG_REAL] on F.Cu", "pos": { "x": 15.0, "y": -10.0 } }
-                ]
-            },
-            {
-                "type": "clearance",
-                "severity": "error",
-                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
-                "items": [
-                    { "description": "Pad 1 [PWR_IGNORED] of U3 on F.Cu", "pos": { "x": 15.0, "y": -10.0 } },
-                    { "description": "Pad 1 [MASK_ONLY_NET] of M1 on F.Mask", "pos": { "x": 15.0, "y": -10.5 } }
-                ]
-            },
-            {
-                "type": "clearance",
-                "severity": "error",
-                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
-                "items": [
-                    { "description": "Pad 1 [NPTH_NET] of H1 on F.Cu", "pos": { "x": 15.0, "y": -11.0 } },
-                    { "description": "Pad 1 [no net] of U3 on F.Cu", "pos": { "x": 15.0, "y": -10.0 } }
-                ]
-            }
-        ]
-    }"#;
-
-    let hs = cluster_kicad_drc_json(&board, kdrc).unwrap();
-    assert_eq!(hs.len(), 1);
-    assert_eq!(hs[0].affected_nets, vec!["SIG_REAL".to_string()]);
-    assert_eq!(hs[0].root_cause_net, "SIG_REAL");
-    assert_eq!(hs[0].violations[2].net_b, "");
+    let rep = check_board_drc(&board);
+    assert_eq!(rep.hotspots.len(), 1, "hotspots={:?}", rep.hotspots);
+    assert_eq!(rep.hotspots[0].affected_nets, vec!["SIG_REAL".to_string()]);
+    assert_eq!(rep.hotspots[0].root_cause_net, "SIG_REAL");
 }
 
 #[test]
@@ -2934,18 +2752,53 @@ fn hotspot_handles_multipin_same_name_and_net_def_pins_fallback() {
     board.placements = vec![
         place_bare("U1", "PASTE_FIRST", 10.0, 10.0),
         place_bare("U2", "SMD", 16.0, 10.0),
-        place_pin1("S1", "SPLIT_TAB", 10.0, 12.0, Side::Top, "SPLIT_SHIELD"),
+        place_pin1("S1", "SPLIT_TAB", 10.0, 10.85, Side::Top, "SPLIT_SHIELD"),
         place_pin1(
             "O1",
             "OVERLAP_PAD",
             10.0,
-            14.0,
+            11.7,
             Side::Top,
             "unconnected-(O1-Pad1)",
         ),
-        place_bare("F1", "SMD", 10.0, 16.0),
-        place_bare("F2", "SMD", 16.0, 16.0),
-        place_bare("F3", "SMD", 10.0, 18.0),
+        place_bare("F1", "SMD", 10.0, 12.55),
+        place_bare("F2", "SMD", 16.0, 12.55),
+        place_bare("F3", "SMD", 10.0, 13.4),
+    ];
+    board.tracks = vec![
+        Track {
+            net: "PASTE_FIRST_NET".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(10.0), mm(10.0)),
+            b: Pt::new(mm(16.0), mm(10.0)),
+            width: um(150.0),
+            locked: false,
+        },
+        Track {
+            net: "SPLIT_SHIELD".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(10.0), mm(10.85)),
+            b: Pt::new(mm(15.0), mm(10.85)),
+            width: um(150.0),
+            locked: false,
+        },
+        Track {
+            net: "FALLBACK_NET".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(10.0), mm(12.55)),
+            b: Pt::new(mm(16.0), mm(12.55)),
+            width: um(150.0),
+            locked: false,
+        },
+        // Colliding track on 1-pin net defined only via board.nets[net].pins ensures DRC emits it before filtering.
+        Track {
+            net: "UNCONN_FALLBACK".into(),
+            layer: "F.Cu".into(),
+            a: Pt::new(mm(10.0), mm(12.8)),
+            b: Pt::new(mm(10.0), mm(13.4)),
+            width: um(150.0),
+            locked: false,
+        },
     ];
     board.nets.insert(
         "PASTE_FIRST_NET".into(),
@@ -2969,67 +2822,17 @@ fn hotspot_handles_multipin_same_name_and_net_def_pins_fallback() {
         },
     );
 
-    let violations = [
-        Violation {
-            kind: ViolationKind::Clearance,
-            severity: Severity::Error,
-            layer: "F.Cu".into(),
-            pos_nm: Pt::new(mm(10.0), mm(12.0)),
-            measured_nm: um(50.0),
-            required_nm: um(150.0),
-            item_a: "U1.1".into(),
-            item_b: Some("S1.1".into()),
-            net_a: "PASTE_FIRST_NET".into(),
-            net_b: "SPLIT_SHIELD".into(),
-            message: "clearance".into(),
-        },
-        Violation {
-            kind: ViolationKind::Clearance,
-            severity: Severity::Error,
-            layer: "F.Cu".into(),
-            pos_nm: Pt::new(mm(10.0), mm(14.0)),
-            measured_nm: um(50.0),
-            required_nm: um(150.0),
-            item_a: "O1.1".into(),
-            item_b: Some("F1.1".into()),
-            net_a: "unconnected-(O1-Pad1)".into(),
-            net_b: "FALLBACK_NET".into(),
-            message: "clearance".into(),
-        },
-        Violation {
-            kind: ViolationKind::Clearance,
-            severity: Severity::Error,
-            layer: "F.Cu".into(),
-            pos_nm: Pt::new(mm(10.0), mm(15.0)),
-            measured_nm: um(50.0),
-            required_nm: um(150.0),
-            item_a: "F3.1".into(),
-            item_b: Some("F1.1".into()),
-            net_a: "UNCONN_FALLBACK".into(),
-            net_b: "FALLBACK_NET".into(),
-            message: "clearance".into(),
-        },
-    ];
-
-    let hs = boardc::drc::cluster_kicad_drc_json(
-        &board,
-        &serde_json::json!({
-            "coordinate_units": "mm",
-            "violations": violations.iter().map(|v| serde_json::json!({
-                "type": "clearance",
-                "severity": "error",
-                "description": "Clearance violation (clearance 0.1500 mm; actual 0.0500 mm)",
-                "items": [
-                    { "description": format!("Pad 1 [{}] of {} on F.Cu", v.net_a, v.item_a.split('.').next().unwrap()), "pos": { "x": v.pos_nm.x as f64 / 1e6, "y": -(v.pos_nm.y as f64) / 1e6 } },
-                    { "description": format!("Pad 1 [{}] of {} on F.Cu", v.net_b, v.item_b.as_deref().unwrap().split('.').next().unwrap()), "pos": { "x": v.pos_nm.x as f64 / 1e6, "y": -(v.pos_nm.y as f64) / 1e6 } }
-                ]
-            })).collect::<Vec<_>>()
-        }).to_string(),
-    )
-    .unwrap();
-    assert_eq!(hs.len(), 1);
+    let rep = check_board_drc(&board);
+    assert!(
+        rep.violations
+            .iter()
+            .any(|v| v.net_a == "UNCONN_FALLBACK" || v.net_b == "UNCONN_FALLBACK"),
+        "expected UNCONN_FALLBACK violation before hotspot filtering, got {:?}",
+        rep.violations
+    );
+    assert_eq!(rep.hotspots.len(), 1, "hotspots={:?}", rep.hotspots);
     assert_eq!(
-        hs[0].affected_nets,
+        rep.hotspots[0].affected_nets,
         vec![
             "FALLBACK_NET".to_string(),
             "PASTE_FIRST_NET".to_string(),
@@ -3039,7 +2842,7 @@ fn hotspot_handles_multipin_same_name_and_net_def_pins_fallback() {
 }
 
 #[test]
-fn native_drc_detects_dangling_tracks_and_vias_and_clusters_kicad_drc() {
+fn native_drc_detects_dangling_tracks_and_vias() {
     let mk_layer = |name: &str, kind: LayerKind, side: Option<Side>| LayerDef {
         name: name.into(),
         kind,
@@ -3177,50 +2980,6 @@ fn native_drc_detects_dangling_tracks_and_vias_and_clusters_kicad_drc() {
         h.kinds.contains(&ViolationKind::ViaDangling)
             && h.action_hint.starts_with("Connect or remove dangling via")
     }));
-
-    // KiCad DRC JSON mapping + error-beats-warning tiebreak for dominant_kind.
-    let kdrc = r#"{
-        "coordinate_units": "mm",
-        "violations": [
-            {
-                "type": "track_dangling",
-                "severity": "error",
-                "description": "Track has unconnected end",
-                "items": [{ "description": "Track [DANG_T] on F.Cu, length 4.0000 mm", "pos": { "x": 8.0, "y": -12.0 } }]
-            },
-            {
-                "type": "via_dangling",
-                "severity": "warning",
-                "description": "Via is not connected or connected on only one layer",
-                "items": [{ "description": "Via [<no net>] on F.Cu - B.Cu", "pos": { "x": 20.0, "y": -24.0 } }]
-            },
-            {
-                "type": "clearance",
-                "severity": "error",
-                "description": "Clearance violation",
-                "items": [{ "description": "Via [<no net>] on F.Cu - B.Cu", "pos": { "x": 20.0, "y": -24.0 } }]
-            }
-        ]
-    }"#;
-    let hs = cluster_kicad_drc_json(&board, kdrc).unwrap();
-    assert_eq!(hs.len(), 2);
-    let t_hs = hs
-        .iter()
-        .find(|h| h.kinds.contains(&ViolationKind::TrackDangling))
-        .unwrap();
-    assert_eq!(t_hs.violations[0].item_a, "track#8");
-    assert_eq!(t_hs.violations[0].net_a, "DANG_T");
-    let v_hs = hs
-        .iter()
-        .find(|h| h.kinds.contains(&ViolationKind::ViaDangling))
-        .unwrap();
-    assert_eq!(v_hs.violations[0].item_a, "via#7");
-    assert_eq!(v_hs.violations[0].net_a, "");
-    assert!(
-        v_hs.action_hint.starts_with("Reposition or resize"),
-        "Severity::Error must beat Severity::Warning on tiebreak, got {}",
-        v_hs.action_hint
-    );
 }
 
 #[test]
@@ -3349,7 +3108,7 @@ fn custom_fp(
 }
 
 #[test]
-fn silkscreen_rules_opt_in_toml_validation_and_kicad_clustering() {
+fn silkscreen_rules_opt_in_and_toml_validation() {
     let toml_src = r#"
 name = "silk_toml"
 size_nm = [20_000_000, 20_000_000]
@@ -3410,69 +3169,6 @@ silk_to_edge_nm = 120_000
     let rep_disabled = check_board_drc(&off_board);
     assert!(silk_viols(&rep_disabled, ViolationKind::SilkOverCopper).is_empty());
     assert!(silk_viols(&rep_disabled, ViolationKind::SilkEdgeClearance).is_empty());
-
-    // KiCad DRC JSON mapping and hotspot hints.
-    let kdrc = r#"{
-        "coordinate_units": "mm",
-        "violations": [
-            {
-                "type": "silk_over_copper",
-                "severity": "error",
-                "description": "Silkscreen clipped by solder mask (clearance 0.1000 mm; actual 0.0200 mm)",
-                "items": [
-                    { "description": "Reference field of U1 on F.SilkS", "pos": { "x": 10.0, "y": -10.0 } },
-                    { "description": "Pad 1 [SIG] of U1 on F.Mask", "pos": { "x": 10.0, "y": -10.0 } }
-                ]
-            },
-            {
-                "type": "silk_edge_clearance",
-                "severity": "warning",
-                "description": "Silkscreen too close to board edge (clearance 0.1500 mm; actual 0.0500 mm)",
-                "items": [
-                    { "description": "Graphic line on B.SilkS", "pos": { "x": 20.0, "y": -0.05 } }
-                ]
-            },
-            {
-                "type": "silk_over_copper",
-                "severity": "error",
-                "description": "Graphic silkscreen clipped by solder mask (clearance 0.1000 mm; actual 0.0100 mm)",
-                "items": [
-                    { "description": "Graphic line on F.SilkS", "pos": { "x": 10.0, "y": -10.0 } },
-                    { "description": "Pad 1 [SIG] of U1 on F.Mask", "pos": { "x": 10.0, "y": -10.0 } }
-                ]
-            }
-        ]
-    }"#;
-    let hs = cluster_kicad_drc_json(&off_board, kdrc).unwrap();
-    assert_eq!(hs.len(), 2);
-    let mask_hs = hs
-        .iter()
-        .find(|h| h.kinds.contains(&ViolationKind::SilkOverCopper))
-        .unwrap();
-    let ref_v = mask_hs
-        .violations
-        .iter()
-        .find(|v| v.item_a == "U1.refdes")
-        .expect("Reference field must map to U1.refdes");
-    assert_eq!(ref_v.item_b.as_deref(), Some("U1.1"));
-    assert_eq!(ref_v.required_nm, um(100.0));
-    assert_eq!(ref_v.measured_nm, um(20.0));
-    assert!(
-        mask_hs
-            .violations
-            .iter()
-            .any(|v| v.item_a == "Graphic line on F.SilkS"),
-        "silkscreen graphic must not snap to overlapped U1.1 pad: {:?}",
-        mask_hs.violations
-    );
-    assert!(!mask_hs.action_hint.is_empty());
-
-    let edge_hs = hs
-        .iter()
-        .find(|h| h.kinds.contains(&ViolationKind::SilkEdgeClearance))
-        .unwrap();
-    assert_eq!(edge_hs.violations[0].layer, "B.SilkS");
-    assert!(!edge_hs.action_hint.is_empty());
 }
 
 #[test]

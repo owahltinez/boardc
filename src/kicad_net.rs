@@ -5,9 +5,7 @@ use std::path::Path;
 use viahop::sexp::SExp;
 
 use crate::ir::{PinType, default_net_class};
-use crate::kicad_geom::{
-    atom_at, child_atom, find_field_ci, insert_kicad_field, normalize_sheetname, parse_kicad_sexp,
-};
+use crate::kicad_geom::{atom_at, child_atom, parse_kicad_sexp};
 
 /// Parsed component entry from a KiCad S-expression netlist (`.net` / `.kicad_net`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -15,15 +13,11 @@ pub struct NetlistComponent {
     pub refdes: String,
     pub value: String,
     pub footprint: String,
-    pub path: Option<String>,
-    pub sheetname: Option<String>,
-    pub sheetfile: Option<String>,
     pub mpn: Option<String>,
     pub lcsc: Option<String>,
     pub dnp: bool,
     pub exclude_from_bom: bool,
     pub exclude_from_board: bool,
-    pub fields: BTreeMap<String, String>,
     pub pin_types: BTreeMap<String, PinType>,
 }
 
@@ -59,33 +53,12 @@ pub fn parse_kicad_net(src: &str) -> Result<KicadNetlist, String> {
         ));
     }
 
-    let mut sheet_info: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-    if let Some(design) = root.find_child("design") {
-        for sheet in design.children_with_tag("sheet") {
-            let Some(ts) = child_atom(sheet, "tstamps").filter(|s| !s.trim().is_empty()) else {
-                continue;
-            };
-            let key = ts.trim().trim_matches('/').to_string();
-            let name = child_atom(sheet, "name")
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(normalize_sheetname);
-            let source = sheet
-                .find_child("title_block")
-                .and_then(|tb| child_atom(tb, "source"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            sheet_info.insert(key, (name, source));
-        }
-    }
-
     let libparts = parse_libparts(&root);
 
     let mut components = BTreeMap::new();
     if let Some(comps_node) = root.find_child("components") {
         for comp in comps_node.children_with_tag("comp") {
-            let parsed = parse_comp(comp, &sheet_info, &libparts)?;
+            let parsed = parse_comp(comp, &libparts)?;
             if components.contains_key(&parsed.refdes) {
                 return Err(format!(
                     "duplicate component reference '{}' in KiCad netlist",
@@ -112,37 +85,6 @@ fn parse_bool_flag_prop(node: &SExp) -> bool {
     match child_atom(node, "value").map(str::trim) {
         None | Some("") => true,
         Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "no" | "false" | "0"),
-    }
-}
-
-fn first_comp_tstamp(node: &SExp) -> Option<&str> {
-    for tag in ["tstamps", "tstamp"] {
-        if let Some(items) = node.find_child(tag).and_then(SExp::as_list) {
-            for item in items.iter().skip(1) {
-                if let Some(tok) = item
-                    .as_atom()
-                    .and_then(|s| s.split_whitespace().next())
-                    .map(|s| s.trim_start_matches('/'))
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(tok);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn compose_schematic_path(sheet_ts: Option<&str>, comp_ts: Option<&str>) -> Option<String> {
-    let comp = comp_ts?.trim().trim_start_matches('/');
-    if comp.is_empty() {
-        return None;
-    }
-    let mid = sheet_ts.unwrap_or("").trim().trim_matches('/');
-    if mid.is_empty() {
-        Some(format!("/{comp}"))
-    } else {
-        Some(format!("/{mid}/{comp}"))
     }
 }
 
@@ -250,7 +192,6 @@ fn parse_libparts<'a>(root: &'a SExp) -> HashMap<LibPartKey<'a>, BTreeMap<String
 
 fn parse_comp(
     node: &SExp,
-    sheet_info: &HashMap<String, (Option<String>, Option<String>)>,
     libparts: &HashMap<(&str, &str), BTreeMap<String, PinType>>,
 ) -> Result<NetlistComponent, String> {
     let refdes = child_atom(node, "ref")
@@ -264,23 +205,22 @@ fn parse_comp(
         .unwrap_or("")
         .to_string();
 
-    let mut fields = BTreeMap::new();
-    if let Some(ds) = child_atom(node, "datasheet") {
-        insert_kicad_field(&mut fields, "Datasheet", ds);
-    }
-    if let Some(desc) = child_atom(node, "description") {
-        insert_kicad_field(&mut fields, "Description", desc);
-    }
+    let mut mpn = None;
+    let mut lcsc = None;
     if let Some(fields_node) = node.find_child("fields") {
         for field in fields_node.children_with_tag("field") {
-            if let (Some(k), Some(v)) = (child_atom(field, "name"), atom_at(field, 2)) {
-                insert_kicad_field(&mut fields, k, v);
+            if let (Some(k), Some(v)) = (child_atom(field, "name"), atom_at(field, 2))
+                && !v.is_empty()
+            {
+                if k.eq_ignore_ascii_case("mpn") {
+                    mpn = Some(v.to_string());
+                } else if k.eq_ignore_ascii_case("lcsc") {
+                    lcsc = Some(v.to_string());
+                }
             }
         }
     }
 
-    let mut prop_sheetname = None;
-    let mut sheetfile = None;
     let mut dnp = false;
     let mut exclude_from_bom = false;
     let mut exclude_from_board = false;
@@ -295,45 +235,15 @@ fn parse_comp(
             exclude_from_bom = parse_bool_flag_prop(prop);
         } else if k.eq_ignore_ascii_case("exclude_from_board") {
             exclude_from_board = parse_bool_flag_prop(prop);
-        } else if k == "Sheetname" {
-            if let Some(v) = child_atom(prop, "value").map(str::trim)
-                && !v.is_empty()
-            {
-                prop_sheetname = Some(normalize_sheetname(v));
+        } else if let Some(v) = child_atom(prop, "value").filter(|s| !s.is_empty()) {
+            if k.eq_ignore_ascii_case("mpn") {
+                mpn = Some(v.to_string());
+            } else if k.eq_ignore_ascii_case("lcsc") {
+                lcsc = Some(v.to_string());
             }
-        } else if k == "Sheetfile" {
-            if let Some(v) = child_atom(prop, "value").map(str::trim)
-                && !v.is_empty()
-            {
-                sheetfile = Some(v.to_string());
-            }
-        } else if let Some(v) = child_atom(prop, "value") {
-            insert_kicad_field(&mut fields, k, v);
         }
     }
 
-    let sheetpath = node.find_child("sheetpath");
-    let sheet_ts = sheetpath
-        .and_then(|sp| child_atom(sp, "tstamps"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let sp_name = sheetpath
-        .and_then(|sp| child_atom(sp, "names"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(normalize_sheetname);
-    let design_entry = sheet_ts.and_then(|ts| sheet_info.get(ts.trim_matches('/')));
-    let sheetname = sp_name
-        .or_else(|| design_entry.and_then(|(n, _)| n.clone()))
-        .or(prop_sheetname);
-    if sheetfile.is_none() {
-        sheetfile = design_entry.and_then(|(_, src)| src.clone());
-    }
-
-    // Multi-unit symbols list one UUID per unit; KiCad PCB footprints store the first unit's UUID.
-    let path = compose_schematic_path(sheet_ts, first_comp_tstamp(node));
-    let mpn = find_field_ci(&fields, "mpn");
-    let lcsc = find_field_ci(&fields, "lcsc");
     let pin_types = node
         .find_child("libsource")
         .and_then(lib_part_key)
@@ -344,15 +254,11 @@ fn parse_comp(
         refdes,
         value,
         footprint,
-        path,
-        sheetname,
-        sheetfile,
         mpn,
         lcsc,
         dnp,
         exclude_from_bom,
         exclude_from_board,
-        fields,
         pin_types,
     })
 }

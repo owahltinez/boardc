@@ -50,7 +50,6 @@ pub enum ViolationKind {
     BgaShadow,
     TrackDangling,
     ViaDangling,
-    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -347,12 +346,4 @@ pub(crate) fn check_repair_drc(board: &BoardIr, static_ctx: &RepairDrcStatic) ->
 /// Groups atomic violations into spatial and shared-object root-cause hotspots.
 pub fn cluster_hotspots(violations: &[Violation], cluster_radius_nm: Nm) -> Vec<Hotspot> {
     drc_cluster::cluster_hotspots(None, violations, cluster_radius_nm)
-}
-
-/// Parses `kicad-cli pcb drc --format json` output, maps coordinates onto `BoardIr` objects, and clusters hotspots.
-pub fn cluster_kicad_drc_json(
-    board: &BoardIr,
-    kicad_drc_json: &str,
-) -> Result<Vec<Hotspot>, String> {
-    drc_cluster::cluster_kicad_drc_json(board, kicad_drc_json)
 }

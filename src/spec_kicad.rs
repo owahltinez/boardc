@@ -76,11 +76,18 @@ fn last_dir_name(dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn is_pretty_dir(dir: &Path) -> bool {
-    last_dir_name(dir).is_some_and(|n| {
-        let b = n.as_bytes();
-        b.len() > 7 && b[b.len() - 7..].eq_ignore_ascii_case(b".pretty")
-    })
+fn dir_library_info(dir: &Path) -> Option<(String, bool)> {
+    let name = last_dir_name(dir)?;
+    let p = Path::new(&name);
+    if p.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pretty"))
+        && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+        && !stem.is_empty()
+    {
+        return Some((stem.to_string(), true));
+    }
+    Some((name, false))
 }
 
 fn dir_has_kicad_mod(dir: &Path) -> bool {
@@ -94,16 +101,6 @@ fn dir_has_kicad_mod(dir: &Path) -> bool {
                 .and_then(|s| s.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("kicad_mod"))
     })
-}
-
-fn dir_library_name(dir: &Path) -> Option<String> {
-    let name = last_dir_name(dir)?;
-    let bytes = name.as_bytes();
-    if bytes.len() > 7 && bytes[bytes.len() - 7..].eq_ignore_ascii_case(b".pretty") {
-        Some(name[..bytes.len() - 7].to_string())
-    } else {
-        Some(name)
-    }
 }
 
 fn find_mod_in_dir(dir: &Path, bare: &str) -> Option<PathBuf> {
@@ -134,12 +131,7 @@ fn find_pretty_subdir(dir: &Path, lib: &str) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.is_dir()
-            && p.extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("pretty"))
-            && dir_library_name(&p).as_deref() == Some(lib)
-        {
+        if p.is_dir() && dir_library_info(&p).is_some_and(|(n, is_pretty)| is_pretty && n == lib) {
             return Some(p);
         }
     }
@@ -162,11 +154,13 @@ fn find_footprint_file(name: &str, libs: &[PathBuf]) -> Result<Option<PathBuf>, 
             if !dir.is_dir() {
                 continue;
             }
-            if dir_library_name(dir).as_deref() == Some(lib) {
+            if let Some((dir_lib, is_pretty)) = dir_library_info(dir)
+                && dir_lib == lib
+            {
                 if let Some(p) = find_mod_in_dir(dir, bare) {
                     return Ok(Some(p));
                 }
-                if is_pretty_dir(dir) || dir_has_kicad_mod(dir) {
+                if is_pretty || dir_has_kicad_mod(dir) {
                     matched_lib = true;
                 }
             }
@@ -223,26 +217,13 @@ pub(crate) fn resolve_footprint_from_libs(
     }
 }
 
-fn non_empty_opt(opt: Option<String>) -> Option<String> {
-    opt.filter(|s| !s.trim().is_empty())
-}
-
-fn sync_override_field(fields: &mut BTreeMap<String, String>, key_ci: &str, value: &str) {
-    if let Some((_, v)) = fields
-        .iter_mut()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key_ci))
-    {
-        *v = value.to_string();
-    }
-}
-
 pub(crate) fn apply_netlist_components(
     placements: &mut [Placement],
     nl: &KicadNetlist,
 ) -> Result<(), String> {
     for p in placements {
-        p.mpn = non_empty_opt(p.mpn.take());
-        p.lcsc = non_empty_opt(p.lcsc.take());
+        p.mpn = p.mpn.take().filter(|s| !s.trim().is_empty());
+        p.lcsc = p.lcsc.take().filter(|s| !s.trim().is_empty());
         let Some(comp) = nl.components.get(&p.refdes) else {
             continue;
         };
@@ -258,33 +239,10 @@ pub(crate) fn apply_netlist_components(
         if p.value.trim().is_empty() && !comp.value.is_empty() {
             p.value = comp.value.clone();
         }
-        let spec_mpn_override = p.mpn.clone();
-        let spec_lcsc_override = p.lcsc.clone();
         p.mpn = p.mpn.take().or_else(|| comp.mpn.clone());
         p.lcsc = p.lcsc.take().or_else(|| comp.lcsc.clone());
         p.dnp |= comp.dnp;
         p.exclude_from_bom |= comp.exclude_from_bom;
-
-        let mut sch = p.schematic.take().unwrap_or_default();
-        sch.path = non_empty_opt(sch.path).or_else(|| comp.path.clone());
-        sch.sheetname = non_empty_opt(sch.sheetname).or_else(|| comp.sheetname.clone());
-        sch.sheetfile = non_empty_opt(sch.sheetfile).or_else(|| comp.sheetfile.clone());
-        sch.footprint = non_empty_opt(sch.footprint).or_else(|| {
-            (!comp.footprint.is_empty()
-                && (p.footprint == comp.footprint
-                    || bare_footprint_name(&comp.footprint) == p.footprint))
-                .then(|| comp.footprint.clone())
-        });
-        for (k, v) in &comp.fields {
-            sch.fields.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-        if let Some(ref mpn) = spec_mpn_override {
-            sync_override_field(&mut sch.fields, "mpn", mpn);
-        }
-        if let Some(ref lcsc) = spec_lcsc_override {
-            sync_override_field(&mut sch.fields, "lcsc", lcsc);
-        }
-        p.schematic = (!sch.is_empty()).then_some(sch);
     }
     Ok(())
 }
