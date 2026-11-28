@@ -4645,3 +4645,125 @@ via_at_smd = false
     assert!(rep.zones.chokes.is_empty());
     assert!(rep.route.repair_passes_run >= 1);
 }
+
+#[test]
+fn timeout_enforced_strictly_across_repair_passes_on_congested_board() {
+    // 24 crossing nets on a single tight layer force congestion and multi-pass timeout.
+    let mut toml = String::from(
+        r#"name = "congested_timeout"
+size_nm = [18000000, 18000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+[footprints.PAD1]
+kind = "custom"
+[[footprints.PAD1.pads]]
+name = "1"
+kind = "smd"
+shape = { shape = "circle", diameter = 500000 }
+pos = { x = 0, y = 0 }
+layers = ["F.Cu"]
+[rules]
+track_width_nm = 250000
+clearance_nm = 250000
+edge_clearance_nm = 300000
+"#,
+    );
+    let n = 24usize;
+    for i in 0..n {
+        let y_a = 2_000_000 + (i as i64) * 580_000;
+        let y_b = 2_000_000 + ((n - 1 - i) as i64) * 580_000;
+        toml.push_str(&format!(
+            "[[placements]]\nrefdes = \"L{i}\"\nfootprint = \"PAD1\"\npos = {{ x = 2000000, y = {y_a} }}\nlocked = true\npin_nets = {{ \"1\" = \"N{i}\" }}\n"
+        ));
+        toml.push_str(&format!(
+            "[[placements]]\nrefdes = \"R{i}\"\nfootprint = \"PAD1\"\npos = {{ x = 16000000, y = {y_b} }}\nlocked = true\npin_nets = {{ \"1\" = \"N{i}\" }}\n"
+        ));
+    }
+    let spec: BoardSpec = toml::from_str(&toml).unwrap();
+    let board = BoardIr::from_spec(&spec).unwrap();
+
+    let mut cfg = boxed_cfg(8, false);
+    cfg.route.max_passes = 200;
+    cfg.route.multi_start = 4;
+    cfg.route.timeout_secs = Some(4);
+    let t0 = std::time::Instant::now();
+    let rep = compile_board(board.clone(), &cfg).unwrap();
+    let wall_ms = t0.elapsed().as_millis();
+    assert!(
+        rep.route.stopped_early,
+        "expected stopped_early=true on tight congested timeout: {:?}",
+        rep.route
+    );
+    assert!(
+        rep.route.repair_passes_run >= 1,
+        "expected at least 1 repair pass within reserved budget, got {:?}",
+        rep.route
+    );
+    assert!(
+        wall_ms < 6000,
+        "expected build with --timeout 4 --repair-passes 8 not to overrun multiple passes, took {wall_ms}ms"
+    );
+
+    // Zero-second timeout skips repair passes cleanly and marks stopped_early=true.
+    let mut cfg0 = boxed_cfg(4, false);
+    cfg0.route.max_passes = 40;
+    cfg0.route.timeout_secs = Some(0);
+    let rep0 = compile_board(board, &cfg0).unwrap();
+    assert_eq!(rep0.route.repair_passes_run, 0);
+    assert!(rep0.route.stopped_early);
+}
+
+#[test]
+fn timeout_1s_clean_pour_and_scoped_reroute_do_not_false_positive_stopped_early() {
+    // 1. Clean board with pours under --timeout 1 --repair-passes 4 reports ok=true and stopped_early=false.
+    let pour_spec: BoardSpec = toml::from_str(&boxed_crossing_board_toml(true)).unwrap();
+    let pour_board = BoardIr::from_spec(&pour_spec).unwrap();
+    let mut pour_cfg = boxed_cfg(4, false);
+    pour_cfg.route.timeout_secs = Some(1);
+    let pour_rep = compile_board(pour_board, &pour_cfg).unwrap();
+    assert!(
+        pour_rep.ok,
+        "expected clean pour board under --timeout 1 to succeed: {:?}",
+        pour_rep.drc
+    );
+    assert!(!pour_rep.route.stopped_early);
+    assert_eq!(pour_rep.route.repair_passes_run, 0);
+
+    // 2. Scoped --reroute-nets with only out-of-scope violations under --timeout 1 reports stopped_early=false.
+    let scope_spec: BoardSpec = toml::from_str(&boxed_crossing_board_toml(true)).unwrap();
+    let mut scope_board = BoardIr::from_spec(&scope_spec).unwrap();
+    push_tracks(
+        &mut scope_board,
+        &[("SIG_B", "F.Cu", (5.0, 0.05), (13.0, 0.05), true)],
+    );
+    let mut scope_cfg = boxed_cfg(4, true);
+    scope_cfg.route.timeout_secs = Some(1);
+    let scope_rep = compile_board(scope_board, &scope_cfg).unwrap();
+    assert!(!scope_rep.route.stopped_early);
+    assert_eq!(scope_rep.route.repair_passes_run, 0);
+}
+
+#[test]
+fn timeout_reserves_budget_so_repair_fixes_residual_hotspot() {
+    let spec: BoardSpec = toml::from_str(&boxed_crossing_board_toml(false)).unwrap();
+    let mut board = BoardIr::from_spec(&spec).unwrap();
+    add_cage_tracks(&mut board, false);
+
+    let mut cfg = boxed_cfg(4, true);
+    cfg.route.max_passes = 4;
+    cfg.route.timeout_secs = Some(20);
+    let rep = compile_board(board, &cfg).unwrap();
+    assert!(
+        rep.ok,
+        "expected repair to heal residual hotspot within reserved budget: {:?}",
+        rep.drc
+    );
+    assert!(rep.route.repair_passes_run >= 1);
+    assert!(
+        !rep.route.stopped_early,
+        "unexpected stopped_early: {:?}",
+        rep.route
+    );
+}
