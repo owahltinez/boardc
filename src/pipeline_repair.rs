@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::drc::{
     DEFAULT_CLUSTER_RADIUS_NM, Hotspot, Severity, Violation, ViolationKind, check_board_drc,
@@ -12,14 +15,127 @@ use crate::pipeline_repair_pour::{
     collect_hotspot_targets, collect_pour_hotspots, resolve_pad_centers,
 };
 use crate::route::{
-    RouteOptions, RouteSummary, apply_match_group_tuning, route_board_ir,
-    route_board_ir_with_unconnected,
+    RouteOptions, RouteSummary, apply_match_group_tuning, route_board_ir, route_board_ir_inner,
 };
 use crate::zones::{ZoneChoke, fill_zones};
 
 const BASE_REROUTE_PAD_MM: f64 = 2.0;
 const REROUTE_PAD_STEP_MM: f64 = 2.0;
 const NEIGHBOR_RADIUS_STEP_NM: Nm = DEFAULT_CLUSTER_RADIUS_NM;
+const REPAIR_PASS_MAX_PASSES: usize = 30;
+const REPAIR_PASS_MAX_MULTI_START: usize = 2;
+const MIN_STAGE2_DURATION: Duration = Duration::from_millis(500);
+
+struct DeadlineWatchdog {
+    flag: Arc<AtomicBool>,
+    cancel_tx: Option<mpsc::Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl DeadlineWatchdog {
+    fn spawn(deadline: Instant) -> Self {
+        let flag = Arc::new(AtomicBool::new(false));
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            flag.store(true, Ordering::Release);
+            return Self {
+                flag,
+                cancel_tx: None,
+                handle: None,
+            };
+        }
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let flag_bg = Arc::clone(&flag);
+        let handle = std::thread::spawn(move || {
+            if matches!(
+                cancel_rx.recv_timeout(wait),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                flag_bg.store(true, Ordering::Release);
+            }
+        });
+        Self {
+            flag,
+            cancel_tx: Some(cancel_tx),
+            handle: Some(handle),
+        }
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
+
+    #[cfg(test)]
+    fn tripped(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for DeadlineWatchdog {
+    fn drop(&mut self) {
+        self.cancel_tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn budget_margins(limit: u64) -> Option<(Duration, Duration)> {
+    match limit {
+        0..=1 => None,
+        2 => Some((Duration::from_millis(750), Duration::from_millis(350))),
+        3..=7 => Some((Duration::from_millis(1000), Duration::from_millis(500))),
+        8..=11 => Some((Duration::from_millis(2000), Duration::from_millis(1200))),
+        12..=15 => Some((Duration::from_millis(3000), Duration::from_millis(1800))),
+        16..=19 => Some((Duration::from_millis(4000), Duration::from_millis(2400))),
+        _ => Some((Duration::from_millis(5000), Duration::from_millis(3000))),
+    }
+}
+
+fn initial_route_budget(limit: u64) -> Duration {
+    match limit {
+        0 => Duration::ZERO,
+        1 => Duration::from_secs(1),
+        2 => Duration::from_millis(900),
+        _ => {
+            let start_margin_ms = budget_margins(limit).map_or(0, |(m, _)| m.as_millis() as u64);
+            let total_ms = limit.saturating_mul(1000);
+            let reserve_ms = (total_ms / 3).clamp(start_margin_ms + 500, 45_000);
+            Duration::from_millis(total_ms.saturating_sub(reserve_ms))
+        }
+    }
+}
+
+fn next_pass_budget(limit: u64, remaining: Duration, rem_passes: usize) -> Option<Duration> {
+    let (start_margin, safety_buffer) = budget_margins(limit)?;
+    if rem_passes == 0 || remaining < start_margin {
+        return None;
+    }
+    let usable = remaining.saturating_sub(safety_buffer);
+    if usable.is_zero() {
+        return None;
+    }
+    let divisor = u32::try_from(rem_passes).unwrap_or(u32::MAX);
+    let fair = usable / divisor;
+    Some(
+        fair.clamp(safety_buffer, Duration::from_secs(30))
+            .min(usable),
+    )
+}
+
+fn route_with_deadline(
+    board: &mut BoardIr,
+    cfg: &RouteOptions,
+    deadline: Option<Instant>,
+) -> Result<(RouteSummary, HashSet<String>, bool), String> {
+    let watchdog = deadline.map(DeadlineWatchdog::spawn);
+    let stop_flag = watchdog.as_ref().map(DeadlineWatchdog::flag);
+    let res = route_board_ir_inner(board, cfg, stop_flag.clone());
+    drop(watchdog);
+    let timed_out = stop_flag.is_some_and(|f| f.load(Ordering::Acquire));
+    let (summary, unconnected) = res?;
+    Ok((summary, unconnected, timed_out))
+}
 
 fn is_repairable_kind(kind: ViolationKind) -> bool {
     matches!(
@@ -279,12 +395,12 @@ impl BoardSnapshot {
 struct RepairState<'a> {
     cfg: &'a RouteOptions,
     pass_cfg: RouteOptions,
-    start: Instant,
+    hard_deadline: Option<Instant>,
     repair_passes: usize,
     repair_passes_run: usize,
     passes_run: usize,
     starts_run: usize,
-    stopped_early: bool,
+    any_stopped_early: bool,
     summary: RouteSummary,
     repaired_nets: HashSet<String>,
     cur_eval: RepairEval,
@@ -293,32 +409,130 @@ struct RepairState<'a> {
 }
 
 impl<'a> RepairState<'a> {
-    fn can_step(&self) -> bool {
-        self.repair_passes_run < self.repair_passes
-            && !self.stopped_early
-            && self
-                .cfg
-                .timeout_secs
-                .is_none_or(|limit| self.start.elapsed().as_secs() < limit)
+    fn has_start_budget(&self) -> bool {
+        match (self.cfg.timeout_secs, self.hard_deadline) {
+            (Some(limit), Some(dl)) => budget_margins(limit).is_some_and(|(start_margin, _)| {
+                dl.saturating_duration_since(Instant::now()) >= start_margin
+            }),
+            _ => true,
+        }
     }
 
-    fn remaining_timeout_secs(&self) -> Option<u64> {
-        self.cfg
-            .timeout_secs
-            .map(|limit| limit.saturating_sub(self.start.elapsed().as_secs()).max(1))
+    fn can_step(&self) -> bool {
+        self.repair_passes_run < self.repair_passes
+            && !viahop::signal::stop_requested(None)
+            && self.has_start_budget()
+    }
+
+    fn has_actionable_work(
+        &self,
+        board: &BoardIr,
+        eligible_nets: &HashSet<String>,
+        scope_nets: Option<&HashSet<String>>,
+    ) -> bool {
+        if !self.cur_eval.repairable.is_empty() {
+            let (_, candidates) = collect_geom_candidates(
+                board,
+                &self.cur_eval.repairable,
+                eligible_nets,
+                scope_nets,
+                &[],
+            );
+            if !candidates.is_empty() {
+                return true;
+            }
+        }
+        if let Some((_, chokes)) = &self.zone_state
+            && (!chokes.is_empty() || !self.cur_eval.pour_opens.is_empty())
+            && !collect_pour_hotspots(
+                board,
+                chokes,
+                &self.cur_eval.pour_opens,
+                eligible_nets,
+                scope_nets,
+            )
+            .is_empty()
+        {
+            return true;
+        }
+        let allowed_nets = scope_nets.unwrap_or(eligible_nets);
+        !ordered_constraint_violating_nets(&self.cur_eval, allowed_nets).is_empty()
+    }
+
+    fn apply_pass_options(&mut self, timed: Option<(u64, Duration, Duration)>) {
+        let Some((limit, remaining, pass_dur)) = timed else {
+            self.pass_cfg.max_passes = self.cfg.max_passes;
+            self.pass_cfg.multi_start = self.cfg.multi_start;
+            self.pass_cfg.optimize = self.cfg.optimize;
+            return;
+        };
+        let allow_optimize = if limit >= 10 && remaining < Duration::from_secs(15) {
+            false
+        } else {
+            pass_dur >= Duration::from_secs(10)
+        };
+        self.pass_cfg.optimize = self.cfg.optimize && allow_optimize;
+        let max_starts = if allow_optimize {
+            REPAIR_PASS_MAX_MULTI_START
+        } else {
+            1
+        };
+        self.pass_cfg.max_passes = self.cfg.max_passes.min(REPAIR_PASS_MAX_PASSES);
+        self.pass_cfg.multi_start = self.cfg.multi_start.min(max_starts);
+    }
+
+    fn configure_pass_budget(&mut self) -> Option<Option<Instant>> {
+        if self.repair_passes_run >= self.repair_passes || viahop::signal::stop_requested(None) {
+            return None;
+        }
+        let (Some(limit), Some(hard_deadline)) = (self.cfg.timeout_secs, self.hard_deadline) else {
+            self.apply_pass_options(None);
+            return Some(None);
+        };
+        let now = Instant::now();
+        let remaining = hard_deadline.saturating_duration_since(now);
+        let rem_passes = self.repair_passes - self.repair_passes_run;
+        let pass_dur = next_pass_budget(limit, remaining, rem_passes)?;
+        self.apply_pass_options(Some((limit, remaining, pass_dur)));
+        Some(Some(now + pass_dur))
+    }
+
+    fn prepare_stage2(&mut self, pass_deadline: Option<Instant>) -> bool {
+        if viahop::signal::stop_requested(None) {
+            return false;
+        }
+        let Some(pdl) = pass_deadline else {
+            self.apply_pass_options(None);
+            return true;
+        };
+        let now = Instant::now();
+        let stage2_dur = pdl.saturating_duration_since(now);
+        if stage2_dur < MIN_STAGE2_DURATION {
+            return false;
+        }
+        if let (Some(limit), Some(hard_deadline)) = (self.cfg.timeout_secs, self.hard_deadline) {
+            let remaining = hard_deadline.saturating_duration_since(now);
+            self.apply_pass_options(Some((limit, remaining, stage2_dur)));
+        }
+        true
     }
 
     fn route_with_keepouts(
-        &self,
+        &mut self,
         board: &mut BoardIr,
         extra_keepouts: &[Keepout],
-    ) -> Result<(RouteSummary, HashSet<String>), String> {
+        pass_deadline: Option<Instant>,
+    ) -> Result<(RouteSummary, HashSet<String>, bool), String> {
         let orig_len = board.keepouts.len();
         board.keepouts.extend(self.pour_keepouts.iter().cloned());
         board.keepouts.extend(extra_keepouts.iter().cloned());
-        let res = route_board_ir_with_unconnected(board, &self.pass_cfg);
+        let res = route_with_deadline(board, &self.pass_cfg, pass_deadline);
         board.keepouts.truncate(orig_len);
-        res
+        let (summary, unconnected, timed_out) = res?;
+        self.passes_run += summary.passes_run;
+        self.starts_run += summary.starts_run;
+        self.any_stopped_early |= summary.stopped_early || timed_out;
+        Ok((summary, unconnected, timed_out))
     }
 
     fn finish_candidate(
@@ -374,19 +588,24 @@ impl<'a> RepairState<'a> {
         pad_mm: f64,
         extra_keepouts: Vec<Keepout>,
     ) -> Result<bool, String> {
-        if !self.can_step() || targets.is_empty() {
+        if targets.is_empty() {
             return Ok(false);
         }
+        let Some(pass_deadline) = self.configure_pass_budget() else {
+            return Ok(false);
+        };
         self.repair_passes_run += 1;
         let snap = BoardSnapshot::take(board, self.zone_state.is_some());
         self.pass_cfg.reroute_nets = Some(targets.clone());
         self.pass_cfg.reroute_pad_mm = Some(pad_mm);
-        self.pass_cfg.timeout_secs = self.remaining_timeout_secs();
 
-        let (cand_summary, _) = self.route_with_keepouts(board, &extra_keepouts)?;
-        self.passes_run += cand_summary.passes_run;
-        self.starts_run += cand_summary.starts_run;
-        self.stopped_early |= cand_summary.stopped_early;
+        let cand_summary = match self.route_with_keepouts(board, &extra_keepouts, pass_deadline) {
+            Ok((s, _, _)) => s,
+            Err(e) => {
+                snap.restore(board);
+                return Err(e);
+            }
+        };
         self.finish_candidate(board, snap, cand_summary, targets, extra_keepouts)
     }
 
@@ -398,9 +617,12 @@ impl<'a> RepairState<'a> {
         neighbors: &HashSet<String>,
         pad_mm: f64,
     ) -> Result<bool, String> {
-        if !self.can_step() || neighbors.is_empty() {
+        if neighbors.is_empty() {
             return Ok(false);
         }
+        let Some(pass_deadline) = self.configure_pass_budget() else {
+            return Ok(false);
+        };
         let vias_before = board.vias.iter().filter(|v| v.net == primary_net).count();
         self.repair_passes_run += 1;
         let snap = BoardSnapshot::take(board, self.zone_state.is_some());
@@ -414,36 +636,101 @@ impl<'a> RepairState<'a> {
 
         self.pass_cfg.reroute_nets = Some(HashSet::from([primary_net.to_string()]));
         self.pass_cfg.reroute_pad_mm = Some(pad_mm);
-        self.pass_cfg.timeout_secs = self.remaining_timeout_secs();
-        let (net_summary, net_unconnected) = self.route_with_keepouts(board, &[])?;
-        self.passes_run += net_summary.passes_run;
-        self.starts_run += net_summary.starts_run;
-        self.stopped_early |= net_summary.stopped_early;
+        let (net_summary, net_unconnected, net_timed_out) =
+            match self.route_with_keepouts(board, &[], pass_deadline) {
+                Ok(v) => v,
+                Err(e) => {
+                    snap.restore(board);
+                    return Err(e);
+                }
+            };
 
-        let timed_out = self
-            .cfg
-            .timeout_secs
-            .is_some_and(|limit| self.start.elapsed().as_secs() >= limit);
         let vias_after = board.vias.iter().filter(|v| v.net == primary_net).count();
         let bad_unconnected = net_unconnected.contains(primary_net)
             || (self.cur_eval.score.unconnected_pairs == 0
                 && net_unconnected.iter().any(|n| !neighbors.contains(n)));
-        if bad_unconnected || net_summary.stopped_early || timed_out || vias_after >= vias_before {
+        if bad_unconnected
+            || net_summary.stopped_early
+            || net_timed_out
+            || viahop::signal::stop_requested(None)
+            || vias_after >= vias_before
+        {
+            snap.restore(board);
+            return Ok(false);
+        }
+
+        if !self.prepare_stage2(pass_deadline) {
+            self.any_stopped_early = true;
             snap.restore(board);
             return Ok(false);
         }
 
         self.pass_cfg.reroute_nets = Some(neighbors.clone());
         self.pass_cfg.reroute_pad_mm = Some(pad_mm);
-        self.pass_cfg.timeout_secs = self.remaining_timeout_secs();
-        let (nbr_summary, _) = self.route_with_keepouts(board, &[])?;
-        self.passes_run += nbr_summary.passes_run;
-        self.starts_run += nbr_summary.starts_run;
-        self.stopped_early |= nbr_summary.stopped_early;
+        let nbr_summary = match self.route_with_keepouts(board, &[], pass_deadline) {
+            Ok((s, _, _)) => s,
+            Err(e) => {
+                snap.restore(board);
+                return Err(e);
+            }
+        };
 
         let targets = std::iter::once(primary_net.to_string()).chain(neighbors.iter().cloned());
         self.finish_candidate(board, snap, nbr_summary, targets, Vec::new())
     }
+}
+
+struct GeomCandidate {
+    hotspot_idx: usize,
+    base_nets: HashSet<String>,
+    prev_attempts: usize,
+}
+
+fn collect_geom_candidates(
+    board: &BoardIr,
+    repairable: &[Violation],
+    eligible_nets: &HashSet<String>,
+    scope_nets: Option<&HashSet<String>>,
+    history: &[PriorCluster],
+) -> (Vec<Hotspot>, Vec<GeomCandidate>) {
+    let hotspots = cluster_hotspots(Some(board), repairable, DEFAULT_CLUSTER_RADIUS_NM);
+    let open_nets: HashSet<&str> = repairable
+        .iter()
+        .filter(|v| v.kind == ViolationKind::OpenNet && !v.net_a.is_empty())
+        .map(|v| v.net_a.as_str())
+        .collect();
+    let candidates = hotspots
+        .iter()
+        .enumerate()
+        .filter_map(|(hotspot_idx, h)| {
+            let base_nets: HashSet<String> = h
+                .affected_nets
+                .iter()
+                .filter(|n| {
+                    eligible_nets.contains(n.as_str())
+                        && (open_nets.contains(n.as_str()) || net_can_reroute(board, n))
+                })
+                .cloned()
+                .collect();
+            if base_nets.is_empty()
+                || scope_nets.is_some_and(|scope| !base_nets.iter().any(|n| scope.contains(n)))
+            {
+                return None;
+            }
+            let prev_attempts = history
+                .iter()
+                .filter(|p| p.matches_region(h.centroid_nm, h.radius_nm, Some(&base_nets)))
+                .map(|p| p.attempts)
+                .max()
+                .unwrap_or(0);
+            Some(GeomCandidate {
+                hotspot_idx,
+                base_nets,
+                prev_attempts,
+            })
+        })
+        .collect();
+    (hotspots, candidates)
 }
 
 fn ordered_constraint_violating_nets(
@@ -623,6 +910,7 @@ pub(crate) fn route_with_repair(
     }
 
     let start = Instant::now();
+    let hard_deadline = cfg.timeout_secs.map(|s| start + Duration::from_secs(s));
     if !board.pours.is_empty() {
         board.filled_pours.clear();
     }
@@ -646,9 +934,15 @@ pub(crate) fn route_with_repair(
     });
     let base_pad_mm = cfg.reroute_pad_mm.unwrap_or(BASE_REROUTE_PAD_MM);
 
-    let mut pass_cfg = cfg.clone();
-    pass_cfg.tune_match_groups = false;
-    let initial_summary = route_board_ir(board, &pass_cfg)?;
+    let mut init_cfg = cfg.clone();
+    init_cfg.tune_match_groups = false;
+    init_cfg.timeout_secs = None;
+    let init_deadline = cfg
+        .timeout_secs
+        .map(|limit| start + initial_route_budget(limit));
+    let (initial_summary, _, init_timed_out) =
+        route_with_deadline(board, &init_cfg, init_deadline)?;
+
     let initial_eval = eval_repair_state(
         board,
         &cfg.ignored_nets,
@@ -658,13 +952,13 @@ pub(crate) fn route_with_repair(
     let mut history: Vec<PriorCluster> = Vec::new();
     let mut state = RepairState {
         cfg,
-        pass_cfg,
-        start,
+        pass_cfg: init_cfg,
+        hard_deadline,
         repair_passes,
         repair_passes_run: 0,
         passes_run: initial_summary.passes_run,
         starts_run: initial_summary.starts_run,
-        stopped_early: initial_summary.stopped_early,
+        any_stopped_early: initial_summary.stopped_early || init_timed_out,
         summary: initial_summary,
         repaired_nets: HashSet::new(),
         cur_eval: initial_eval,
@@ -673,66 +967,31 @@ pub(crate) fn route_with_repair(
     };
 
     while state.can_step() && !state.cur_eval.repairable.is_empty() {
-        let hotspots = cluster_hotspots(
-            Some(board),
+        let (hotspots, candidates) = collect_geom_candidates(
+            board,
             &state.cur_eval.repairable,
-            DEFAULT_CLUSTER_RADIUS_NM,
+            &eligible_nets,
+            scope_nets.as_ref(),
+            &history,
         );
-        let open_nets: HashSet<&str> = state
-            .cur_eval
-            .repairable
-            .iter()
-            .filter(|v| v.kind == ViolationKind::OpenNet && !v.net_a.is_empty())
-            .map(|v| v.net_a.as_str())
-            .collect();
 
-        let candidates: Vec<(usize, HashSet<String>, usize)> = hotspots
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, h)| {
-                let base_nets: HashSet<String> = h
-                    .affected_nets
-                    .iter()
-                    .filter(|n| {
-                        eligible_nets.contains(n.as_str())
-                            && (open_nets.contains(n.as_str()) || net_can_reroute(board, n))
-                    })
-                    .cloned()
-                    .collect();
-                if base_nets.is_empty()
-                    || scope_nets
-                        .as_ref()
-                        .is_some_and(|scope| !base_nets.iter().any(|n| scope.contains(n)))
-                {
-                    return None;
-                }
-                let prev_attempts = history
-                    .iter()
-                    .filter(|p| p.matches_region(h.centroid_nm, h.radius_nm, Some(&base_nets)))
-                    .map(|p| p.attempts)
-                    .max()
-                    .unwrap_or(0);
-                Some((idx, base_nets, prev_attempts))
-            })
-            .collect();
-
-        let Some(&(h_idx, ref base_nets, prev_attempts)) = candidates
-            .iter()
-            .find(|(_, _, prev)| *prev < 2)
-            .or_else(|| candidates.iter().min_by_key(|(idx, _, prev)| (*prev, *idx)))
-        else {
+        let Some(cand) = candidates.iter().find(|c| c.prev_attempts < 2).or_else(|| {
+            candidates
+                .iter()
+                .min_by_key(|c| (c.prev_attempts, c.hotspot_idx))
+        }) else {
             break;
         };
 
-        let hotspot = &hotspots[h_idx];
-        let attempt = prev_attempts + 1;
+        let hotspot = &hotspots[cand.hotspot_idx];
+        let attempt = cand.prev_attempts + 1;
         let neighbor_radius_nm = ((attempt - 1) as Nm) * NEIGHBOR_RADIUS_STEP_NM;
         let pad_mm = base_pad_mm + ((attempt - 1) as f64) * REROUTE_PAD_STEP_MM;
         let anchors = collect_hotspot_anchors(board, hotspot);
         let targets = collect_hotspot_targets(
             board,
             &eligible_nets,
-            base_nets,
+            &cand.base_nets,
             &anchors,
             hotspot.radius_nm,
             neighbor_radius_nm,
@@ -743,7 +1002,7 @@ pub(crate) fn route_with_repair(
             &mut history,
             hotspot.centroid_nm,
             hotspot.radius_nm,
-            Some(base_nets),
+            Some(&cand.base_nets),
             attempt,
         );
 
@@ -780,6 +1039,14 @@ pub(crate) fn route_with_repair(
         )?;
     }
 
+    if !state.any_stopped_early
+        && !state.can_step()
+        && state.repair_passes_run < state.repair_passes
+        && state.has_actionable_work(board, &eligible_nets, scope_nets.as_ref())
+    {
+        state.any_stopped_early = true;
+    }
+
     if !board.pours.is_empty() {
         board.filled_pours.clear();
     }
@@ -789,7 +1056,8 @@ pub(crate) fn route_with_repair(
         summary.drc_violations = state.cur_eval.score.geom_viols;
     }
     let repaired_nets = state.repaired_nets;
-    if cfg.tune_match_groups {
+    let can_tune = cfg.tune_match_groups && hard_deadline.is_none_or(|dl| Instant::now() < dl);
+    if can_tune {
         let only_nets = cfg.reroute_nets.clone().map(|mut s| {
             s.extend(repaired_nets.iter().cloned());
             for rule in &board.constraints.match_groups {
@@ -800,15 +1068,18 @@ pub(crate) fn route_with_repair(
             s
         });
         apply_match_group_tuning(board, &mut summary, only_nets, &cfg.ignored_nets);
-    } else if !board.constraints.match_groups.is_empty()
-        || !board.constraints.max_lengths.is_empty()
-    {
-        summary.length_violations = count_length_violations(board);
+    } else {
+        if cfg.tune_match_groups && !board.constraints.match_groups.is_empty() {
+            state.any_stopped_early = true;
+        }
+        if !board.constraints.match_groups.is_empty() || !board.constraints.max_lengths.is_empty() {
+            summary.length_violations = count_length_violations(board);
+        }
     }
 
     summary.passes_run = state.passes_run;
     summary.starts_run = state.starts_run;
-    summary.stopped_early = state.stopped_early;
+    summary.stopped_early = state.any_stopped_early;
     summary.repair_passes_run = state.repair_passes_run;
     summary.elapsed_ms = start.elapsed().as_millis();
     Ok(summary)
@@ -817,11 +1088,17 @@ pub(crate) fn route_with_repair(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
-    use super::{RepairScore, eval_repair_state};
+    use super::{
+        DeadlineWatchdog, REPAIR_PASS_MAX_MULTI_START, REPAIR_PASS_MAX_PASSES, RepairScore,
+        RepairState, budget_margins, eval_repair_state, initial_route_budget, next_pass_budget,
+    };
     use crate::ir::{
         BoardIr, BoardSpec, FilledPour, MaxLengthRule, MaxViasRule, PourPoly, Pt, Track, Via, mm,
     };
+    use crate::route::{RouteOptions, RouteSummary};
 
     #[test]
     fn eval_repair_state_prioritizes_geom_drc_over_max_length() {
@@ -1129,5 +1406,270 @@ pin_nets = { "1" = "GND" }
         let eval = eval_repair_state(&board, &HashSet::new(), 1, None);
         assert_eq!(eval.pour_opens.len(), 0);
         assert_eq!(eval.repairable.len(), 1);
+    }
+
+    #[test]
+    fn budget_splitting_and_caps_edge_cases() {
+        assert_eq!(budget_margins(0), None);
+        assert_eq!(budget_margins(1), None);
+        assert_eq!(initial_route_budget(0), Duration::ZERO);
+        assert_eq!(initial_route_budget(1), Duration::from_secs(1));
+        assert_eq!(initial_route_budget(2), Duration::from_millis(900));
+        assert_eq!(initial_route_budget(180), Duration::from_secs(135));
+        assert_eq!(
+            budget_margins(180),
+            Some((Duration::from_secs(5), Duration::from_secs(3)))
+        );
+
+        let mut prev_init = Duration::ZERO;
+        let mut prev_reserve = Duration::ZERO;
+        let mut prev_margin = Duration::ZERO;
+        let mut prev_buffer = Duration::ZERO;
+        for limit in 2..=200u64 {
+            let (start_margin, buffer) = budget_margins(limit).unwrap();
+            let total = Duration::from_secs(limit);
+            let init = initial_route_budget(limit);
+            assert!(init < total, "limit={limit}");
+            let reserve = total - init;
+            assert!(
+                reserve > start_margin,
+                "limit={limit}: reserve={reserve:?} <= start_margin={start_margin:?}"
+            );
+            assert!(start_margin > buffer, "limit={limit}");
+            assert!(init >= prev_init, "init not monotonic at limit={limit}");
+            assert!(
+                reserve >= prev_reserve,
+                "reserve not monotonic at limit={limit}"
+            );
+            assert!(
+                start_margin >= prev_margin,
+                "margin not monotonic at limit={limit}"
+            );
+            assert!(
+                buffer >= prev_buffer,
+                "buffer not monotonic at limit={limit}"
+            );
+            prev_init = init;
+            prev_reserve = reserve;
+            prev_margin = start_margin;
+            prev_buffer = buffer;
+        }
+
+        assert_eq!(next_pass_budget(0, Duration::from_secs(10), 4), None);
+        assert_eq!(next_pass_budget(1, Duration::from_secs(1), 4), None);
+        assert_eq!(next_pass_budget(2, Duration::from_millis(749), 4), None);
+        assert_eq!(
+            next_pass_budget(2, Duration::from_millis(1100), 4),
+            Some(Duration::from_millis(350))
+        );
+        assert_eq!(next_pass_budget(20, Duration::from_millis(4999), 4), None);
+        assert_eq!(
+            next_pass_budget(20, Duration::from_secs(5), 4),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            next_pass_budget(180, Duration::from_secs(45), 8),
+            Some(Duration::from_millis(5250))
+        );
+        assert_eq!(
+            next_pass_budget(180, Duration::from_secs(45), 1),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(next_pass_budget(180, Duration::from_secs(45), 0), None);
+        assert_eq!(
+            next_pass_budget(180, Duration::from_secs(45), usize::MAX),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            next_pass_budget(
+                180,
+                Duration::from_secs(45),
+                (u32::MAX as usize).saturating_add(1)
+            ),
+            Some(Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn deadline_watchdog_trips_after_deadline_and_joins_cleanly_on_early_drop() {
+        let wd_short = DeadlineWatchdog::spawn(Instant::now() + Duration::from_millis(50));
+        let flag_short = wd_short.flag();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(flag_short.load(Ordering::Acquire));
+        assert!(wd_short.tripped());
+        drop(wd_short);
+
+        let wd_long = DeadlineWatchdog::spawn(Instant::now() + Duration::from_secs(10));
+        let flag_long = wd_long.flag();
+        let t0 = Instant::now();
+        drop(wd_long);
+        assert!(t0.elapsed() < Duration::from_millis(200));
+        assert!(!flag_long.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn repair_state_budget_untimed_stage2_and_caps() {
+        let spec: BoardSpec = toml::from_str(
+            r#"
+name = "budget_state_test"
+size_nm = [20000000, 12000000]
+[[layers]]
+name = "F.Cu"
+kind = "signal"
+side = "top"
+"#,
+        )
+        .unwrap();
+        let board = BoardIr::from_spec(&spec).unwrap();
+        let summary = RouteSummary {
+            total_nets: 1,
+            routable_nets: 1,
+            routed_nets: 0,
+            unconnected_pairs: 1,
+            total_segments: 0,
+            total_vias: 0,
+            total_wirelength_um: 0.0,
+            passes_run: 1,
+            starts_run: 1,
+            drc_violations: 0,
+            length_violations: 0,
+            dense_bga_pads: 0,
+            pofv_capable_pads: 0,
+            grid_step_um: 100.0,
+            stopped_early: true,
+            elapsed_ms: 0,
+            repair_passes_run: 0,
+        };
+
+        // Untimed repair passes preserve user max_passes, multi_start, and optimize.
+        let untimed_cfg = RouteOptions {
+            max_passes: 90,
+            multi_start: 6,
+            optimize: true,
+            timeout_secs: None,
+            ..Default::default()
+        };
+        let mut untimed_pass_cfg = untimed_cfg.clone();
+        untimed_pass_cfg.timeout_secs = None;
+        let mut untimed_state = RepairState {
+            cfg: &untimed_cfg,
+            pass_cfg: untimed_pass_cfg,
+            hard_deadline: None,
+            repair_passes: 4,
+            repair_passes_run: 0,
+            passes_run: 1,
+            starts_run: 1,
+            any_stopped_early: false,
+            summary: summary.clone(),
+            repaired_nets: HashSet::new(),
+            cur_eval: eval_repair_state(&board, &HashSet::new(), 1, None),
+            pour_keepouts: Vec::new(),
+            zone_state: None,
+        };
+        assert_eq!(untimed_state.configure_pass_budget(), Some(None));
+        assert_eq!(untimed_state.pass_cfg.max_passes, 90);
+        assert_eq!(untimed_state.pass_cfg.multi_start, 6);
+        assert!(untimed_state.pass_cfg.optimize);
+        assert_eq!(untimed_state.pass_cfg.timeout_secs, None);
+
+        // Timed repair pass caps max_passes/multi_start, clears pass_cfg.timeout_secs, and allows Stage 2 below start_margin.
+        let timed_cfg = RouteOptions {
+            max_passes: 90,
+            multi_start: 6,
+            optimize: true,
+            timeout_secs: Some(20),
+            ..Default::default()
+        };
+        let mut timed_pass_cfg = timed_cfg.clone();
+        timed_pass_cfg.timeout_secs = None;
+        let mut state_ok = RepairState {
+            cfg: &timed_cfg,
+            pass_cfg: timed_pass_cfg.clone(),
+            hard_deadline: Some(Instant::now() + Duration::from_secs(8)),
+            repair_passes: 4,
+            repair_passes_run: 0,
+            passes_run: 1,
+            starts_run: 1,
+            any_stopped_early: summary.stopped_early,
+            summary: summary.clone(),
+            repaired_nets: HashSet::new(),
+            cur_eval: eval_repair_state(&board, &HashSet::new(), 1, None),
+            pour_keepouts: Vec::new(),
+            zone_state: None,
+        };
+        assert!(state_ok.can_step());
+        let dl = state_ok.configure_pass_budget().unwrap().unwrap();
+        assert_eq!(state_ok.pass_cfg.max_passes, REPAIR_PASS_MAX_PASSES);
+        assert_eq!(state_ok.pass_cfg.multi_start, 1);
+        assert!(!state_ok.pass_cfg.optimize);
+        assert_eq!(state_ok.pass_cfg.timeout_secs, None);
+        assert!(dl <= state_ok.hard_deadline.unwrap() - Duration::from_secs(3));
+
+        // Stage 2 with remaining pass time between safety_buffer + MIN_STAGE2_DURATION and start_margin (e.g. 4s < 5s) succeeds.
+        let mut state_stage2 = RepairState {
+            cfg: &timed_cfg,
+            pass_cfg: timed_pass_cfg.clone(),
+            hard_deadline: Some(Instant::now() + Duration::from_millis(7500)),
+            repair_passes: 4,
+            repair_passes_run: 1,
+            passes_run: 1,
+            starts_run: 1,
+            any_stopped_early: false,
+            summary: summary.clone(),
+            repaired_nets: HashSet::new(),
+            cur_eval: eval_repair_state(&board, &HashSet::new(), 1, None),
+            pour_keepouts: Vec::new(),
+            zone_state: None,
+        };
+        assert!(state_stage2.prepare_stage2(Some(Instant::now() + Duration::from_secs(4))));
+        assert_eq!(state_stage2.pass_cfg.max_passes, REPAIR_PASS_MAX_PASSES);
+        assert_eq!(state_stage2.pass_cfg.multi_start, 1);
+        assert!(!state_stage2.pass_cfg.optimize);
+        assert_eq!(state_stage2.pass_cfg.timeout_secs, None);
+        assert!(!state_stage2.prepare_stage2(Some(Instant::now() + Duration::from_millis(200))));
+
+        // Remaining < start_margin (5s) -> cannot start a new pass, and detects actionable work.
+        let mut state_low = RepairState {
+            cfg: &timed_cfg,
+            pass_cfg: timed_pass_cfg,
+            hard_deadline: Some(Instant::now() + Duration::from_secs(3)),
+            repair_passes: 4,
+            repair_passes_run: 0,
+            passes_run: 1,
+            starts_run: 1,
+            any_stopped_early: false,
+            summary,
+            repaired_nets: HashSet::new(),
+            cur_eval: eval_repair_state(&board, &HashSet::new(), 1, None),
+            pour_keepouts: Vec::new(),
+            zone_state: None,
+        };
+        assert!(!state_low.can_step());
+        assert!(!state_low.has_start_budget());
+        assert_eq!(state_low.configure_pass_budget(), None);
+
+        // Generous budget (> 15s remaining, >= 10s pass_dur) keeps optimize=true and caps multi_start at REPAIR_PASS_MAX_MULTI_START.
+        let mut state_gen = RepairState {
+            cfg: &timed_cfg,
+            pass_cfg: RouteOptions {
+                timeout_secs: None,
+                ..timed_cfg.clone()
+            },
+            hard_deadline: Some(Instant::now() + Duration::from_secs(45)),
+            repair_passes: 2,
+            repair_passes_run: 0,
+            passes_run: 0,
+            starts_run: 0,
+            any_stopped_early: false,
+            summary: state_low.summary,
+            repaired_nets: HashSet::new(),
+            cur_eval: eval_repair_state(&board, &HashSet::new(), 0, None),
+            pour_keepouts: Vec::new(),
+            zone_state: None,
+        };
+        assert!(state_gen.configure_pass_budget().is_some());
+        assert_eq!(state_gen.pass_cfg.max_passes, REPAIR_PASS_MAX_PASSES);
+        assert_eq!(state_gen.pass_cfg.multi_start, REPAIR_PASS_MAX_MULTI_START);
+        assert!(state_gen.pass_cfg.optimize);
     }
 }

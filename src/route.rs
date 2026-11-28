@@ -1,4 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize, Serializer};
 use viahop::geometry::Point;
@@ -447,12 +449,13 @@ pub(crate) fn apply_match_group_tuning(
 
 /// Routes all non-ignored (or `--reroute-nets` targeted) nets in memory using `viahop`.
 pub fn route_board_ir(board: &mut BoardIr, cfg: &RouteOptions) -> Result<RouteSummary, String> {
-    route_board_ir_with_unconnected(board, cfg).map(|(summary, _)| summary)
+    route_board_ir_inner(board, cfg, None).map(|(summary, _)| summary)
 }
 
-pub(crate) fn route_board_ir_with_unconnected(
+pub(crate) fn route_board_ir_inner(
     board: &mut BoardIr,
     cfg: &RouteOptions,
+    stop_flag: Option<Arc<AtomicBool>>,
 ) -> Result<(RouteSummary, HashSet<String>), String> {
     if let Some(pad_mm) = cfg.reroute_pad_mm
         && (!pad_mm.is_finite() || pad_mm <= 0.0)
@@ -502,7 +505,7 @@ pub(crate) fn route_board_ir_with_unconnected(
         length_constraints,
         reroute_nets: cfg.reroute_nets.clone(),
         reroute_pad_um: cfg.reroute_pad_mm.map(|m| m * 1000.0),
-        stop_flag: None,
+        stop_flag,
     };
 
     let result = route_board(&vboard, &rcfg);
