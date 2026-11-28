@@ -10,7 +10,7 @@ use crate::ir::{BoardIr, LayerKind, Nm, PourPoly, Pt, SOLDER_MASK_THICKNESS_NM, 
 use crate::kicad_export_items::{
     UuidGen, esc, write_closed_poly_lines, write_graphic, write_keepout, write_pts,
 };
-use crate::kicad_raw_fp::write_footprint;
+use crate::kicad_raw_fp::write_footprints;
 use crate::zone_scene::match_pour_specs;
 
 fn collect_net_ids(board: &BoardIr) -> BTreeMap<String, usize> {
@@ -176,9 +176,28 @@ fn write_setup(out: &mut String, board: &BoardIr) {
     out.push_str("\t)\n");
 }
 
+fn vertex_accepts_left_ray(p_prev: Pt, p_cur: Pt, p_next: Pt) -> bool {
+    let e1x = (p_prev.x - p_cur.x) as i128;
+    let e1y = (p_prev.y - p_cur.y) as i128;
+    let e2x = (p_next.x - p_cur.x) as i128;
+    let e2y = (p_next.y - p_cur.y) as i128;
+    let cross = e2x * e1y - e2y * e1x;
+    if cross < 0 {
+        e2y >= 0 || e1y <= 0
+    } else if cross == 0 && e2x * e1x + e2y * e1y > 0 {
+        e2y == 0 && e2x < 0
+    } else {
+        e2y >= 0 && e1y <= 0
+    }
+}
+
 // Fractures a `PourPoly` (outer + holes) into a single KiCad keyhole-slit polygon.
 fn fracture_pour_poly(poly: &PourPoly) -> Vec<Pt> {
     let mut ring = poly.outer.clone();
+    ring.dedup();
+    if ring.len() > 1 && ring.first() == ring.last() {
+        ring.pop();
+    }
     if ring.len() < 3 || poly.holes.is_empty() {
         return ring;
     }
@@ -200,56 +219,160 @@ fn fracture_pour_poly(poly: &PourPoly) -> Vec<Pt> {
             (cw, m_idx, m_pt)
         })
         .collect();
+    if holes.is_empty() {
+        return ring;
+    }
     // Process rightmost holes first so no unprocessed hole can block the +X bridge ray.
     holes.sort_by_key(|h| std::cmp::Reverse((h.2.x, h.2.y)));
 
+    let mut min_y = ring[0].y;
+    let mut max_y = ring[0].y;
+    for p in &ring {
+        min_y = min_y.min(p.y);
+        max_y = max_y.max(p.y);
+    }
+    let n0 = ring.len();
+    let mut total_verts = n0;
+    for (h, _, _) in &holes {
+        total_verts += h.len() + 2;
+        for p in h {
+            min_y = min_y.min(p.y);
+            max_y = max_y.max(p.y);
+        }
+    }
+
+    let mut pts = ring;
+    pts.reserve(total_verts - n0);
+    let mut next: Vec<usize> = Vec::with_capacity(total_verts);
+    let mut prev: Vec<usize> = Vec::with_capacity(total_verts);
+    for i in 0..n0 {
+        next.push((i + 1) % n0);
+        prev.push((i + n0 - 1) % n0);
+    }
+
+    let h_span = (max_y - min_y).max(1);
+    let num_slabs = (total_verts / 4).clamp(16, 512);
+    let y_step = (h_span / num_slabs as Nm).max(1);
+    let actual_slabs = ((h_span / y_step) as usize + 1).max(1);
+    let slab_of =
+        |y: Nm| -> usize { ((y - min_y) / y_step).clamp(0, actual_slabs as i64 - 1) as usize };
+    let mut slabs: Vec<Vec<usize>> = vec![Vec::new(); actual_slabs];
+    for i in 0..n0 {
+        let a = pts[i];
+        let b = pts[next[i]];
+        let s0 = slab_of(a.y.min(b.y));
+        let s1 = slab_of(a.y.max(b.y));
+        for slab in &mut slabs[s0..=s1] {
+            slab.push(i);
+        }
+    }
+
+    let mut splice_pts: Vec<Pt> = Vec::new();
     for (h, m_idx, m) in holes {
-        let n = ring.len();
-        let mut best: Option<(f64, bool, usize, Option<Pt>)> = None;
-        for i in 0..n {
-            let a = ring[i];
-            let b = ring[(i + 1) % n];
+        let s = slab_of(m.y);
+        let mut best: Option<(f64, u8, usize)> = None;
+        for &i in &slabs[s] {
+            let a = pts[i];
+            let b = pts[next[i]];
             if a.y == m.y && a.x >= m.x {
-                let cand = (a.x as f64, false, i, None);
-                if best.is_none_or(|cur| cand.0 < cur.0 || (cand.0 == cur.0 && !cand.1 && cur.1)) {
+                let rank = u8::from(!vertex_accepts_left_ray(pts[prev[i]], a, b));
+                let cand = (a.x as f64, rank, i);
+                if best.is_none_or(|cur| cand.0 < cur.0 || (cand.0 == cur.0 && cand.1 < cur.1)) {
                     best = Some(cand);
                 }
             }
-            if (a.y > m.y) != (b.y > m.y) {
+            if (a.y > m.y && b.y < m.y) || (a.y < m.y && b.y > m.y) {
                 let ix = a.x as f64 + (m.y - a.y) as f64 * (b.x - a.x) as f64 / (b.y - a.y) as f64;
                 if ix >= m.x as f64 - 1e-6 {
                     let rx = ix.max(m.x as f64);
-                    let cand = (rx, true, i, Some(Pt::new(rx.round() as Nm, m.y)));
+                    let cand = (rx, 2, i);
                     if best.is_none_or(|cur| cand.0 < cur.0) {
                         best = Some(cand);
                     }
                 }
             }
         }
-        let Some((_, _, edge_idx, split_pt)) = best else {
+        let Some((bx, rank, u)) = best else {
             continue;
         };
-        let hl = h.len();
-        let mut splice = Vec::with_capacity(hl + 3);
-        if let Some(ip) = split_pt {
-            splice.push(ip);
-        }
-        for k in 0..=hl {
-            splice.push(h[(m_idx + k) % hl]);
-        }
-        splice.push(split_pt.unwrap_or(ring[edge_idx]));
+        let split_pt = (rank == 2).then(|| Pt::new(bx.round() as Nm, m.y));
+        let v = next[u];
+        let old_s0 = slab_of(pts[u].y.min(pts[v].y));
+        let old_s1 = slab_of(pts[u].y.max(pts[v].y));
 
-        let mut next = Vec::with_capacity(n + splice.len());
-        next.extend_from_slice(&ring[..=edge_idx]);
-        next.extend(splice);
-        next.extend_from_slice(&ring[(edge_idx + 1)..]);
-        next.dedup();
-        if next.len() > 1 && next.first() == next.last() {
-            next.pop();
+        splice_pts.clear();
+        if let Some(ip) = split_pt {
+            splice_pts.push(ip);
         }
-        ring = next;
+        let hl = h.len();
+        for k in 0..=hl {
+            splice_pts.push(h[(m_idx + k) % hl]);
+        }
+        splice_pts.push(split_pt.unwrap_or(pts[u]));
+        splice_pts.dedup();
+        if splice_pts.first() == Some(&pts[u]) {
+            splice_pts.remove(0);
+        }
+        if splice_pts.last() == Some(&pts[v]) {
+            splice_pts.pop();
+        }
+        if splice_pts.is_empty() {
+            continue;
+        }
+
+        let first_new = pts.len();
+        let count = splice_pts.len();
+        for (k, &pt) in splice_pts.iter().enumerate() {
+            let idx = first_new + k;
+            pts.push(pt);
+            prev.push(if k == 0 { u } else { idx - 1 });
+            next.push(if k + 1 == count { v } else { idx + 1 });
+        }
+        let last_new = first_new + count - 1;
+        next[u] = first_new;
+        prev[v] = last_new;
+
+        let new_s0 = slab_of(pts[u].y.min(pts[first_new].y));
+        let new_s1 = slab_of(pts[u].y.max(pts[first_new].y));
+        if (old_s0, old_s1) != (new_s0, new_s1) {
+            for (s_idx, slab) in (old_s0..=old_s1).zip(&mut slabs[old_s0..=old_s1]) {
+                if (s_idx < new_s0 || s_idx > new_s1)
+                    && let Some(pos) = slab.iter().position(|&e| e == u)
+                {
+                    slab.swap_remove(pos);
+                }
+            }
+            for (s_idx, slab) in (new_s0..=new_s1).zip(&mut slabs[new_s0..=new_s1]) {
+                if s_idx < old_s0 || s_idx > old_s1 {
+                    slab.push(u);
+                }
+            }
+        }
+        for idx in first_new..=last_new {
+            let a = pts[idx];
+            let b = pts[next[idx]];
+            let s0 = slab_of(a.y.min(b.y));
+            let s1 = slab_of(a.y.max(b.y));
+            for slab in &mut slabs[s0..=s1] {
+                slab.push(idx);
+            }
+        }
     }
-    ring
+
+    let mut out = Vec::with_capacity(pts.len());
+    let mut cur = 0usize;
+    for _ in 0..pts.len() {
+        out.push(pts[cur]);
+        cur = next[cur];
+        if cur == 0 {
+            break;
+        }
+    }
+    out.dedup();
+    if out.len() > 1 && out.first() == out.last() {
+        out.pop();
+    }
+    out
 }
 
 /// Renders `BoardIr` into a KiCad `.kicad_pcb` S-expression string (Y-up -> Y-down).
@@ -313,9 +436,7 @@ pub fn render_kicad_pcb(board: &BoardIr) -> String {
         write_graphic(&mut out, g, None, &mut uuids);
     }
 
-    for pl in &board.placements {
-        write_footprint(&mut out, pl, board, &net_ids, &mut uuids);
-    }
+    write_footprints(&mut out, board, &net_ids, &mut uuids);
 
     for tr in &board.tracks {
         let net_id = net_ids.get(&tr.net).copied().unwrap_or(0);
@@ -540,4 +661,156 @@ pub fn export_kicad_pcb(board: &BoardIr, pcb_path: &Path, write_pro: bool) -> Re
             .map_err(|e| format!("failed to write '{}': {e}", pro_path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::{point_in_polygon, polygon_signed_area_2};
+    use crate::ir::mm;
+    use std::cmp::Ordering;
+    use std::collections::HashMap;
+
+    fn cmp_dir(a: Pt, b: Pt) -> Ordering {
+        let half = |d: Pt| u8::from(d.y < 0 || (d.y == 0 && d.x < 0));
+        half(a).cmp(&half(b)).then_with(|| {
+            let cross = (a.x as i128) * (b.y as i128) - (a.y as i128) * (b.x as i128);
+            0i128.cmp(&cross)
+        })
+    }
+
+    fn in_open_ccw_arc(u: Pt, r: Pt, w: Pt) -> bool {
+        match cmp_dir(u, w) {
+            Ordering::Less => cmp_dir(u, r) == Ordering::Less && cmp_dir(r, w) == Ordering::Less,
+            Ordering::Greater => cmp_dir(u, r) == Ordering::Less || cmp_dir(r, w) == Ordering::Less,
+            Ordering::Equal => false,
+        }
+    }
+
+    fn pairs_strictly_interleave(a1: Pt, b1: Pt, a2: Pt, b2: Pt) -> bool {
+        if cmp_dir(a2, a1) == Ordering::Equal
+            || cmp_dir(a2, b1) == Ordering::Equal
+            || cmp_dir(b2, a1) == Ordering::Equal
+            || cmp_dir(b2, b1) == Ordering::Equal
+        {
+            return false;
+        }
+        in_open_ccw_arc(a1, a2, b1) != in_open_ccw_arc(a1, b2, b1)
+    }
+
+    fn assert_no_repeated_vertex_crossings(poly: &[Pt]) {
+        let n = poly.len();
+        let mut by_vert: HashMap<Pt, Vec<(Pt, Pt)>> = HashMap::new();
+        for i in 0..n {
+            let p = poly[i];
+            let prev = poly[(i + n - 1) % n];
+            let next = poly[(i + 1) % n];
+            by_vert.entry(p).or_default().push((
+                Pt::new(prev.x - p.x, prev.y - p.y),
+                Pt::new(next.x - p.x, next.y - p.y),
+            ));
+        }
+        for (v, pairs) in by_vert {
+            for (i, &(a1, b1)) in pairs.iter().enumerate() {
+                for &(a2, b2) in &pairs[i + 1..] {
+                    assert!(
+                        !pairs_strictly_interleave(a1, b1, a2, b2),
+                        "cyclic crossing at {v:?}: ({a1:?}, {b1:?}) vs ({a2:?}, {b2:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    fn assert_fracture_valid(outer: &[Pt], holes: &[Vec<Pt>]) {
+        let poly = PourPoly {
+            outer: outer.to_vec(),
+            holes: holes.to_vec(),
+        };
+        let fractured = fracture_pour_poly(&poly);
+        assert!(fractured.len() >= outer.len() + holes.len() * 3);
+        assert_ne!(fractured.first(), fractured.last());
+        assert!(fractured.windows(2).all(|w| w[0] != w[1]));
+        assert_no_repeated_vertex_crossings(&fractured);
+
+        let hole_area_sum: i128 = holes.iter().map(|h| polygon_signed_area_2(h).abs()).sum();
+        let expected_area_2 = polygon_signed_area_2(outer).abs() - hole_area_sum;
+        assert_eq!(polygon_signed_area_2(&fractured), expected_area_2);
+
+        for h in holes {
+            let cx = h.iter().map(|p| p.x).sum::<Nm>() / h.len() as Nm;
+            let cy = h.iter().map(|p| p.y).sum::<Nm>() / h.len() as Nm;
+            assert!(!point_in_polygon(Pt::new(cx, cy), &fractured));
+        }
+    }
+
+    #[test]
+    fn fracture_pour_poly_handles_many_holes_same_y_and_bridge_on_bridge() {
+        let outer = vec![
+            Pt::new(0, 0),
+            Pt::new(mm(100.0), 0),
+            Pt::new(mm(100.0), mm(100.0)),
+            Pt::new(0, mm(100.0)),
+        ];
+        let mut holes = Vec::new();
+        // 8x7 = 56 grid holes with shared Y coordinates across rows.
+        for row in 0..7 {
+            for col in 0..8 {
+                let x0 = mm(5.0 + col as f64 * 10.0);
+                let y0 = mm(5.0 + row as f64 * 10.0);
+                holes.push(vec![
+                    Pt::new(x0, y0),
+                    Pt::new(x0 + mm(5.0), y0),
+                    Pt::new(x0 + mm(5.0), y0 + mm(5.0)),
+                    Pt::new(x0, y0 + mm(5.0)),
+                ]);
+            }
+        }
+        // Top-tip and bottom-tip holes on the same Y = 85mm to force bridge-on-bridge vertex hits.
+        holes.push(vec![
+            Pt::new(mm(40.0), mm(80.0)),
+            Pt::new(mm(45.0), mm(85.0)),
+            Pt::new(mm(37.0), mm(82.0)),
+        ]);
+        holes.push(vec![
+            Pt::new(mm(20.0), mm(85.0)),
+            Pt::new(mm(15.0), mm(88.0)),
+            Pt::new(mm(17.0), mm(82.0)),
+        ]);
+        holes.push(vec![
+            Pt::new(mm(60.0), mm(88.0)),
+            Pt::new(mm(65.0), mm(85.0)),
+            Pt::new(mm(57.0), mm(90.0)),
+        ]);
+        holes.push(vec![
+            Pt::new(mm(28.0), mm(82.0)),
+            Pt::new(mm(33.0), mm(85.0)),
+            Pt::new(mm(28.0), mm(88.0)),
+        ]);
+
+        assert!(holes.len() >= 60);
+        assert_fracture_valid(&outer, &holes);
+
+        // Large diagonal edge (|dy| * |dx| > 2^53) ending at y = 1mm must not bypass vertex_accepts_left_ray.
+        let diag_outer = vec![
+            Pt::new(0, 0),
+            Pt::new(mm(150.0), 0),
+            Pt::new(mm(150.0), mm(120.0)),
+            Pt::new(0, mm(120.0)),
+        ];
+        let diag_holes = vec![
+            vec![
+                Pt::new(mm(1.0), mm(119.0) + 1),
+                Pt::new(mm(95.0) + 1, mm(1.0)),
+                Pt::new(mm(90.0), mm(2.0)),
+            ],
+            vec![
+                Pt::new(mm(10.0), mm(0.5)),
+                Pt::new(mm(15.0), mm(0.5)),
+                Pt::new(mm(15.0), mm(1.0)),
+                Pt::new(mm(10.0), mm(1.0)),
+            ],
+        ];
+        assert_fracture_valid(&diag_outer, &diag_holes);
+    }
 }

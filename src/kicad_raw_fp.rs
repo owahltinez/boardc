@@ -498,28 +498,43 @@ fn raw_matches_fp(root: &SExp, fp: &FootprintDef) -> bool {
         && parsed.models == fp.models
 }
 
-fn try_write_raw_footprint(
+fn prepare_raw_footprint(fp: &FootprintDef) -> Option<(Vec<SExp>, bool)> {
+    let raw = fp.kicad_raw.as_deref()?;
+    let root = parse_kicad_sexp(raw).ok()?;
+    if root.tag() != Some("footprint") || !raw_matches_fp(&root, fp) {
+        return None;
+    }
+    let raw_is_bottom = root.find_child("layer").and_then(|n| atom_at(n, 1)) == Some("B.Cu");
+    let SExp::List(mut items) = root else {
+        return None;
+    };
+    let start_idx = usize::from(items.get(1).and_then(SExp::as_atom).is_some()) + 1;
+    items.drain(..start_idx);
+    Some((items, raw_is_bottom))
+}
+
+fn placement_fp_id<'a>(pl: &'a Placement, fp: &'a FootprintDef) -> &'a str {
+    pl.schematic
+        .as_ref()
+        .and_then(|s| s.footprint.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&fp.name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_raw_footprint(
     out: &mut String,
-    fp_id: &str,
     pl: &Placement,
     fp: &FootprintDef,
+    raw_children: &[SExp],
+    raw_is_bottom: bool,
     hide_refdes: bool,
     net_ids: &BTreeMap<String, usize>,
     uuids: &mut UuidGen,
-) -> bool {
-    let Some(raw) = &fp.kicad_raw else {
-        return false;
-    };
-    let Ok(root) = parse_kicad_sexp(raw) else {
-        return false;
-    };
-    if root.tag() != Some("footprint") || !raw_matches_fp(&root, fp) {
-        return false;
-    }
-    let raw_is_bottom = root.find_child("layer").and_then(|n| atom_at(n, 1)) == Some("B.Cu");
-    let SExp::List(items) = root else {
-        return false;
-    };
+) {
+    let fp_id = placement_fp_id(pl, fp);
+    let items = raw_children.to_vec();
 
     let bottom = pl.side == Side::Bottom;
     let needs_flip = bottom != raw_is_bottom;
@@ -545,13 +560,12 @@ fn try_write_raw_footprint(
         })
         .unwrap_or_default();
 
-    let start_idx = usize::from(items.get(1).and_then(SExp::as_atom).is_some()) + 1;
     let (mut head_meta, mut props, mut body, mut group_indices) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut raw_attr: Option<Vec<String>> = None;
     let (mut saw_ref, mut saw_val) = (false, false);
 
-    for mut child in items.into_iter().skip(start_idx) {
+    for mut child in items {
         let Some(tag) = child.tag().map(str::to_string) else {
             continue;
         };
@@ -706,50 +720,52 @@ fn try_write_raw_footprint(
         write_top_child(out, node);
     }
     out.push_str("\t)\n");
-    true
 }
 
-pub(crate) fn write_footprint(
+pub(crate) fn write_footprints(
     out: &mut String,
-    pl: &Placement,
     board: &BoardIr,
     net_ids: &BTreeMap<String, usize>,
     uuids: &mut UuidGen,
 ) {
-    let Some(fp) = board.footprints.get(&pl.footprint) else {
-        return;
-    };
-    let fp_id = pl
-        .schematic
-        .as_ref()
-        .and_then(|s| s.footprint.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&fp.name);
-    if try_write_raw_footprint(
-        out,
-        fp_id,
-        pl,
-        fp,
-        board.fab.auto_refdes == AutoRefdes::Off,
-        net_ids,
-        uuids,
-    ) {
-        return;
-    }
-    let bottom = pl.side == Side::Bottom;
-    write_fp_header(out, fp_id, pl, pl.rot_deg, uuids);
-    write_fp_property(out, "Reference", &pl.refdes, bottom, uuids);
-    write_fp_property(out, "Value", &pl.value, bottom, uuids);
-    if let Some(sch) = &pl.schematic {
-        for (k, v) in &sch.fields {
-            if is_exportable_kicad_field(k, v) {
-                write_fp_property(out, k, v, bottom, uuids);
-            }
+    let hide_refdes = board.fab.auto_refdes == AutoRefdes::Off;
+    let mut raw_fp_cache: HashMap<&str, Option<(Vec<SExp>, bool)>> =
+        HashMap::with_capacity(board.footprints.len());
+    for pl in &board.placements {
+        let Some(fp) = board.footprints.get(&pl.footprint) else {
+            continue;
+        };
+        let cached = raw_fp_cache
+            .entry(pl.footprint.as_str())
+            .or_insert_with(|| prepare_raw_footprint(fp));
+        if let Some((raw_items, raw_is_bottom)) = cached.as_ref() {
+            write_raw_footprint(
+                out,
+                pl,
+                fp,
+                raw_items,
+                *raw_is_bottom,
+                hide_refdes,
+                net_ids,
+                uuids,
+            );
+            continue;
         }
-        write_schematic_paths(out, sch);
+        let fp_id = placement_fp_id(pl, fp);
+        let bottom = pl.side == Side::Bottom;
+        write_fp_header(out, fp_id, pl, pl.rot_deg, uuids);
+        write_fp_property(out, "Reference", &pl.refdes, bottom, uuids);
+        write_fp_property(out, "Value", &pl.value, bottom, uuids);
+        if let Some(sch) = &pl.schematic {
+            for (k, v) in &sch.fields {
+                if is_exportable_kicad_field(k, v) {
+                    write_fp_property(out, k, v, bottom, uuids);
+                }
+            }
+            write_schematic_paths(out, sch);
+        }
+        write_fp_attr(out, None, fp, pl);
+        write_footprint_body(out, pl, fp, net_ids, uuids);
+        out.push_str("\t)\n");
     }
-    write_fp_attr(out, None, fp, pl);
-    write_footprint_body(out, pl, fp, net_ids, uuids);
-    out.push_str("\t)\n");
 }

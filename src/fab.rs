@@ -390,105 +390,123 @@ pub fn export_fab(
         .map_err(|e| format!("failed to create fab dir '{}': {e}", out_dir.display()))?;
     let cu_layers = board.copper_layer_names();
     let slug = safe_slug(&board.name);
-    let mut gerber_files = Vec::new();
 
-    for (idx, layer_name) in cu_layers.iter().enumerate() {
-        let path = out_dir.join(copper_gerber_filename(layer_name, idx, &cu_layers));
-        emit_copper_layer(board, &cu_layers, idx, &path)?;
-        gerber_files.push(path);
-    }
-
-    for (side, mask_file, paste_file, silk_file, fn_pos) in [
+    let cu_paths: Vec<PathBuf> = cu_layers
+        .iter()
+        .enumerate()
+        .map(|(idx, layer_name)| out_dir.join(copper_gerber_filename(layer_name, idx, &cu_layers)))
+        .collect();
+    let side_files = [
         (
             Side::Top,
-            "F_Mask.gts",
-            "F_Paste.gtp",
-            "F_Silkscreen.gto",
+            out_dir.join("F_Mask.gts"),
+            out_dir.join("F_Paste.gtp"),
+            out_dir.join("F_Silkscreen.gto"),
             Position::Top,
         ),
         (
             Side::Bottom,
-            "B_Mask.gbs",
-            "B_Paste.gbp",
-            "B_Silkscreen.gbo",
+            out_dir.join("B_Mask.gbs"),
+            out_dir.join("B_Paste.gbp"),
+            out_dir.join("B_Silkscreen.gbo"),
             Position::Bottom,
         ),
-    ] {
-        let mask_path = out_dir.join(mask_file);
-        let mask_openings =
-            emit_mask_layer(board, &cu_layers, side, &mask_path, cfg.clip_silk_to_mask)?;
-        gerber_files.push(mask_path);
-
-        let paste_path = out_dir.join(paste_file);
-        emit_paste_layer(board, &cu_layers, side, &paste_path)?;
-        gerber_files.push(paste_path);
-
-        let silk_path = out_dir.join(silk_file);
-        let mut silk_b = GerberBuilder::new(FileFunction::Legend {
-            pos: fn_pos,
-            index: None,
-        });
-        emit_silk_layer(&mut silk_b, board, side, &mask_openings, fab);
-        silk_b.write_file(&silk_path)?;
-        gerber_files.push(silk_path);
-    }
-
+    ];
     let edge_path = out_dir.join("Edge_Cuts.gm1");
-    emit_edge_cuts(board, &edge_path)?;
-    gerber_files.push(edge_path);
 
-    let drill_sections = collect_drill_sections(board, &cu_layers);
-    let mut drill_files = Vec::with_capacity(drill_sections.len());
-    for sec in &drill_sections {
-        let path = out_dir.join(&sec.filename);
-        emit_excellon_section(&path, sec)?;
-        drill_files.push(path);
-    }
-
-    let bom_csv = out_dir.join(format!("{slug}_bom.csv"));
-    let cpl_csv = out_dir.join(format!("{slug}_cpl.csv"));
-    let gbrjob = out_dir.join(format!("{slug}-job.gbrjob"));
-    emit_bom_csv(board, &bom_csv)?;
-    emit_cpl_csv(board, &cpl_csv)?;
-    emit_gbrjob(board, &cu_layers, &gbrjob)?;
-
-    let mut assembly_svgs = Vec::new();
+    let mut assembly_jobs: Vec<(Side, PathBuf)> = Vec::new();
     if cfg.assembly {
-        let top_path = out_dir.join(format!("{slug}-assembly-top.svg"));
-        fs::write(
-            &top_path,
-            render_assembly_svg(board, Side::Top, DEFAULT_SVG_MARGIN_MM),
-        )
-        .map_err(|e| format!("failed to write '{}': {e}", top_path.display()))?;
-        assembly_svgs.push(top_path);
+        assembly_jobs.push((Side::Top, out_dir.join(format!("{slug}-assembly-top.svg"))));
         if has_bottom_assembly(board) {
-            let bot_path = out_dir.join(format!("{slug}-assembly-bottom.svg"));
-            fs::write(
-                &bot_path,
-                render_assembly_svg(board, Side::Bottom, DEFAULT_SVG_MARGIN_MM),
-            )
-            .map_err(|e| format!("failed to write '{}': {e}", bot_path.display()))?;
-            assembly_svgs.push(bot_path);
+            assembly_jobs.push((
+                Side::Bottom,
+                out_dir.join(format!("{slug}-assembly-bottom.svg")),
+            ));
         }
     }
 
-    let drill_map_svg = if cfg.drill_map {
-        let path = out_dir.join(format!("{slug}-drl_map.svg"));
-        let svg = render_drill_map_svg_with_sections(board, &drill_sections, DEFAULT_SVG_MARGIN_MM);
-        fs::write(&path, svg).map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
-        Some(path)
-    } else {
-        None
-    };
+    let drill_sections = collect_drill_sections(board, &cu_layers);
+    let mut drill_files = Vec::with_capacity(drill_sections.len());
+    let bom_csv = out_dir.join(format!("{slug}_bom.csv"));
+    let cpl_csv = out_dir.join(format!("{slug}_cpl.csv"));
+    let gbrjob = out_dir.join(format!("{slug}-job.gbrjob"));
 
-    let drill_report = if cfg.drill_report {
-        let path = out_dir.join(format!("{slug}-drl.rpt"));
-        let rpt = format_drill_report(board, &cu_layers, &drill_sections);
-        fs::write(&path, rpt).map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
-        Some(path)
-    } else {
-        None
-    };
+    let mut drill_map_svg = None;
+    let mut drill_report = None;
+
+    std::thread::scope(|s| -> Result<(), String> {
+        let mut handles = Vec::with_capacity(cu_paths.len() + 7);
+        for (idx, path) in cu_paths.iter().enumerate() {
+            let cu_ref = &cu_layers;
+            handles.push(s.spawn(move || emit_copper_layer(board, cu_ref, idx, path)));
+        }
+        for (side, mask_p, paste_p, silk_p, fn_pos) in &side_files {
+            let (side, fn_pos) = (*side, *fn_pos);
+            let cu_ref = &cu_layers;
+            let clip_silk = cfg.clip_silk_to_mask;
+            handles.push(s.spawn(move || {
+                let mask_openings = emit_mask_layer(board, cu_ref, side, mask_p, clip_silk)?;
+                let mut silk_b = GerberBuilder::new(FileFunction::Legend {
+                    pos: fn_pos,
+                    index: None,
+                });
+                emit_silk_layer(&mut silk_b, board, side, &mask_openings, fab);
+                silk_b.write_file(silk_p)
+            }));
+            handles.push(s.spawn(move || emit_paste_layer(board, cu_ref, side, paste_p)));
+        }
+        let edge_ref = &edge_path;
+        handles.push(s.spawn(move || emit_edge_cuts(board, edge_ref)));
+
+        for (side, path) in &assembly_jobs {
+            let side = *side;
+            handles.push(s.spawn(move || {
+                fs::write(
+                    path,
+                    render_assembly_svg(board, side, DEFAULT_SVG_MARGIN_MM),
+                )
+                .map_err(|e| format!("failed to write '{}': {e}", path.display()))
+            }));
+        }
+
+        for sec in &drill_sections {
+            let path = out_dir.join(&sec.filename);
+            emit_excellon_section(&path, sec)?;
+            drill_files.push(path);
+        }
+        emit_bom_csv(board, &bom_csv)?;
+        emit_cpl_csv(board, &cpl_csv)?;
+        emit_gbrjob(board, &cu_layers, &gbrjob)?;
+
+        if cfg.drill_map {
+            let path = out_dir.join(format!("{slug}-drl_map.svg"));
+            let svg =
+                render_drill_map_svg_with_sections(board, &drill_sections, DEFAULT_SVG_MARGIN_MM);
+            fs::write(&path, svg)
+                .map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
+            drill_map_svg = Some(path);
+        }
+        if cfg.drill_report {
+            let path = out_dir.join(format!("{slug}-drl.rpt"));
+            let rpt = format_drill_report(board, &cu_layers, &drill_sections);
+            fs::write(&path, rpt)
+                .map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
+            drill_report = Some(path);
+        }
+
+        for h in handles {
+            h.join().expect("fab export worker panicked")?;
+        }
+        Ok(())
+    })?;
+
+    let mut gerber_files = Vec::with_capacity(cu_paths.len() + 7);
+    gerber_files.extend(cu_paths);
+    for (_, mask_p, paste_p, silk_p, _) in side_files {
+        gerber_files.extend([mask_p, paste_p, silk_p]);
+    }
+    gerber_files.push(edge_path);
+    let assembly_svgs = assembly_jobs.into_iter().map(|(_, p)| p).collect();
 
     Ok(FabManifest {
         gerber_files,

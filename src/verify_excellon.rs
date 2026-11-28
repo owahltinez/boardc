@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
-use crate::geom::{UnionFind, pad_copper_layers, pad_to_world_shape};
-use crate::ir::{BoardIr, Nm, PadKind, Pt};
+use crate::geom::{
+    GridQueryScratch, SpatialGrid, UnionFind, pad_copper_layers, pad_to_world_shape,
+};
+use crate::ir::{BBoxNm, BoardIr, Nm, PadKind, Pt};
 use crate::poly_index::IndexedPour;
 use crate::shapes::ResolvedShape;
 use crate::verify::ConnectivityCheck;
@@ -117,18 +119,33 @@ pub(crate) fn match_drill_lists(
     parsed: &[(Nm, Pt)],
     tol_nm: Nm,
 ) -> (usize, usize) {
+    if tol_nm < 0 {
+        return (0, expected.len() + parsed.len());
+    }
+    let grid = SpatialGrid::new(
+        parsed.iter().map(|&(_, p)| BBoxNm::from_pt(p, 0)),
+        tol_nm.max(500_000),
+    );
+    let mut scratch = GridQueryScratch::default();
+    let mut cands = Vec::new();
     let mut used = vec![false; parsed.len()];
     let mut matched = 0usize;
     let mut mismatches = 0usize;
     for &(ed, ep) in expected {
-        if let Some((idx, _)) = parsed
+        grid.query_with(BBoxNm::from_pt(ep, tol_nm), &mut scratch, &mut cands);
+        let best = cands
             .iter()
-            .enumerate()
-            .filter(|&(i, &(pd, pp))| {
-                !used[i] && (pd - ed).abs() <= tol_nm && ep.dist(pp) <= tol_nm as f64
+            .copied()
+            .filter_map(|idx| {
+                let (pd, pp) = parsed[idx];
+                if used[idx] || (pd - ed).abs() > tol_nm {
+                    return None;
+                }
+                let d = ep.dist(pp);
+                (d <= tol_nm as f64).then_some((d, idx))
             })
-            .min_by(|(_, a), (_, b)| ep.dist(a.1).total_cmp(&ep.dist(b.1)))
-        {
+            .min_by(|&(da, ia), &(db, ib)| da.total_cmp(&db).then(ia.cmp(&ib)));
+        if let Some((_, idx)) = best {
             used[idx] = true;
             matched += 1;
         } else {
@@ -161,22 +178,40 @@ pub(crate) fn check_gerber_connectivity(
     pth_groups: &[(Vec<String>, DrillHits)],
 ) -> ConnectivityCheck {
     let cu_layers = board.copper_layer_names();
-    let mut by_layer: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut layer_indices: HashMap<&str, Vec<usize>> = HashMap::new();
     for (idx, isl) in islands.iter().enumerate() {
-        by_layer.entry(isl.layer.as_str()).or_default().push(idx);
+        layer_indices
+            .entry(isl.layer.as_str())
+            .or_default()
+            .push(idx);
     }
+    let by_layer: HashMap<&str, (Vec<usize>, SpatialGrid)> = layer_indices
+        .into_iter()
+        .map(|(layer, idxs)| {
+            let grid = SpatialGrid::new(
+                idxs.iter().map(|&idx| islands[idx].indexed.outer.bbox),
+                2_000_000,
+            );
+            (layer, (idxs, grid))
+        })
+        .collect();
+    let mut scratch = GridQueryScratch::default();
+    let mut cands = Vec::new();
 
     let mut uf = UnionFind::new(islands.len());
     for (span_layers, hits) in pth_groups {
         for &(dia, pos) in hits {
             let reach = (dia as f64 * 0.5) + 2_000.0;
             let reach_i = reach.ceil() as Nm;
+            let qbb = BBoxNm::from_pt(pos, reach_i);
             let mut first: Option<usize> = None;
             for layer in span_layers {
-                let Some(idxs) = by_layer.get(layer.as_str()) else {
+                let Some((idxs, grid)) = by_layer.get(layer.as_str()) else {
                     continue;
                 };
-                for &idx in idxs {
+                grid.query_with(qbb, &mut scratch, &mut cands);
+                for &li in &cands {
+                    let idx = idxs[li];
                     let isl = &islands[idx];
                     if isl.indexed.outer.bbox.expand(reach_i).contains_pt(pos)
                         && island_contains_or_near(pos, isl, reach)
@@ -204,6 +239,7 @@ pub(crate) fn check_gerber_connectivity(
                 continue;
             }
             let shape = pad_to_world_shape(pad, pl, 16);
+            let qbb = shape.bbox().expand(5_000);
             let layers = pad_copper_layers(pad, pl.side, &cu_layers);
             let net = pl.pin_nets.get(&pad.name).cloned().unwrap_or_default();
             let label = format!("{}.{}", pl.refdes, pad.name);
@@ -211,8 +247,11 @@ pub(crate) fn check_gerber_connectivity(
 
             for layer in &layers {
                 let mut layer_hit: Option<usize> = None;
-                if let Some(idxs) = by_layer.get(layer.as_str()) {
-                    for &idx in idxs {
+                if let Some((idxs, grid)) = by_layer.get(layer.as_str()) {
+                    grid.query_with(qbb, &mut scratch, &mut cands);
+                    cands.sort_unstable();
+                    for &li in &cands {
+                        let idx = idxs[li];
                         if island_near_shape(&shape, &islands[idx], 5_000.0) {
                             layer_hit = Some(idx);
                             break;
@@ -248,8 +287,10 @@ pub(crate) fn check_gerber_connectivity(
             b: tr.b,
             radius: tr.width / 2,
         };
-        if let Some(idxs) = by_layer.get(tr.layer.as_str()) {
-            for &idx in idxs {
+        if let Some((idxs, grid)) = by_layer.get(tr.layer.as_str()) {
+            grid.query_with(shape.bbox().expand(5_000), &mut scratch, &mut cands);
+            for &li in &cands {
+                let idx = idxs[li];
                 if island_near_shape(&shape, &islands[idx], 5_000.0) {
                     comp_nets
                         .entry(uf.find(idx))
@@ -263,11 +304,14 @@ pub(crate) fn check_gerber_connectivity(
         if via.net.is_empty() {
             continue;
         }
+        let qbb = BBoxNm::from_pt(via.pos, 5_000);
         for layer in via.spanned_layers(&cu_layers, &board.layers) {
-            let Some(idxs) = by_layer.get(layer.as_str()) else {
+            let Some((idxs, grid)) = by_layer.get(layer.as_str()) else {
                 continue;
             };
-            for &idx in idxs {
+            grid.query_with(qbb, &mut scratch, &mut cands);
+            for &li in &cands {
+                let idx = idxs[li];
                 if island_contains_or_near(via.pos, &islands[idx], 5_000.0) {
                     comp_nets
                         .entry(uf.find(idx))
@@ -312,5 +356,30 @@ pub(crate) fn check_gerber_connectivity(
         shorts,
         opens,
         missing_pad_copper,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::mm;
+
+    #[test]
+    fn match_drill_lists_preserves_lowest_index_tie_breaking() {
+        let tol = 1_000;
+        let parsed = vec![
+            (mm(0.3), Pt::new(1_001_000, 1_000_000)),
+            (mm(0.3), Pt::new(999_000, 1_000_000)),
+            (mm(0.3), Pt::new(501_000, 500_000)),
+            (mm(0.3), Pt::new(499_500, 500_000)),
+        ];
+        let expected = vec![
+            (mm(0.3), Pt::new(1_000_000, 1_000_000)),
+            (mm(0.3), Pt::new(1_001_000, 1_000_000)),
+            (mm(0.3), Pt::new(500_000, 500_000)),
+        ];
+        // First expected drill ties between parsed[0] and parsed[1] and must claim parsed[0].
+        // Third expected drill sits on the 500_000 cell boundary and claims nearer parsed[3].
+        assert_eq!(match_drill_lists(&expected, &parsed, tol), (2, 3));
     }
 }

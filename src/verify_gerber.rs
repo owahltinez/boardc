@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use clipper2_rust::{FillRule, Path64, Paths64, difference_64, union_64};
+use clipper2_rust::{ClipType, FillRule, Path64, Paths64, difference_64, union_64};
 use gerber_types::{
     Aperture, ApertureMacro, Command as GCmd, Coordinates, DCode, ExtendedCode, FunctionCode,
     GCode, MacroBoolean, MacroContent, MacroDecimal, Operation, Polarity, Unit,
@@ -20,7 +20,7 @@ use crate::verify::{ConnectivityCheck, DrillCheck, GerberFileCheck};
 use crate::verify_excellon::{
     GerberIsland, check_gerber_connectivity, match_drill_lists, parse_excellon_file,
 };
-use crate::zone_scene::paths_to_pour_polys;
+use crate::zone_scene::{boolean_op_to_pour_polys, paths_to_pour_polys};
 
 fn unit_scale_to_nm(unit: Option<Unit>) -> f64 {
     match unit {
@@ -284,17 +284,6 @@ fn parse_gerber_file(
     let mut dark_batch = Paths64::new();
     let mut clear_batch = Paths64::new();
 
-    let flush_polarity =
-        |pol: Polarity, dark: &mut Paths64, clear: &mut Paths64, copper: &mut Paths64| {
-            if pol == Polarity::Dark && !dark.is_empty() {
-                *copper = union_64(copper, dark, FillRule::NonZero);
-                dark.clear();
-            } else if pol == Polarity::Clear && !clear.is_empty() {
-                *copper = difference_64(copper, clear, FillRule::NonZero);
-                clear.clear();
-            }
-        };
-
     for cmd in doc.commands() {
         match cmd {
             GCmd::ExtendedCode(ExtendedCode::ApertureMacro(am)) => {
@@ -306,12 +295,14 @@ fn parse_gerber_file(
             GCmd::ExtendedCode(ExtendedCode::LoadPolarity(pol)) => {
                 if *pol != polarity {
                     if collect_copper {
-                        flush_polarity(
-                            polarity,
-                            &mut dark_batch,
-                            &mut clear_batch,
-                            &mut copper_paths,
-                        );
+                        if polarity == Polarity::Dark && !dark_batch.is_empty() {
+                            copper_paths = union_64(&copper_paths, &dark_batch, FillRule::NonZero);
+                            dark_batch.clear();
+                        } else if polarity == Polarity::Clear && !clear_batch.is_empty() {
+                            copper_paths =
+                                difference_64(&copper_paths, &clear_batch, FillRule::NonZero);
+                            clear_batch.clear();
+                        }
                     }
                     polarity = *pol;
                 }
@@ -399,20 +390,25 @@ fn parse_gerber_file(
 
     let mut islands = Vec::new();
     if collect_copper {
-        flush_polarity(
-            polarity,
-            &mut dark_batch,
-            &mut clear_batch,
-            &mut copper_paths,
-        );
-        if !copper_paths.is_empty() {
-            let layer = layer_name.unwrap_or("F.Cu");
-            for poly in paths_to_pour_polys(&copper_paths) {
-                islands.push(GerberIsland {
-                    layer: layer.to_string(),
-                    indexed: IndexedPour::new(&poly),
-                });
+        let pour_polys = match polarity {
+            Polarity::Dark if !dark_batch.is_empty() => {
+                if copper_paths.is_empty() {
+                    paths_to_pour_polys(&dark_batch)
+                } else {
+                    boolean_op_to_pour_polys(ClipType::Union, &copper_paths, &dark_batch)
+                }
             }
+            Polarity::Clear if !clear_batch.is_empty() => {
+                boolean_op_to_pour_polys(ClipType::Difference, &copper_paths, &clear_batch)
+            }
+            _ => paths_to_pour_polys(&copper_paths),
+        };
+        let layer = layer_name.unwrap_or("F.Cu");
+        for poly in pour_polys {
+            islands.push(GerberIsland {
+                layer: layer.to_string(),
+                indexed: IndexedPour::new(&poly),
+            });
         }
     }
 
@@ -532,25 +528,34 @@ pub(crate) fn verify_fab_outputs_impl(
     }
     gerber_paths.sort();
 
-    let mut checks = Vec::with_capacity(gerber_paths.len());
+    let parsed_results: Vec<(GerberFileCheck, Vec<GerberIsland>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = gerber_paths
+            .iter()
+            .map(|path| {
+                let cu_by_fname_ref = &cu_by_fname;
+                s.spawn(move || {
+                    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    let cu_layer = cu_by_fname_ref.get(fname).map(String::as_str);
+                    // Edge_Cuts must match outline tightly; copper allows edge-mounted connectors (1mm); silk/mask allow overhang.
+                    let tol = if fname == "Edge_Cuts.gm1" {
+                        mm(0.1)
+                    } else if cu_layer.is_some() {
+                        mm(1.0)
+                    } else {
+                        mm(3.0)
+                    };
+                    parse_gerber_file(path, cu_layer, cu_layer.is_some(), outline_bbox, tol)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("gerber verify worker panicked"))
+            .collect()
+    });
+    let mut checks = Vec::with_capacity(parsed_results.len());
     let mut islands = Vec::new();
-    for path in &gerber_paths {
-        let fname = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let cu_layer = cu_by_fname.get(&fname).map(String::as_str);
-        // Edge_Cuts must match outline tightly; copper allows edge-mounted connectors (1mm); silk/mask allow overhang.
-        let tol = if fname == "Edge_Cuts.gm1" {
-            mm(0.1)
-        } else if cu_layer.is_some() {
-            mm(1.0)
-        } else {
-            mm(3.0)
-        };
-        let (chk, mut layer_islands) =
-            parse_gerber_file(path, cu_layer, cu_layer.is_some(), outline_bbox, tol);
+    for (chk, mut layer_islands) in parsed_results {
         checks.push(chk);
         islands.append(&mut layer_islands);
     }
