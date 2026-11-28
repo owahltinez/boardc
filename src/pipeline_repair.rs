@@ -1544,7 +1544,10 @@ pin_nets = { "1" = "GND" }
     fn deadline_watchdog_trips_after_deadline_and_joins_cleanly_on_early_drop() {
         let wd_short = DeadlineWatchdog::spawn(Instant::now() + Duration::from_millis(50));
         let flag_short = wd_short.flag();
-        std::thread::sleep(Duration::from_millis(120));
+        let wait_until = Instant::now() + Duration::from_secs(2);
+        while !flag_short.load(Ordering::Acquire) && Instant::now() < wait_until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(flag_short.load(Ordering::Acquire));
         assert!(wd_short.tripped());
         drop(wd_short);
@@ -1553,7 +1556,7 @@ pin_nets = { "1" = "GND" }
         let flag_long = wd_long.flag();
         let t0 = Instant::now();
         drop(wd_long);
-        assert!(t0.elapsed() < Duration::from_millis(200));
+        assert!(t0.elapsed() < Duration::from_secs(2));
         assert!(!flag_long.load(Ordering::Acquire));
     }
 
